@@ -1,0 +1,68 @@
+Institute Ledger — اس ریویژن میں کی گئی محدود تبدیلیاں
+
+- Removed public Create Account action from login screen; login remains available.
+- Blocked authentication for legacy student accounts without deleting their database rows.
+- Disabled public self-registration; teacher accounts remain admin-managed inside the app.
+- Restricted Admin > Login Accounts creation to teacher accounts and raised password minimum to 12 characters; legacy student rows remain untouched.
+- Main-window close now destroys direct child Toplevel windows before backup and database close.
+
+اہم: اصل ڈیٹا بیس میں کوئی تبدیلی نہیں کی گئی۔ پرانے student user rows حذف نہیں کیے گئے، مگر student login بند ہے۔ Windows GUI/installer کے عملی ٹیسٹ ابھی باقی ہیں۔
+- طالب علم شامل کرنے یا پروفائل میں طالب علم لاگ اِن بنانے کے راستے بھی بند کیے؛ صرف ایڈمن کے ذریعے استاد کا اکاؤنٹ بن سکتا ہے۔
+
+- لاگ اِن اور پرانا ڈیٹا/بیک اپ کھولنے کے بٹن الگ برابر چوڑائی والے خانوں میں رکھے؛ بٹنوں کی عمودی جگہ کم کی تاکہ وہ آپس میں نہ ملیں۔
+- ادارے کا لوگو Settings میں Choose & crop اور Adjust کے ذریعے تبدیل/فریم کیا جا سکتا ہے؛ اس فیچر کو برقرار رکھا۔
+- سورس کی Python syntax compilation کامیاب۔ Windows پر GUI اور EXE installer کے حقیقی ٹیسٹ اس ماحول میں نہیں کیے گئے۔
+
+- v8: لاگ اِن اسکرین کی عمودی جگہ بہتر کی: کارڈ کی دستیاب اونچائی بڑھائی، سرخیوں/فیلڈز کے درمیان فاصلہ کم کیا، ان پٹ فیلڈز قدرے مختصر کیے، اور لوگو پینل چھوٹا کیا تاکہ نیچے کے دونوں ایکشن بٹن کٹنے کا امکان کم ہو۔ Python syntax compilation کامیاب؛ Windows پر بصری/عملی تصدیق ابھی باقی ہے۔
+
+
+ورژن 10 — پہلی تنصیب پر Admin اکاؤنٹ کا مسئلہ
+- انسٹالر اب first_install.flag شامل کرتا ہے۔ پہلی بار ایپ کھلنے پر پرانا محفوظ DB path خاموشی سے استعمال نہیں ہوگا۔
+- صارف واضح طور پر پرانی ڈیٹابیس منتخب کر سکتا ہے، یا NO منتخب کر کے نیا ڈیٹا فولڈر بنا سکتا ہے۔
+- نئے خالی ڈیٹابیس پر موجودہ first_admin_exists شرط کے مطابق Create Admin Account اسکرین کھلے گی۔
+- پرانی ڈیٹابیس، پاس ورڈ hashes، ریکارڈز اور saved path خودکار طور پر حذف یا تبدیل نہیں کیے جاتے۔
+- پہلی تنصیب کا نشان صرف درست ڈیٹابیس منتخب ہونے کے بعد ختم ہوتا ہے؛ منسوخی پر اگلی بار انتخاب دوبارہ آئے گا۔
+
+
+ورژن 12 — ایک مشترکہ پس منظر اور Scroll Transition
+- لاگ اِن اسکرین، شناختی ہیڈر اور تمام مرکزی صفحات کے لیے ایک ہی wallpaper asset / user-selected image استعمال کی جاتی ہے۔
+- الگ کور فوٹو اور اس کے header patterns/scale controls ہٹا دیے گئے ہیں۔
+- ادارے کا نام، لوگو، سلوگن، LOCAL • OFFLINE نشان اور موجودہ اکاؤنٹ/Role معلومات کی جگہ برقرار ہے۔
+- نیچے اسکرول: شناختی ہیڈر 220ms کی نرم animation کے ساتھ اوپر سمٹ کر غائب؛ اوپر اسکرول: ہیڈر واپس ظاہر۔ Navigation bar مستقل دکھائی دیتی ہے۔
+- Wallpaper path اور transparency کی Live Preview ہیڈر اور صفحے دونوں میں بیک وقت نظر آتی ہے۔
+- Tk/Xvfb پر Dashboard، Students، Teachers، Fees، Timetable، Attendance، Progress، Accounts، Graphs، Reports اور Settings کے smoke tests کامیاب؛ Windows installer کا حقیقی ٹیسٹ اس ماحول میں نہیں کیا گیا۔
+
+
+RC v13 UI Patch
+- Wallpaper Canvas stacking کی اصل خرابی درست۔
+- Shared, cached wallpaper tile؛ page re-open پر غیر ضروری decode/resize نہیں۔
+- Navigation، Action، Attendance اور Calendar buttons کے لیے wallpaper-blended image surfaces۔
+- Nested tables/scrollbars اور main page کے scroll position کے مطابق header collapse/restore۔
+- Mousewheel fractional delta handling بہتر۔
+- Calendar attendance prefetch کا duplicate query ختم۔
+- Windows native verification ابھی باقی ہے؛ یہ source/build kit ہے، compiled installer نہیں۔
+
+
+نسخہ v14 — 2026-10-31
+- ہر صفحے کے لیے الگ full-workspace wallpaper اور transparency۔ Login / Create Admin بھی page-background mapping میں شامل۔
+- Light / Dark modes؛ settings میں محفوظ، Login screen پر بھی لاگو۔
+- Admin dropdown میں سے Customize Header ہٹایا؛ صرف Settings سے دستیاب۔
+- ہر installer run کے بعد ایک مرتبہ first-launch choice: نیا ادارہ / موجودہ ڈیٹابیس۔ نیا ادارہ بنانے کے لیے خالی data folder؛ موجودہ DB خودکار طور پر reuse نہیں ہوگی۔
+- طالب علم کارڈز 18 فی batch query/render ہوتے ہیں، اس سے بڑی فہرستوں کا ابتدائی بوجھ کم۔
+- Active page بدلنے پر wallpaper، header اور button surfaces sync ہوتے ہیں؛ global fallback برقرار۔
+
+
+Hotfix v14.1 — PyMuPDF:
+- جدید PyMuPDF import `pymupdf` استعمال کیا گیا ہے؛ پرانے ورژنز کے لیے compatibility fallback برقرار ہے۔
+- `fitz` deprecation warning ختم ہونی چاہیے؛ PDF rendering calls اسی alias کے ذریعے کام جاری رکھیں گی۔
+
+
+نسخہ v14.2 — پہلی ونڈو نظر نہ آنے کا مسئلہ
+- پہلی بار چلانے پر main root کو `withdraw()` کرنے سے اس کے ساتھ منسلک modal chooser بھی Windows پر hidden ہو سکتا تھا، جبکہ Python console خاموشی سے `wait_window()` میں رکی رہتی تھی۔
+- اب startup کے دوران 1x1، بغیر border اور transparent مگر mapped owner window رکھی جاتی ہے؛ اس کے سامنے New Institute / Existing Database chooser اور فائل منتخب کرنے کی ونڈوز ظاہر ہوتی ہیں۔ اصل پروگرام شروع ہونے سے پہلے عام titlebar اور window opacity بحال کر دی جاتی ہے۔
+- غیر متوقع startup exception پر `%LOCALAPPDATA%\Institute Ledger\startup_error.log` بنایا جاتا ہے اور error dialog ظاہر ہوتا ہے۔
+- Windows native test ابھی صارف کے کمپیوٹر پر درکار ہے؛ Tk/Xvfb میں modal-window visibility اور دونوں database paths چیک کیے گئے ہیں۔
+
+
+PHASE 1 / v15.1 — Login UI Preserved
+Login screen, first-admin setup, themes, login button styles aur login assets ko v14.2 se bilkul barqarar rakha gaya hai. Sirf shared header/scroll controller aur us ke page hooks is phase mein shamil hain. Tafseel PHASE1_LOGIN_PRESERVED_UR.txt mein hai.

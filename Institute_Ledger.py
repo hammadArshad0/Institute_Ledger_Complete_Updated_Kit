@@ -1,0 +1,14255 @@
+# -*- coding: utf-8 -*-
+import os
+import re
+import base64
+import io
+import shutil
+import sqlite3
+import hashlib
+import secrets
+import uuid
+import string
+import csv
+import json
+import tkinter as tk
+import tkinter.font as tkfont
+from tkinter import ttk, messagebox, filedialog, simpledialog, colorchooser
+from datetime import datetime, date, timedelta
+import calendar
+import sys
+import subprocess
+import ctypes
+import time
+import tempfile
+import threading
+import queue
+import webbrowser
+from urllib.parse import quote
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+
+# ---------------------------------------------------------------------------
+# Performance utilities integrated from the supplied upgrade snippet.
+# Tk widgets are always updated on the main thread; worker threads only do I/O
+# and data processing.  Cache instances are bounded to prevent memory growth.
+# ---------------------------------------------------------------------------
+class LRUCache:
+    """Small thread-safe LRU cache with dict-compatible access used by UI assets."""
+    def __init__(self, maxsize=50):
+        self.maxsize = max(1, int(maxsize))
+        self._items = OrderedDict()
+        self._lock = threading.RLock()
+
+    def get(self, key, default=None):
+        with self._lock:
+            if key not in self._items:
+                return default
+            self._items.move_to_end(key)
+            return self._items[key]
+
+    def put(self, key, value):
+        with self._lock:
+            if key in self._items:
+                self._items.move_to_end(key)
+            self._items[key] = value
+            while len(self._items) > self.maxsize:
+                self._items.popitem(last=False)
+        return value
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+
+    def __getitem__(self, key):
+        value = self.get(key, None)
+        if value is None:
+            raise KeyError(key)
+        return value
+
+    def __setitem__(self, key, value):
+        self.put(key, value)
+
+    def __contains__(self, key):
+        with self._lock:
+            return key in self._items
+
+    def __len__(self):
+        with self._lock:
+            return len(self._items)
+
+
+class Debouncer:
+    """Cancel pending UI work and run it once after the input settles."""
+    def __init__(self, widget, delay_ms=250):
+        self.widget = widget
+        self.delay = max(0, int(delay_ms))
+        self._after_id = None
+
+    def cancel(self):
+        after_id, self._after_id = self._after_id, None
+        if after_id is not None:
+            try:
+                self.widget.after_cancel(after_id)
+            except (tk.TclError, AttributeError):
+                pass
+
+    def run(self, callback, *args):
+        self.cancel()
+        try:
+            self._after_id = self.widget.after(self.delay, self._invoke, callback, args)
+        except tk.TclError:
+            self._after_id = None
+
+    def _invoke(self, callback, args):
+        self._after_id = None
+        try:
+            callback(*args)
+        except tk.TclError:
+            pass
+
+
+class AsyncWorker:
+    """Run non-Tk work in a small pool and dispatch results on Tk's UI thread.
+
+    Unlike calling root.after() from a worker completion callback, this class
+    places results in a thread-safe queue.  A root.after pump created on the
+    main thread executes all UI callbacks safely.
+    """
+    _pool = None
+    _pool_lock = threading.Lock()
+
+    @classmethod
+    def _get_pool(cls):
+        with cls._pool_lock:
+            if cls._pool is None:
+                cls._pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='InstituteLedgerWorker')
+            return cls._pool
+
+    @classmethod
+    def _ensure_ui_pump(cls, root):
+        if getattr(root, '_il_async_pump_started', False):
+            return
+        root._il_async_result_queue = queue.Queue()
+        root._il_async_pump_started = True
+
+        def pump():
+            try:
+                if not root.winfo_exists():
+                    return
+                processed = 0
+                while processed < 20:
+                    try:
+                        ok, payload, callback, error_callback = root._il_async_result_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    processed += 1
+                    try:
+                        if ok and callable(callback):
+                            callback(payload)
+                        elif not ok and callable(error_callback):
+                            error_callback(payload)
+                    except Exception as callback_error:
+                        # A failed UI callback is reported without stopping later jobs.
+                        if callable(error_callback):
+                            try:
+                                error_callback(callback_error)
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                root.report_callback_exception(type(callback_error), callback_error,
+                                                                callback_error.__traceback__)
+                            except Exception:
+                                pass
+                root.after(35, pump)
+            except tk.TclError:
+                return
+
+        root.after(35, pump)
+
+    @classmethod
+    def run(cls, root, func, args=(), callback=None, error_callback=None):
+        cls._ensure_ui_pump(root)
+        future = cls._get_pool().submit(func, *args)
+        result_queue = root._il_async_result_queue
+
+        def completed(done):
+            try:
+                result_queue.put((True, done.result(), callback, error_callback))
+            except Exception as exc:
+                result_queue.put((False, exc, callback, error_callback))
+
+        future.add_done_callback(completed)
+        return future
+
+
+def _fetch_report_rows_worker(db_path, sql):
+    """Read a report through a worker-owned, read-only SQLite connection."""
+    if not db_path or not os.path.isfile(db_path):
+        raise FileNotFoundError('The selected Institute Ledger database was not found.')
+    connection = sqlite3.connect(db_path, timeout=12.0)
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute('PRAGMA query_only=ON')
+        cursor = connection.execute(sql)
+        columns = [item[0] for item in (cursor.description or ())]
+        return [dict(zip(columns, row)) for row in cursor]
+    finally:
+        connection.close()
+
+
+# Resolve read-only UI assets next to the source, or inside a future frozen bundle.
+APP_BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+def app_asset_path(*parts):
+    return os.path.join(APP_BASE_DIR, *parts)
+
+DEFAULT_WALLPAPER_IMAGE = app_asset_path("assets", "background_wallpaper.png")
+DEFAULT_LOGIN_LOGO = app_asset_path("assets", "login_default_logo.png")
+DEFAULT_INSTITUTION_NAME = "Institute's Name"
+DEFAULT_INSTITUTION_NAME_UR = "ادارے کا نام"
+# Default palette matched to the user-provided TAHA reference screenshots.
+DEFAULT_PRIMARY_COLOR = "#0B3D2E"   # dark green (changeable in Settings)
+DEFAULT_BACKGROUND_COLOR = "#F6F8F7"
+DEFAULT_TEXT_COLOR = "auto"         # auto = black on light backgrounds, white on dark ones (changeable)
+
+# Load the user's supplied Aptos family and Jameel Noori Nastaleeq fonts privately.
+# No substitute fonts are bundled. The exact supplied TTF files live in assets/fonts.
+_FONT_RESOURCES = []
+def load_bundled_fonts():
+    if sys.platform != "win32":
+        return
+    possible_dirs = [
+        app_asset_path("assets", "fonts"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts"),
+        os.path.join(os.getcwd(), "assets", "fonts"),
+    ]
+    try:
+        gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+        add_font = gdi32.AddFontResourceExW
+        add_font.argtypes = [ctypes.c_wchar_p, ctypes.c_uint, ctypes.c_void_p]
+        add_font.restype = ctypes.c_int
+        for font_dir in possible_dirs:
+            if not os.path.isdir(font_dir):
+                continue
+            for filename in sorted(os.listdir(font_dir), key=str.casefold):
+                if not filename.casefold().endswith((".ttf", ".otf")):
+                    continue
+                font_path = os.path.join(font_dir, filename)
+                if os.path.isfile(font_path) and font_path not in _FONT_RESOURCES:
+                    if add_font(font_path, 0x10, None):
+                        _FONT_RESOURCES.append(font_path)
+    except Exception:
+        pass
+
+load_bundled_fonts()
+
+try:
+    from PIL import Image, ImageTk, ImageDraw, ImageFont, features as PILFeatures
+except ImportError:
+    Image = ImageTk = ImageDraw = ImageFont = PILFeatures = None
+
+# PyMuPDF renders curriculum PDFs into crisp page images inside the app.
+# It is optional for the rest of the software; the curriculum viewer explains
+# the missing dependency instead of crashing if it has not been bundled yet.
+try:
+    # Use the current PyMuPDF import name.  The module is aliased as `fitz`
+    # below so existing PDF rendering calls remain unchanged.
+    try:
+        import pymupdf as fitz
+    except ImportError:
+        # Compatibility with older PyMuPDF releases.
+        import fitz
+except ImportError:
+    fitz = None
+
+
+# User-provided "Free Notification.lottie" converted to a small transparent animated GIF.
+# It is bundled in this source file, so no extra asset file or internet access is required.
+_NOTIFICATION_GIF_FRAME_COUNT = 20
+_NOTIFICATION_ANIMATION_GIF_BASE64 = (
+    "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"
+    "aC8EyB1zzIEHlXFDNHcekOQI7fffgAdOUkAAOw=="
+)
+
+APP_NAME = "Institute Ledger"
+APP_VERSION = "Professional dark-green UI — black text, fully customisable"
+
+# =============================================================================
+# CENTRAL DESIGN TOKENS & THEME PRESETS (WCAG AA Compliant)
+# =============================================================================
+THEME_PRESETS = {
+    "emerald": {
+        "id": "emerald",
+        "name": "Dark Green & Black (Default)",
+        "name_ur": "گہرا سبز اور سیاہ (طے شدہ)",
+        "primary": "#0B3D2E",
+        "primary_hover": "#072A20",
+        "primary_light": "#D5E6DE",
+        "primary_subtle": "#EAF2EE",
+        "accent": "#B8860B",
+        "accent_hover": "#8F6809",
+        "accent_light": "#F6EBC8",
+        "bg_light": "#F6F8F7",
+        "card_light": "#FFFFFF",
+        "border_light": "#D3DDD8",
+        "text_light": "#000000",
+        "muted_light": "#4A5A53",
+        "bg_dark": "#0E1512",
+        "card_dark": "#17211C",
+        "border_dark": "#2A3A33",
+        "text_dark": "#F2F7F4",
+        "muted_dark": "#A3B5AC",
+    },
+    "royal_blue": {
+        "id": "royal_blue",
+        "name": "Royal Blue & Gold",
+        "name_ur": "شاہی نیلا اور سنہری",
+        "primary": "#1E3A8A",
+        "primary_hover": "#172554",
+        "primary_light": "#DBEAFE",
+        "primary_subtle": "#EFF6FF",
+        "accent": "#D97706",
+        "accent_hover": "#B45309",
+        "accent_light": "#FEF3C7",
+        "bg_light": "#F8FAFC",
+        "card_light": "#FFFFFF",
+        "border_light": "#E2E8F0",
+        "text_light": "#0F172A",
+        "muted_light": "#64748B",
+        "bg_dark": "#0F172A",
+        "card_dark": "#1E293B",
+        "border_dark": "#334155",
+        "text_dark": "#F8FAFC",
+        "muted_dark": "#94A3B8",
+    },
+    "teal": {
+        "id": "teal",
+        "name": "Teal & Amber",
+        "name_ur": "نیلگوں اور عنبری",
+        "primary": "#0F766E",
+        "primary_hover": "#115E59",
+        "primary_light": "#CCFBF1",
+        "primary_subtle": "#F0FDFA",
+        "accent": "#F59E0B",
+        "accent_hover": "#D97706",
+        "accent_light": "#FEF3C7",
+        "bg_light": "#F4F9F9",
+        "card_light": "#FFFFFF",
+        "border_light": "#D5E5E5",
+        "text_light": "#132E2C",
+        "muted_light": "#5E7775",
+        "bg_dark": "#111C1B",
+        "card_dark": "#1A2B29",
+        "border_dark": "#2B4441",
+        "text_dark": "#E6F3F2",
+        "muted_dark": "#95B0AE",
+    },
+    "purple": {
+        "id": "purple",
+        "name": "Deep Purple & Mint",
+        "name_ur": "گہرا جامنی اور پودینہ",
+        "primary": "#581C87",
+        "primary_hover": "#3B0764",
+        "primary_light": "#F3E8FF",
+        "primary_subtle": "#FAF5FF",
+        "accent": "#059669",
+        "accent_hover": "#047857",
+        "accent_light": "#D1FAE5",
+        "bg_light": "#FAF8FC",
+        "card_light": "#FFFFFF",
+        "border_light": "#E9E2F0",
+        "text_light": "#241433",
+        "muted_light": "#6F5F7D",
+        "bg_dark": "#17121F",
+        "card_dark": "#251D30",
+        "border_dark": "#3C2F4D",
+        "text_dark": "#F3EEFA",
+        "muted_dark": "#AB9BBF",
+    },
+    "charcoal": {
+        "id": "charcoal",
+        "name": "Charcoal & Green",
+        "name_ur": "کوئلہ اور سبز",
+        "primary": "#2D3748",
+        "primary_hover": "#1A202C",
+        "primary_light": "#E2E8F0",
+        "primary_subtle": "#F7FAFC",
+        "accent": "#10B981",
+        "accent_hover": "#059669",
+        "accent_light": "#D1FAE5",
+        "bg_light": "#F7FAFC",
+        "card_light": "#FFFFFF",
+        "border_light": "#E2E8F0",
+        "text_light": "#1A202C",
+        "muted_light": "#718096",
+        "bg_dark": "#1A202C",
+        "card_dark": "#2D3748",
+        "border_dark": "#4A5568",
+        "text_dark": "#F7FAFC",
+        "muted_dark": "#A0AEC0",
+    },
+}
+
+# Semantic status tokens
+STATUS_COLORS = {
+    "paid": {"fg": "#0F5132", "bg": "#D1E7DD", "border": "#A3CFBB", "label": "Paid / ادا شدہ"},
+    "present": {"fg": "#0F5132", "bg": "#D1E7DD", "border": "#A3CFBB", "label": "Present / حاضر"},
+    "active": {"fg": "#0F5132", "bg": "#D1E7DD", "border": "#A3CFBB", "label": "Active / فعال"},
+    "partial": {"fg": "#854D0E", "bg": "#FEF3C7", "border": "#FDE68A", "label": "Partial / جزوی"},
+    "pending": {"fg": "#854D0E", "bg": "#FEF3C7", "border": "#FDE68A", "label": "Pending / زیرِ التواء"},
+    "late": {"fg": "#854D0E", "bg": "#FEF3C7", "border": "#FDE68A", "label": "Late / دیر"},
+    "unpaid": {"fg": "#991B1B", "bg": "#FEE2E2", "border": "#FECACA", "label": "Unpaid / غیر ادا شدہ"},
+    "absent": {"fg": "#991B1B", "bg": "#FEE2E2", "border": "#FECACA", "label": "Absent / غیر حاضر"},
+    "overdue": {"fg": "#7F1D1D", "bg": "#FEE2E2", "border": "#FECACA", "label": "Overdue / واجب الادا"},
+    "leave": {"fg": "#1E40AF", "bg": "#DBEAFE", "border": "#BFDBFE", "label": "Leave / رخصت"},
+}
+
+RADIUS_SM = 4
+RADIUS_MD = 8
+RADIUS_LG = 12
+RADIUS_PILL = 20
+SPACE_XS = 4
+SPACE_SM = 8
+SPACE_MD = 12
+SPACE_LG = 16
+SPACE_XL = 24
+
+GREEN = "#0B3D2E"
+GREEN_HOVER = "#072A20"
+ACCENT = "#D97706"
+ACCENT_HOVER = "#B45309"
+ACCENT_LIGHT = "#FEF3C7"
+DANGER = "#991B1B"
+DANGER_HOVER = "#7F1D1D"
+DANGER_LIGHT = "#FEE2E2"
+WHITE = "#FFFFFF"
+APP_BG = "#F6F8F7"
+CARD_BG = "#FFFFFF"
+BORDER = "#D3DDD8"
+DARK = "#000000"
+MUTED = "#4A5A53"
+PALE = "#E8F4EE"
+SOFT_GREEN = "#E8F4EE"
+GOLD = "#FEF3C7"
+# Fixed STATUS / FUNCTION colors. They never depend on the saved primary color.
+SEM_GREEN = "#16A34A"     # paid, present, success
+SEM_GREEN_BTN = "#15803D" # same hue, darker so white button text reaches WCAG AA
+SEM_YELLOW = "#F5B301"    # pending, partial
+SEM_ORANGE = "#F28C28"    # warning, due soon; print / export / certificates buttons
+SEM_RED = "#DC2626"       # unpaid, absent, danger
+SEM_BLUE = "#2563EB"      # information, refresh / open / view buttons, Students
+# The wallpaper is only ever a faint page background (max share of the picture).
+WALLPAPER_MAX_STRENGTH = 0.35
+# Urdu font is selected from fonts installed in Windows at application startup.
+# Prefer true Nastaleeq fonts; fall back gracefully if none is installed.
+UI_FONT = "Arial"
+UI_BOLD_FONT = "Arial"
+URDU_FONT = "Jameel Noori Nastaleeq"
+FONT_SCALE = 1.2  # Readable default; user-configurable in Settings.
+URDU_FONT_CANDIDATES = (
+    "Jameel Noori Nastaleeq", "Noto Nastaliq Urdu", "Noto Nastaliq Urdu UI",
+    "Urdu Typesetting", "Nafees Nastaleeq", "Segoe UI"
+)
+
+def choose_urdu_font(root=None):
+    """Ensure the bundled Jameel Noori Nastaleeq font is always used for Urdu. Never silently fall back to Segoe UI."""
+    return "Jameel Noori Nastaleeq"
+
+_URDU_SCRIPT_REPLACEMENT = None
+_SMART_LABEL_FONT_CACHE = {}
+
+
+# --- Bilingual label factory -------------------------------------------------
+# Tk widgets accept only one font per Label. For labels containing both scripts,
+# render consecutive English/Urdu runs as separate child labels, each with its
+# required family. This avoids assigning one font to mixed-script text.
+_URDU_CODEPOINT_RANGES = ((0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF),
+                          (0xFB50, 0xFDFF), (0xFE70, 0xFEFF))
+def _is_urdu_char(ch):
+    n = ord(ch)
+    return any(lo <= n <= hi for lo, hi in _URDU_CODEPOINT_RANGES)
+
+def _split_script_runs(text):
+    text = str(text)
+    if not any(_is_urdu_char(ch) for ch in text):
+        return None
+    runs = []
+    current = ''
+    current_urdu = None
+    for ch in text:
+        # Keep spaces and punctuation with the preceding run, unless the next
+        # visible character changes script. This preserves readable separators.
+        if ch.isspace() or ch in '/|•:—-()[]':
+            current += ch
+            continue
+        is_urdu = _is_urdu_char(ch)
+        if current_urdu is None:
+            current_urdu = is_urdu
+        elif is_urdu != current_urdu:
+            runs.append((current, current_urdu))
+            current = ''
+            current_urdu = is_urdu
+        current += ch
+    if current:
+        runs.append((current, bool(current_urdu)))
+    # Merge separator-only runs into adjacent chunks and remove empty chunks.
+    cleaned = []
+    for value, urdu in runs:
+        if not value:
+            continue
+        if cleaned and not any(_is_urdu_char(ch) for ch in value) and not any(ch.isalpha() or _is_urdu_char(ch) for ch in value):
+            prev, prev_urdu = cleaned[-1]
+            cleaned[-1] = (prev + value, prev_urdu)
+        else:
+            cleaned.append((value, urdu))
+    return cleaned
+
+# Global UI language: persisted per local database. Mixed bilingual labels are
+# rendered as one language at a time when the user switches modes.
+APP_LANGUAGE = "en"
+_UI_TRANSLATIONS = {
+    "Dashboard": "ڈیش بورڈ", "Students": "طلبہ", "Teachers": "اساتذہ",
+    "Fees & Payments": "فیس اور ادائیگیاں", "Timetable": "ٹائم ٹیبل",
+    "Attendance": "حاضری", "Progress": "کارکردگی", "Accounts": "اکاؤنٹس",
+    "Reports / Export": "رپورٹس / برآمد", "Reports & Export": "رپورٹس اور برآمد",
+    "Graphs": "گرافس", "Graphs & Analytics": "گرافس اور تجزیہ",
+    "Per currency": "ہر کرنسی کے حساب سے", "Open": "کھلے", "Overdue": "تاخیر سے واجب الادا",
+    "Settings": "ترتیبات", "My Students": "میرے طلبہ", "My Learning": "میری تعلیم",
+    "Log out": "لاگ آؤٹ", "Login": "داخل ہوں", "Create account": "اکاؤنٹ بنائیں",
+    "Welcome back": "خوش آمدید", "Sign in to continue": "جاری رکھنے کے لیے لاگ اِن کریں",
+    "Username": "صارف نام", "Password": "پاس ورڈ", "English": "انگریزی", "Urdu": "اردو",
+    "Choose report": "رپورٹ منتخب کریں", "Official reports": "ادارے کی رپورٹس",
+    "Export CSV": "CSV برآمد کریں", "Students by Course": "کورس کے لحاظ سے طلبہ",
+    "Monthly Fee Collection": "ماہانہ فیس وصولی", "Present": "حاضر", "Absent": "غیر حاضر",
+    "Late": "تاخیر", "Active": "فعال", "Inactive": "غیر فعال", "Pending": "زیرِ التوا",
+    "Paused": "عارضی طور پر روک دیا گیا", "Complete": "مکمل", "Refresh": "تازہ کریں",
+    "Add Student": "طالب علم شامل کریں", "Add Teacher": "استاد شامل کریں",
+    "Record Payment": "فیس وصولی درج کریں", "View Details": "تفصیلات دیکھیں",
+    "Choose Photo": "تصویر منتخب کریں", "Student Profile": "طالب علم کا پروفائل",
+    "Teacher Profile": "استاد کا پروفائل", "Profile": "پروفائل", "Open Profile": "پروفائل کھولیں",
+    "Edit Profile": "پروفائل میں ترمیم کریں", "Save": "محفوظ کریں", "Cancel": "منسوخ کریں",
+    "Close": "بند کریں", "Search": "تلاش کریں", "Search student name...": "طالب علم کا نام تلاش کریں...",
+    "Search teacher name...": "استاد کا نام تلاش کریں...", "Name": "نام", "Full Name": "پورا نام",
+    "Student ID": "طالب علم کا شناختی نمبر", "Teacher ID": "استاد کا شناختی نمبر",
+    "Guardian": "سرپرست", "Parent & Contact": "والدین اور رابطہ",
+    "Phone": "فون نمبر", "Email": "ای میل", "Course": "کورس", "Level": "درجہ",
+    "Level / Grade": "درجہ", "Class Time": "کلاس کا وقت", "Admission Date": "داخلے کی تاریخ",
+    "Age": "عمر", "Monthly Fee": "ماہانہ فیس", "Fee Information": "فیس کی معلومات",
+    "Academic Details": "تعلیمی تفصیلات", "Notes": "اضافی نوٹس", "Record Status": "ریکارڈ کی حالت",
+    "Qualification": "تعلیمی قابلیت", "Experience": "تجربہ", "Availability": "دستیابی",
+    "Assigned Students": "منسلک طلبہ", "Create / Reset Login": "لاگ اِن بنائیں / ری سیٹ کریں",
+    "Create / Reset Student Login": "طالب علم کا لاگ اِن بنائیں / ری سیٹ کریں",
+    "Create / Reset Teacher Login": "استاد کا لاگ اِن بنائیں / ری سیٹ کریں",
+    "Choose Photo": "تصویر منتخب کریں", "Choose a logo": "لوگو منتخب کریں",
+    "Payment": "ادائیگی", "Payments": "ادائیگیاں", "Fees": "فیس", "Balance": "بقایا",
+    "Paid": "ادا شدہ", "Unpaid": "غیر ادا شدہ", "Partial": "جزوی ادائیگی",
+    "Month": "مہینہ", "Date": "تاریخ", "Time": "وقت", "Status": "حالت",
+    "Start time": "شروع ہونے کا وقت", "End time": "ختم ہونے کا وقت",
+    "Available": "دستیاب", "Booked": "بک شدہ", "Approved": "منظور شدہ",
+    "Overdue": "واجب الادا مدت گزر گئی", "Reports": "رپورٹس", "Export": "برآمد کریں",
+    "Database Safety": "ڈیٹا بیس کی حفاظت", "Backup": "بیک اپ", "Restore": "بحال کریں",
+    "Logout": "لاگ آؤٹ", "Welcome": "خوش آمدید", "Language": "زبان",
+    "Switch to Urdu": "اردو میں تبدیل ہوں", "Switch to English": "انگریزی میں تبدیل ہوں",
+    "Choose report language": "رپورٹ کی زبان منتخب کریں", "Report language": "رپورٹ کی زبان",
+    "Institute's Name": "ادارے کا نام", "Institute Name": "ادارے کا نام",
+    "Your data stays on this computer": "آپ کا ڈیٹا اسی کمپیوٹر میں محفوظ رہتا ہے",
+    "Local": "مقامی", "Offline": "آف لائن", "LOCAL  •  OFFLINE": "مقامی  •  آف لائن",
+    "No records": "کوئی ریکارڈ موجود نہیں", "No students yet": "ابھی کوئی طالب علم نہیں",
+    "No teachers yet": "ابھی کوئی استاد نہیں", "No classes": "کوئی کلاس نہیں",
+    "Today's Classes": "آج کی کلاسیں", "Total Students": "کل طلبہ", "Active Teachers": "فعال اساتذہ",
+    "Monthly Collection": "ماہانہ وصولی", "Outstanding Fees": "بقایا فیس",
+    "Collected": "وصول شدہ", "Expected (invoices)": "متوقع فیس (بلوں کے مطابق)",
+    "Choose & crop": "منتخب کریں اور کراپ کریں", "Adjust": "فریم ایڈجسٹ کریں",
+    "Zoom": "زوم", "Use this crop": "یہ فریم محفوظ کریں", "Photo": "تصویر",
+    "Create account": "اکاؤنٹ بنائیں", "Create new account": "نیا اکاؤنٹ بنائیں",
+    "Learn • Practice • Grow in Quranic Knowledge": "سیکھیں • مشق کریں • قرآنی علم میں ترقی کریں",
+    "Offline school management system": "ادارے کا آف لائن انتظامی نظام",
+    "Overview of the local school records": "ادارے کے مقامی ریکارڈ کا خلاصہ",
+    "Administrator": "منتظم", "Administrator workspace": "منتظم کا نظام",
+    "Student": "طالب علم", "Teacher": "استاد", "Day": "دن", "Week": "ہفتہ",
+    "Monthly": "ماہانہ", "Weekly": "ہفتہ وار", "Daily": "روزانہ", "Calendar": "کیلنڈر",
+    "Profile not found": "پروفائل نہیں ملا", "View": "دیکھیں", "View day": "دن دیکھیں",
+    "Daily View": "روزانہ منظر", "Weekly View": "ہفتہ وار منظر", "Monthly View": "ماہانہ منظر",
+    "Next": "اگلا", "Previous": "پچھلا", "Open day": "دن کھولیں",
+    "Add Extra / Make-up Class": "اضافی / متبادل کلاس شامل کریں",
+    "Generate Monthly Fees": "ماہانہ فیس تیار کریں", "Print / Save Receipt": "رسید پرنٹ / محفوظ کریں",
+    "Student Fee History": "طالب علم کی فیس کی تاریخ", "Currency": "کرنسی",
+    "Fee month (YYYY-MM):": "فیس کا مہینہ (YYYY-MM):", "Day and time": "دن اور وقت",
+    "End time (e.g. 03:30 PM)": "اختتامی وقت (مثلاً 03:30 PM)",
+    "Start time (e.g. 03:00 PM)": "آغاز کا وقت (مثلاً 03:00 PM)",
+    "Notes (optional)": "نوٹس (اختیاری)", "Select student:": "طالب علم منتخب کریں:",
+    "Select student and teacher, then select an AVAILABLE time slot.": "طالب علم اور استاد منتخب کریں، پھر دستیاب وقت منتخب کریں۔",
+    "No student records found. Use Add Student to create the first profile.": "طالب علم کا ریکارڈ نہیں ملا۔ پہلا پروفائل بنانے کے لیے طالب علم شامل کریں۔",
+    "No teacher records found. Use Add Teacher to create the first profile.": "استاد کا ریکارڈ نہیں ملا۔ پہلا پروفائل بنانے کے لیے استاد شامل کریں۔",
+    "No classes are scheduled for this date.": "اس تاریخ کے لیے کوئی کلاس طے نہیں ہے۔",
+    "No classes scheduled for this date.": "اس تاریخ کے لیے کوئی کلاس طے نہیں ہے۔",
+    "No scheduled classes": "کوئی کلاس طے نہیں ہے", "Important fee, class and system alerts will appear here.": "فیس، کلاس اور سسٹم کے اہم انتباہات یہاں نظر آئیں گے۔",
+    "Saved locally • Refreshes every minute": "مقامی طور پر محفوظ • ہر منٹ تازہ ہوتا ہے",
+    "Currency follows the student's fee/invoice. No automatic conversion is performed.": "کرنسی طالب علم کی فیس/بل کے مطابق رہے گی۔ خودکار تبدیلی نہیں ہوگی۔",
+    "Green = Present • Red = Absent • Amber = Leave / Class not held. Approval is not required.": "سبز = حاضر • سرخ = غیر حاضر • زرد = رخصت / کلاس نہیں ہوئی۔ منظوری درکار نہیں۔",
+    "Leave a color blank (Auto) to follow the brand color from Settings.": "برانڈ رنگ کو ترتیبات کے مطابق رکھنے کے لیے رنگ خالی (خودکار) چھوڑیں۔",
+    "This account controls the whole local database. Use a strong password and keep it private.": "یہ اکاؤنٹ پورے مقامی ڈیٹا بیس کو کنٹرول کرتا ہے۔ مضبوط پاس ورڈ رکھیں اور اسے خفیہ رکھیں۔",
+    "No assigned students yet. Admin must assign students to this teacher through attendance/records.": "ابھی کوئی طالب علم منسلک نہیں۔ منتظم کو حاضری/ریکارڈ کے ذریعے طلبہ منسلک کرنے ہوں گے۔",
+    "Select a card to view a student's complete profile.": "طالب علم کی مکمل معلومات دیکھنے کے لیے کارڈ منتخب کریں۔",
+    "Choose card view or list view.": "کارڈ یا فہرست کا انداز منتخب کریں۔",
+    "Primary color": "بنیادی رنگ", "Background color": "پس منظر کا رنگ", "Font size": "فونٹ سائز",
+    "9 = Small, 10 = Normal, 12–14 = Large, 18 = Extra large": "9 = چھوٹا، 10 = عام، 12–14 = بڑا، 18 = بہت بڑا",
+    "Institute identity": "ادارے کی شناخت", "Institution identity": "ادارے کی شناخت",
+    "Available time slots": "دستیاب اوقات", "Select an available slot": "دستیاب وقت منتخب کریں",
+    "Records needed": "ریکارڈ درکار ہے", "Check details": "تفصیلات چیک کریں",
+    "Login failed": "لاگ اِن ناکام", "Approval pending": "منظوری زیرِ التوا",
+    "Account temporarily locked": "اکاؤنٹ عارضی طور پر بند ہے", "Export complete": "برآمد مکمل",
+    "Database error": "ڈیٹا بیس کی خرابی", "Permission denied": "اجازت نہیں ہے",
+    "ACTIVE": "فعال", "Account active": "اکاؤنٹ فعال ہے",
+    "Activate / Deactivate selected": "منتخب اکاؤنٹ فعال / غیر فعال کریں",
+    "Auto": "خودکار", "Browse…": "فائل منتخب کریں…", "Choose…": "منتخب کریں…", "Clear": "صاف کریں",
+    "Create Account": "اکاؤنٹ بنائیں", "Create Login": "لاگ اِن بنائیں", "Turn off": "بند کریں",
+    "Day and time": "دن اور وقت", "Today": "آج", "Weekday": "ہفتے کا دن",
+    "Next ▶": "اگلا ▶", "◀ Previous": "◀ پچھلا", "↻ Refresh": "↻ تازہ کریں",
+    "▣  Create / Reset Login": "▣ لاگ اِن بنائیں / ری سیٹ کریں", "✖ Close": "✖ بند کریں",
+    "No assigned students yet. Admin must assign students to this teacher through attendance/records.": "ابھی کوئی طالب علم منسلک نہیں۔ منتظم کو حاضری یا ریکارڈ سے طلبہ منسلک کرنے ہوں گے۔",
+    "No student records found. Use Add Student to create the first profile.": "طالب علم کا ریکارڈ نہیں ملا۔ پہلا پروفائل بنانے کے لیے طالب علم شامل کریں۔",
+    "No teacher records found. Use Add Teacher to create the first profile.": "استاد کا ریکارڈ نہیں ملا۔ پہلا پروفائل بنانے کے لیے استاد شامل کریں۔",
+    "Student profile not found. Please contact the administrator.": "طالب علم کا پروفائل نہیں ملا۔ منتظم سے رابطہ کریں۔",
+    "This student login is not linked to a student profile. Ask the administrator for help.": "یہ طالب علم لاگ اِن کسی پروفائل سے منسلک نہیں۔ منتظم سے مدد لیں۔",
+    "This teacher login is not linked to a teacher record. Ask the administrator to create/link the account.": "یہ استاد لاگ اِن کسی استاد کے ریکارڈ سے منسلک نہیں۔ منتظم سے اکاؤنٹ منسلک کروائیں۔",
+    "Use an existing student/teacher record. The administrator must approve your request before you can log in.": "موجودہ طالب علم یا استاد کا ریکارڈ استعمال کریں۔ لاگ اِن سے پہلے منتظم کی منظوری ضروری ہے۔",
+    "Amounts are never converted automatically between currencies; each record keeps its original currency.": "مختلف کرنسیوں کی رقم خودکار طور پر تبدیل نہیں ہوتی؛ ہر ریکارڈ اپنی اصل کرنسی میں رہتا ہے۔",
+    "Assign one student multiple weekdays. Choose a day and time, then add it; repeat for each class day.": "ایک طالب علم کے لیے کئی دن مقرر کریں۔ دن اور وقت منتخب کرکے شامل کریں، ہر کلاس کے دن کے لیے دہرائیں۔",
+    "Create a consistent SQLite backup or export all tables to a JSON file. Backup and export do not change the active database. Restore replaces it (a safety copy is saved first).": "مکمل SQLite بیک اپ بنائیں یا تمام ٹیبلز JSON فائل میں برآمد کریں۔ بیک اپ موجودہ ڈیٹا بیس نہیں بدلتا۔ بحالی اسے تبدیل کرتی ہے، پہلے حفاظتی نقل بنائی جاتی ہے۔",
+    "Currency follows the student's fee/invoice. No automatic conversion is performed.": "کرنسی طالب علم کی فیس یا بل کے مطابق رہتی ہے۔ خودکار تبدیلی نہیں ہوتی۔",
+    "Green = Present • Red = Absent • Amber = Leave / Class not held. Approval is not required.": "سبز = حاضر • سرخ = غیر حاضر • زرد = رخصت یا کلاس نہیں ہوئی۔ منظوری درکار نہیں۔",
+    "Green = scheduled regular class • Blue = extra/make-up session • Click a class to view details and mark attendance.": "سبز = باقاعدہ کلاس • نیلا = اضافی یا متبادل کلاس • تفصیل اور حاضری کے لیے کلاس پر کلک کریں۔",
+    "Important fee, class and system alerts will appear here.": "فیس، کلاس اور سسٹم کے اہم انتباہات یہاں دکھائے جائیں گے۔",
+    "Leave a color blank (Auto) to follow the brand color from Settings.": "ترتیبات کا برانڈ رنگ استعمال کرنے کے لیے رنگ خالی (خودکار) چھوڑیں۔",
+    "Select student and teacher, then select an AVAILABLE time slot.": "طالب علم اور استاد منتخب کریں، پھر دستیاب وقت منتخب کریں۔",
+    "Teacher availability can be entered as comma-separated slots, e.g. Monday 03:00 PM, Tuesday 04:00 PM. If blank, all unbooked slots are considered available.": "استاد کے دستیاب اوقات کو کاما سے الگ کرکے درج کریں، مثلاً پیر 03:00 PM، منگل 04:00 PM۔ خالی چھوڑنے پر تمام غیر محفوظ اوقات دستیاب تصور ہوں گے۔",
+    "This account controls the whole local database. Use a strong password and keep it private.": "یہ اکاؤنٹ پورے مقامی ڈیٹا بیس کو کنٹرول کرتا ہے۔ مضبوط پاس ورڈ رکھیں اور اسے خفیہ رکھیں۔",
+    "9 = Small, 10 = Normal, 12–14 = Large, 18 = Extra large": "9 = چھوٹا، 10 = عام، 12–14 = بڑا، 18 = بہت بڑا",
+    "Language": "زبان", "Cards": "کارڈز", "List": "فہرست", "Cards / List": "کارڈز / فہرست",
+    "List view": "فہرست کا منظر", "Card view": "کارڈ کا منظر", "Card View": "کارڈ کا منظر",
+    "Search student name...": "طالب علم کا نام تلاش کریں...", "Search teacher name...": "استاد کا نام تلاش کریں...",
+    "Photo / تصویر منتخب کریں": "تصویر منتخب کریں", "Add Student": "طالب علم شامل کریں", "Add Teacher": "استاد شامل کریں",
+    "Choose card view or list view. Double-click a student in list view to open the full profile.": "کارڈ یا فہرست کا انداز منتخب کریں۔ مکمل پروفائل کھولنے کے لیے فہرست میں طالب علم پر ڈبل کلک کریں۔",
+    "Choose card view or list view. Double-click a teacher in list view to open the full profile.": "کارڈ یا فہرست کا انداز منتخب کریں۔ مکمل پروفائل کھولنے کے لیے فہرست میں استاد پر ڈبل کلک کریں۔",
+    "Choose card view or list view.": "کارڈ یا فہرست کا انداز منتخب کریں۔",
+    "Select a card to view a student's complete profile.": "طالب علم کی مکمل معلومات دیکھنے کے لیے کارڈ منتخب کریں۔",
+    "The local school records overview": "ادارے کے مقامی ریکارڈ کا خلاصہ",
+    "Total": "کل", "Total:": "کل:", "Total: ": "کل: ",
+    "Attendance not marked": "حاضری درج نہیں ہوئی", "Attendance not marked:": "حاضری درج نہیں ہوئی:",
+    "No attendance recorded in the last 30 days": "گزشتہ 30 دن میں حاضری درج نہیں ہوئی",
+    "No fee invoices yet": "ابھی فیس کے بل موجود نہیں", "open invoices": "کھلے بل", "from earlier months": "پچھلے مہینوں کے",
+    "Completed": "مکمل ہو چکا", "Cancelled": "منسوخ", "Missed": "چھوٹ گئی", "Scheduled": "طے شدہ",
+    "Noorani Qaida": "نورانی قاعدہ", "Qaida & Nazra Quran": "قاعدہ و ناظرہ قرآن",
+    "Tajweed": "تجوید", "Hifz-e-Quran": "حفظِ قرآن", "Islamiat": "اسلامیات",
+    "Duas & Salah": "دعائیں اور نماز", "Quran Translation": "قرآن کا ترجمہ", "Quran Understanding": "قرآن فہمی",
+    "Beginner": "ابتدائی", "Intermediate": "درمیانی", "Advanced": "اعلیٰ", "Hifz": "حفظ",
+    "Level 1": "درجہ 1", "Level 2": "درجہ 2", "Level 3": "درجہ 3",
+    "Monday": "پیر", "Tuesday": "منگل", "Wednesday": "بدھ", "Thursday": "جمعرات",
+    "Friday": "جمعہ", "Saturday": "ہفتہ", "Sunday": "اتوار",
+    "Jan": "جنوری", "Feb": "فروری", "Mar": "مارچ", "Apr": "اپریل", "May": "مئی", "Jun": "جون",
+    "Jul": "جولائی", "Aug": "اگست", "Sep": "ستمبر", "Oct": "اکتوبر", "Nov": "نومبر", "Dec": "دسمبر",
+    "January": "جنوری", "February": "فروری", "March": "مارچ", "April": "اپریل", "June": "جون",
+    "July": "جولائی", "August": "اگست", "September": "ستمبر", "October": "اکتوبر", "November": "نومبر", "December": "دسمبر",
+    "Today’s Classes": "آج کی کلاسیں", "LOCAL • OFFLINE": "مقامی • آف لائن", "Local • Offline": "مقامی • آف لائن",
+    "Learn": "سیکھیں", "Practice": "مشق کریں", "Grow in Quranic Knowledge": "قرآنی علم میں ترقی کریں",
+    "Switch to English": "انگریزی میں جائیں", "Switch to Urdu": "اردو میں جائیں",
+    "live overview from your school records": "ادارے کے ریکارڈ کا تازہ خلاصہ",
+    "No classes scheduled today": "آج کوئی کلاس طے نہیں ہے", "No payments recorded yet": "ابھی ادائیگیاں درج نہیں ہوئیں",
+    "each currency separate": "ہر کرنسی الگ دکھائی گئی ہے", "each currency separately": "ہر کرنسی الگ دکھائی گئی ہے",
+    "Change Password": "پاس ورڈ تبدیل کریں", "Customize header": "ہیڈر کی ترتیب بدلیں",
+    "First-time setup": "پہلی بار کی ترتیب", "Create Admin Login": "ایڈمن لاگ اِن بنائیں",
+    "Student report": "طلبہ کی رپورٹ", "Teacher report": "اساتذہ کی رپورٹ",
+    "Payments report": "ادائیگیوں کی رپورٹ", "Attendance report": "حاضری کی رپورٹ", "Progress report": "کارکردگی کی رپورٹ",
+    "English Report": "انگریزی رپورٹ", "Print / Save as PDF": "پرنٹ / PDF محفوظ کریں",
+    "First-time setup • Create the private administrator account": "ابتدائی ترتیب • منتظم کا نجی اکاؤنٹ بنائیں",
+    "First-time setup • Create the private administrator account.": "ابتدائی ترتیب • منتظم کا نجی اکاؤنٹ بنائیں",
+    "Administrator details": "منتظم کی تفصیلات", "Confirm password": "پاس ورڈ کی تصدیق",
+    "Password (at least 12 characters)": "پاس ورڈ (کم از کم 12 حروف)", "Check details": "تفصیلات درست کریں",
+    "Enter a username and a password of at least 12 characters.": "صارف نام اور کم از کم 12 حروف کا پاس ورڈ درج کریں۔",
+    "The two passwords do not match.": "دونوں پاس ورڈ ایک جیسے نہیں ہیں۔",
+    "Admin account created. Please log in.": "منتظم کا اکاؤنٹ بن گیا ہے۔ اب لاگ اِن کریں۔",
+    "Choose a different username.": "کوئی دوسرا صارف نام منتخب کریں۔",
+    "No records are available for this report.": "اس رپورٹ کے لیے کوئی ریکارڈ دستیاب نہیں۔",
+    "CSV report saved:": "CSV رپورٹ محفوظ ہو گئی:",
+    "Choose report": "رپورٹ منتخب کریں", "Report text size": "رپورٹ کے متن کا سائز",
+    "Report font size": "رپورٹ کے فونٹ کا سائز", "Print / Save as PDF": "پرنٹ / PDF محفوظ کریں",
+    "Choose color": "رنگ منتخب کریں", "Invalid color": "غلط رنگ",
+    "Pillow needed": "Pillow درکار ہے", "Cover image needed": "کور تصویر درکار ہے",
+    "Choose cover image": "کور تصویر منتخب کریں", "Reset header": "ہیڈر ری سیٹ کریں",
+    "Return the header to the original design?": "کیا ہیڈر کو اصل ڈیزائن پر واپس لانا ہے؟",
+    "Save & Apply": "محفوظ کریں اور لاگو کریں", "Cancel": "منسوخ کریں",
+    "Create Admin Login": "منتظم کا لاگ اِن بنائیں", "Create Admin": "منتظم بنائیں",
+    "Login failed": "لاگ اِن ناکام", "Username exists": "صارف نام پہلے سے موجود ہے",
+    "Choose a different username": "کوئی دوسرا صارف نام منتخب کریں",
+    "No students are assigned to this account. Ask the administrator to assign students first.": "اس اکاؤنٹ کے ساتھ کوئی طالب علم منسلک نہیں۔ منتظم سے طلبہ منسلک کروائیں۔",
+    "Attendance recorded.": "حاضری درج کر دی گئی۔",
+    "Create Login": "لاگ اِن بنائیں", "Username": "صارف نام", "Password": "پاس ورڈ",
+}
+
+
+def _has_urdu_text(value):
+    return any(_is_urdu_char(ch) for ch in str(value))
+
+
+def _language_text(text):
+    """Select one language from bilingual UI labels; leave user-entered data untouched."""
+    value = str(text)
+    if not value:
+        return value
+    # For bilingual UI strings, slash-separated segments are explicit equivalents.
+    # This keeps dynamic values inside their own language segment intact.
+    if re.search(r"\s+/\s+", value) and _has_urdu_text(value):
+        segments = re.split(r"\s+/\s+", value)
+        if APP_LANGUAGE == "ur":
+            selected = [part for part in segments if _has_urdu_text(part)]
+        else:
+            selected = [part for part in segments if not _has_urdu_text(part)]
+        if selected:
+            return " / ".join(selected).strip(" /\t\r\n")
+    # Mixed labels separated by bullets or other punctuation should also become single-language.
+    runs = _split_script_runs(value)
+    if _has_urdu_text(value) and runs:
+        if APP_LANGUAGE == "ur":
+            selected = [part for part, is_urdu in runs if is_urdu]
+        else:
+            selected = [part for part, is_urdu in runs if not is_urdu]
+        if selected and any(ch.isalpha() or _has_urdu_text(ch) for part in selected for ch in part):
+            candidate = "".join(selected).strip(" /|•:—-()[]\t\r\n")
+            return candidate
+        # A pure Urdu data value (e.g. a person's real name) is not a UI phrase; preserve it.
+        if APP_LANGUAGE == "en":
+            reverse = {ur: en for en, ur in _UI_TRANSLATIONS.items()}
+            if value in reverse:
+                return reverse[value]
+            return value
+    if APP_LANGUAGE == "en":
+        reverse = {ur: en for en, ur in _UI_TRANSLATIONS.items()}
+        return reverse.get(value, value)
+    if value in _UI_TRANSLATIONS:
+        return _UI_TRANSLATIONS[value]
+    for en, ur in sorted(_UI_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True):
+        value = value.replace(en, ur)
+    return value
+
+
+def _report_value_for_language(field, value, language):
+    """Translate known enum/course/day values in reports without changing names or free text."""
+    if value is None or language != "ur":
+        return "" if value is None else value
+    key = str(field or "").strip().lower()
+    text = str(value)
+    exact_fields = {
+        "course": {
+            "Noorani Qaida": "نورانی قاعدہ", "Qaida & Nazra Quran": "قاعدہ و ناظرہ قرآن",
+            "Tajweed": "تجوید", "Hifz-e-Quran": "حفظِ قرآن", "Islamiat": "اسلامیات",
+            "Duas & Salah": "دعائیں اور نماز", "Quran Translation": "قرآن کا ترجمہ",
+            "Quran Understanding": "قرآن فہمی",
+        },
+        "level": {"Beginner": "ابتدائی", "Intermediate": "درمیانی", "Advanced": "اعلیٰ",
+                  "Hifz": "حفظ", "Level 1": "درجہ 1", "Level 2": "درجہ 2", "Level 3": "درجہ 3"},
+        "status": {"Active": "فعال", "Inactive": "غیر فعال", "Pending": "زیرِ التوا",
+                   "Paused": "عارضی طور پر روک دیا گیا", "Complete": "مکمل", "Present": "حاضر",
+                   "Absent": "غیر حاضر", "Late": "تاخیر", "Leave": "رخصت", "Paid": "ادا شدہ",
+                   "Unpaid": "غیر ادا شدہ", "Partial": "جزوی ادائیگی", "Approved": "منظور شدہ",
+                   "Cancelled": "منسوخ", "Scheduled": "طے شدہ", "Missed": "چھوٹ گئی"},
+        "role": {"Administrator": "منتظم", "Teacher": "استاد", "Student": "طالب علم"},
+        "session_type": {"Regular": "باقاعدہ", "Extra": "اضافی", "Make-up": "متبادل"},
+        "class_type": {"Regular": "باقاعدہ", "Extra": "اضافی", "Make-up": "متبادل"},
+        "type": {"Regular": "باقاعدہ", "Extra": "اضافی", "Make-up": "متبادل"},
+    }
+    if key in exact_fields:
+        return exact_fields[key].get(text, text)
+    day_names = {"Monday": "پیر", "Tuesday": "منگل", "Wednesday": "بدھ", "Thursday": "جمعرات",
+                 "Friday": "جمعہ", "Saturday": "ہفتہ", "Sunday": "اتوار"}
+    if key in {"day", "weekday", "class_time", "availability"}:
+        for en, ur in sorted(day_names.items(), key=lambda item: len(item[0]), reverse=True):
+            text = re.sub(r"\b" + re.escape(en) + r"\b", ur, text)
+        return text
+    return value
+
+
+def _font_for_localized_text(text, current_font=None):
+    """Use Nastaleeq for Urdu UI text and Aptos for English while preserving size/weight."""
+    try:
+        font = current_font or (UI_FONT, 10)
+        if isinstance(font, str):
+            actual = tkfont.Font(font=font).actual()
+            size, weight, slant = actual.get("size", 10), actual.get("weight", "normal"), actual.get("slant", "roman")
+            family = actual.get("family", UI_FONT)
+        else:
+            values = tuple(font) if isinstance(font, (tuple, list)) else (UI_FONT, 10)
+            family = values[0] if values else UI_FONT
+            size = values[1] if len(values) > 1 else 10
+            weight = values[2] if len(values) > 2 else "normal"
+            slant = values[3] if len(values) > 3 else "roman"
+        try:
+            scale = max(0.8, min(1.8, float(FONT_SCALE)))
+        except (TypeError, ValueError, NameError):
+            scale = 1.0
+        size = max(8, int(round(abs(int(size or 10)) * scale)))
+        if _has_urdu_text(text):
+            return (URDU_FONT, size, weight, slant)
+        if any(ch.isalpha() for ch in str(text)) and family not in ("Symbol", "Segoe UI Symbol"):
+            return (UI_FONT, size, weight, slant)
+        return current_font
+    except Exception:
+        return (URDU_FONT if _has_urdu_text(text) else UI_FONT, 10)
+
+
+def _install_language_aware_widgets():
+    """Translate visible static labels at creation time without changing stored school data."""
+    widget_classes = (tk.Label, tk.Button, ttk.Label, ttk.Button, ttk.Checkbutton,
+                      ttk.Radiobutton, ttk.LabelFrame)
+    for cls in widget_classes:
+        if getattr(cls, "_taha_language_wrapper_installed", False):
+            continue
+        original_init = cls.__init__
+        def localized_init(self, *args, _original=original_init, _cls=cls, **kwargs):
+            text = kwargs.get("text")
+            if isinstance(text, str):
+                text = _language_text(text)
+                kwargs["text"] = text
+                # ttk.Button/Checkbutton/Radiobutton/LabelFrame use ttk styles rather
+                # than a per-widget -font option. Their fonts are switched centrally in style().
+                if _cls in (tk.Label, tk.Button) or (_cls is ttk.Label and "font" in kwargs):
+                    desired = _font_for_localized_text(text, kwargs.get("font"))
+                    if desired is not None:
+                        kwargs["font"] = desired
+                else:
+                    kwargs.pop("font", None)
+            return _original(self, *args, **kwargs)
+        cls.__init__ = localized_init
+        original_configure = cls.configure
+        def localized_configure(self, cnf=None, _original_configure=original_configure, _cls=cls, **kwargs):
+            # Tkinter accepts either configure(text=...) or configure({"text": ...}).
+            if isinstance(cnf, dict):
+                cnf = dict(cnf)
+                if isinstance(cnf.get("text"), str):
+                    cnf["text"] = _language_text(cnf["text"])
+            if isinstance(kwargs.get("text"), str):
+                kwargs["text"] = _language_text(kwargs["text"])
+                if "font" in kwargs and (_cls in (tk.Label, tk.Button, ttk.Label)):
+                    desired = _font_for_localized_text(kwargs["text"], kwargs.get("font"))
+                    if desired is not None:
+                        kwargs["font"] = desired
+            return _original_configure(self, cnf, **kwargs)
+        cls.configure = localized_configure
+        cls.config = localized_configure
+        cls._taha_language_wrapper_installed = True
+
+    # Canvas headings and chart labels use create_text rather than Label widgets.
+    if not getattr(tk.Canvas, "_taha_language_create_text_wrapper", False):
+        original_create_text = tk.Canvas.create_text
+        def localized_create_text(self, *args, **kwargs):
+            text = kwargs.get("text")
+            if isinstance(text, str):
+                text = _language_text(text)
+                kwargs["text"] = text
+                desired = _font_for_localized_text(text, kwargs.get("font"))
+                if desired is not None:
+                    kwargs["font"] = desired
+            return original_create_text(self, *args, **kwargs)
+        tk.Canvas.create_text = localized_create_text
+        tk.Canvas._taha_language_create_text_wrapper = True
+
+    # Translate dropdown captions while preserving canonical values for business logic.
+    if not getattr(ttk.Combobox, "_taha_language_values_wrapper", False):
+        original_combo_init = ttk.Combobox.__init__
+        original_combo_get = ttk.Combobox.get
+        original_combo_set = ttk.Combobox.set
+        def localized_combo_init(self, *args, **kwargs):
+            canonical_values = tuple(kwargs.get("values", ()))
+            display_values = tuple(_language_text(v) if isinstance(v, str) else v for v in canonical_values)
+            if "values" in kwargs:
+                kwargs["values"] = display_values
+            original_combo_init(self, *args, **kwargs)
+            self._taha_canonical_for_display = {str(display): canonical for canonical, display in zip(canonical_values, display_values)}
+            self._taha_display_for_canonical = {str(canonical): display for canonical, display in zip(canonical_values, display_values)}
+        def localized_combo_get(self):
+            value = original_combo_get(self)
+            return getattr(self, "_taha_canonical_for_display", {}).get(str(value), value)
+        def localized_combo_set(self, value):
+            display_value = getattr(self, "_taha_display_for_canonical", {}).get(str(value), value)
+            return original_combo_set(self, display_value)
+        ttk.Combobox.__init__ = localized_combo_init
+        ttk.Combobox.get = localized_combo_get
+        ttk.Combobox.set = localized_combo_set
+        ttk.Combobox._taha_language_values_wrapper = True
+
+    # Translate displayed status/course/level cells but keep canonical DB values for callbacks.
+    if not getattr(ttk.Treeview, "_taha_language_cell_wrapper", False):
+        original_tree_insert = ttk.Treeview.insert
+        original_tree_item = ttk.Treeview.item
+        localizable_columns = {"status", "course", "level", "class_time", "availability", "day", "weekday",
+                               "session_type", "class_type", "type", "role", "attendance_status", "class_status"}
+        def _localized_tree_values(tree, values):
+            values = tuple(values or ())
+            columns = tuple(tree.cget("columns"))
+            shown = list(values)
+            reverse = sorted(((ur, en) for en, ur in _UI_TRANSLATIONS.items()), key=lambda pair: len(pair[0]), reverse=True)
+            for i, value in enumerate(values):
+                if i >= len(columns) or not isinstance(value, str) or str(columns[i]).lower() not in localizable_columns:
+                    continue
+                text = value
+                if APP_LANGUAGE == "ur":
+                    for en, ur in sorted(_UI_TRANSLATIONS.items(), key=lambda pair: len(pair[0]), reverse=True):
+                        text = text.replace(en, ur)
+                else:
+                    for ur, en in reverse:
+                        if ur and ur in text:
+                            text = text.replace(ur, en)
+                shown[i] = text
+            return tuple(shown)
+        def localized_tree_insert(self, parent, index, iid=None, **kwargs):
+            canonical = tuple(kwargs.get("values", ()) or ())
+            if "values" in kwargs:
+                kwargs["values"] = _localized_tree_values(self, canonical)
+            result = original_tree_insert(self, parent, index, iid, **kwargs)
+            cache = getattr(self, "_taha_canonical_rows", None)
+            if cache is None:
+                cache = {}
+                self._taha_canonical_rows = cache
+            cache[result] = canonical
+            return result
+        def localized_tree_item(self, item, option=None, **kwargs):
+            cache = getattr(self, "_taha_canonical_rows", {})
+            if "values" in kwargs:
+                canonical = tuple(kwargs.get("values", ()) or ())
+                kwargs["values"] = _localized_tree_values(self, canonical)
+                result = original_tree_item(self, item, option, **kwargs)
+                cache[item] = canonical
+                self._taha_canonical_rows = cache
+                return result
+            result = original_tree_item(self, item, option, **kwargs)
+            if not kwargs:
+                canonical = cache.get(item)
+                if canonical is not None:
+                    if option == "values":
+                        return canonical
+                    if option is None and isinstance(result, dict):
+                        result = dict(result)
+                        result["values"] = canonical
+            return result
+        ttk.Treeview.insert = localized_tree_insert
+        ttk.Treeview.item = localized_tree_item
+        ttk.Treeview._taha_language_cell_wrapper = True
+
+    # Tree headings are set after construction, so translate them when assigned.
+    if not getattr(ttk.Treeview, "_taha_language_heading_wrapper", False):
+        original_heading = ttk.Treeview.heading
+        def localized_heading(self, column, option=None, **kwargs):
+            if isinstance(kwargs.get("text"), str):
+                kwargs["text"] = _language_text(kwargs["text"])
+                desired = _font_for_localized_text(kwargs["text"], None)
+            return original_heading(self, column, option, **kwargs)
+        ttk.Treeview.heading = localized_heading
+        ttk.Treeview._taha_language_heading_wrapper = True
+
+    # Localize bilingual top-level window titles and popup menu labels too.
+    if not getattr(tk.Wm, "_taha_title_language_wrapper", False):
+        original_wm_title = tk.Wm.title
+        def localized_wm_title(self, string=None):
+            if isinstance(string, str):
+                string = _language_text(string)
+            return original_wm_title(self, string)
+        tk.Wm.title = localized_wm_title
+        tk.Wm._taha_title_language_wrapper = True
+    if not getattr(tk.Menu, "_taha_menu_language_wrapper", False):
+        for _menu_method_name in ("add_command", "add_cascade", "add_radiobutton", "add_checkbutton"):
+            _original_menu_method = getattr(tk.Menu, _menu_method_name)
+            def _menu_wrapper_factory(original_method):
+                def localized_menu_method(self, *args, **kwargs):
+                    if isinstance(kwargs.get("label"), str):
+                        kwargs["label"] = _language_text(kwargs["label"])
+                    if isinstance(kwargs.get("accelerator"), str):
+                        kwargs["accelerator"] = _language_text(kwargs["accelerator"])
+                    return original_method(self, *args, **kwargs)
+                return localized_menu_method
+            setattr(tk.Menu, _menu_method_name, _menu_wrapper_factory(_original_menu_method))
+        tk.Menu._taha_menu_language_wrapper = True
+
+    # All standard dialogs already carry paired English/Urdu messages; display only the active side.
+    for method_name in ("showinfo", "showwarning", "showerror", "askyesno", "askokcancel", "askretrycancel"):
+        original = getattr(messagebox, method_name, None)
+        if not original or getattr(original, "_taha_language_wrapper", False):
+            continue
+        def wrap_dialog(fn):
+            def localized_dialog(title=None, message=None, **kwargs):
+                if title is not None:
+                    title = _language_text(title)
+                if message is not None:
+                    message = _language_text(message)
+                return fn(title, message, **kwargs)
+            localized_dialog._taha_language_wrapper = True
+            return localized_dialog
+        setattr(messagebox, method_name, wrap_dialog(original))
+
+_install_language_aware_widgets()
+
+
+def smart_label(factory, parent, **kwargs):
+    """Create a visible label in the active language and use its matching font."""
+    text = kwargs.get("text")
+    if text is not None and not kwargs.get("textvariable") and not kwargs.get("image"):
+        text = _language_text(text)
+        kwargs["text"] = text
+        # Preserve mixed-script data, but split remaining bilingual label runs so
+        # the Urdu characters never inherit Aptos and English never inherits Nastaleeq.
+        runs = _split_script_runs(text)
+        if runs and len(runs) > 1 and factory in (tk.Label, ttk.Label):
+            bg = kwargs.get("bg", kwargs.get("background"))
+            frame = tk.Frame(parent, bg=bg if bg else parent.cget("background")) if factory is tk.Label else ttk.Frame(parent)
+            font = kwargs.get("font", (UI_FONT, 10))
+            try:
+                vals = tuple(font) if isinstance(font, (tuple, list)) else (font, 10)
+                size = vals[1] if len(vals) > 1 else 10
+                weight = vals[2] if len(vals) > 2 else "normal"
+            except Exception:
+                size, weight = 10, "normal"
+            options = dict(kwargs)
+            options.pop("text", None)
+            options.pop("textvariable", None)
+            options.pop("width", None)
+            options.pop("height", None)
+            for part, is_urdu in runs:
+                if not part:
+                    continue
+                piece_options = dict(options)
+                piece_options["font"] = (URDU_FONT if is_urdu else UI_FONT, size, weight)
+                factory(frame, text=part, **piece_options).pack(side="left", anchor="w")
+            return frame
+        # The installed widget constructor selects script-specific font and scale exactly once.
+    return factory(parent, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+
+def apply_script_fonts(root):
+    """Apply script-appropriate fonts in small UI-thread batches instead of freezing large screens."""
+    try:
+        families = {str(name).casefold(): str(name) for name in root.tk.call("font", "families")}
+        english_family = families.get(str(UI_FONT).casefold(), str(UI_FONT) or "Arial")
+        urdu_family = choose_urdu_font(root)
+        urdu_ranges = ((0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF),
+                       (0xFB50, 0xFDFF), (0xFE70, 0xFEFF))
+
+        # Coalesce overlapping requests, such as a quick series of tab changes.
+        generation = int(getattr(root, "_taha_font_scan_generation", 0)) + 1
+        root._taha_font_scan_generation = generation
+        old_after = getattr(root, "_taha_font_scan_after_id", None)
+        if old_after:
+            try:
+                root.after_cancel(old_after)
+            except tk.TclError:
+                pass
+        pending_widgets = list(reversed(root.winfo_children()))
+        style_owner = root._root() if hasattr(root, "_root") else root
+        tree_style_cache = getattr(style_owner, "_taha_tree_font_style_cache", {})
+
+        def has_urdu(value):
+            return any(lo <= ord(ch) <= hi for ch in value for lo, hi in urdu_ranges)
+
+        def get_text(widget):
+            cls = str(widget.winfo_class())
+            try:
+                # Canvas labels are processed once in the canvas-specific branch below.
+                if cls == "Canvas":
+                    return ""
+                if cls == "Text":
+                    return widget.get("1.0", "end-1c")
+                if cls in ("Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox"):
+                    return str(widget.get())
+                value = str(widget.cget("text"))
+                if value:
+                    return value
+                var = str(widget.cget("textvariable"))
+                if var:
+                    return str(root.getvar(var))
+            except Exception:
+                pass
+            return ""
+
+        def set_font(widget, family):
+            try:
+                base = getattr(widget, "_taha_base_font_metrics", None)
+                if base is None:
+                    old = tkfont.Font(root=root, font=widget.cget("font"))
+                    actual = old.actual()
+                    base = (abs(int(actual.get("size", 10))) or 10,
+                            actual.get("weight", "normal"), actual.get("slant", "roman"))
+                    widget._taha_base_font_metrics = base
+                base_size, weight, slant = base
+                cls = str(widget.winfo_class())
+                sizes = getattr(root, "_taha_font_sizes", {})
+                try:
+                    global_size = max(9, min(24, int(sizes.get("global", 12))))
+                    if cls in ("Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox", "Text"):
+                        area = "fields"
+                    elif cls in ("Button", "TButton", "Checkbutton", "TCheckbutton", "Radiobutton", "TRadiobutton", "Menubutton", "TMenubutton"):
+                        area = "buttons"
+                    elif cls == "Treeview":
+                        area = "tables"
+                    elif weight == "bold" or base_size >= 14 or cls in ("Labelframe", "TLabelframe"):
+                        area = "heading"
+                    else:
+                        area = "body"
+                    area_size = max(9, min(24, int(sizes.get(area, global_size))))
+                    # Keep each widget's original relative scale while allowing a size per area.
+                    desired_size = int(round(base_size * area_size / 10.0))
+                except (TypeError, ValueError):
+                    desired_size = int(round(base_size * FONT_SCALE))
+                desired = (family, max(8, desired_size), weight, slant)
+                if getattr(widget, "_taha_applied_font_spec", None) == desired:
+                    return
+                widget.configure(font=desired)
+                widget._taha_applied_font_spec = desired
+            except (tk.TclError, TypeError, ValueError):
+                pass
+
+        def process_widget(widget):
+            cls = str(widget.winfo_class())
+            text = get_text(widget)
+            contains_urdu = has_urdu(text)
+            family = urdu_family if contains_urdu else english_family
+            if cls in ("Label", "Button", "Checkbutton", "Radiobutton", "Menubutton",
+                       "TLabel", "TButton", "TCheckbutton", "TRadiobutton", "TMenubutton",
+                       "Entry", "TEntry", "Combobox", "TCombobox", "Spinbox", "TSpinbox",
+                       "Text", "Listbox", "Scale", "TScale"):
+                set_font(widget, family)
+            elif cls == "Treeview":
+                try:
+                    stylename = str(widget.cget("style") or "Treeview")
+                    base_tree_size = getattr(widget, "_taha_tree_base_size", 10)
+                    tree_font_family = urdu_family if APP_LANGUAGE == "ur" else english_family
+                    tree_rowheight = int(round((38 if APP_LANGUAGE == "ur" else 30) * FONT_SCALE))
+                    desired = (tree_font_family, max(8, int(round(base_tree_size * FONT_SCALE))))
+                    if tree_style_cache.get(stylename) != desired:
+                        ttk.Style(root).configure(stylename, font=desired, rowheight=tree_rowheight)
+                        ttk.Style(root).configure(stylename + ".Heading", font=(tree_font_family, max(8, int(round(base_tree_size * FONT_SCALE))), "bold"))
+                        tree_style_cache[stylename] = desired
+                except Exception:
+                    pass
+            elif cls == "Canvas":
+                try:
+                    base_cache = getattr(widget, "_taha_canvas_font_base", {})
+                    applied_cache = getattr(widget, "_taha_canvas_font_applied", {})
+                    for item in widget.find_all():
+                        if widget.type(item) != "text":
+                            continue
+                        value = str(widget.itemcget(item, "text"))
+                        base = base_cache.get(item)
+                        if base is None:
+                            old = widget.itemcget(item, "font") or (english_family, 10)
+                            try:
+                                actual = tkfont.Font(root=root, font=old).actual()
+                                base = (abs(int(actual.get("size", 10))) or 10, actual.get("weight", "normal"))
+                            except Exception:
+                                base = (10, "normal")
+                            base_cache[item] = base
+                        size, weight = base
+                        item_family = urdu_family if has_urdu(value) else english_family
+                        signature = (item_family, size, weight)
+                        if applied_cache.get(item) != signature:
+                            widget.itemconfigure(item, font=(item_family, size, weight))
+                            applied_cache[item] = signature
+                    widget._taha_canvas_font_base = base_cache
+                    widget._taha_canvas_font_applied = applied_cache
+                except Exception:
+                    pass
+
+        def scan_batch():
+            try:
+                if not root.winfo_exists() or getattr(root, "_taha_font_scan_generation", None) != generation:
+                    return
+                processed = 0
+                while pending_widgets and processed < 45:
+                    widget = pending_widgets.pop()
+                    try:
+                        if not widget.winfo_exists():
+                            continue
+                        process_widget(widget)
+                        # Use a stack so each chunk remains bounded and no recursive full-tree walk occurs.
+                        pending_widgets.extend(reversed(widget.winfo_children()))
+                    except tk.TclError:
+                        continue
+                    processed += 1
+                if pending_widgets:
+                    root._taha_font_scan_after_id = root.after(2, scan_batch)
+                else:
+                    root._taha_font_scan_after_id = None
+                    style_owner._taha_tree_font_style_cache = tree_style_cache
+            except (tk.TclError, RuntimeError, AttributeError):
+                root._taha_font_scan_after_id = None
+
+        root._taha_font_scan_after_id = root.after_idle(scan_batch)
+    except (tk.TclError, RuntimeError, AttributeError):
+        pass
+
+# Refined visual system: reusable colors for a clean, premium desktop UI.
+APP_BG = DEFAULT_BACKGROUND_COLOR
+CARD_BG = "#FFFFFF"
+BORDER = "#D9E3DF"
+GOLD = "#FFF3D6"
+SOFT_GREEN = "#E8F4EE"
+GREEN_HOVER = "#0B624A"
+DEFAULT_DB = r"D:\TAHA_SCHOOL_DATA\taha_school.db"
+PROJECT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taha_school.db")
+COURSES = [
+    "Noorani Qaida", "Qaida & Nazra Quran", "Tajweed", "Hifz-e-Quran",
+    "Islamiat", "Duas & Salah", "Quran Translation", "Quran Understanding"
+]
+
+# Detailed, editable-in-code syllabus outlines. The selected app language chooses
+# the matching content; canonical English course keys remain unchanged in records.
+COURSE_CATALOG = {
+    "Noorani Qaida": {
+        "en": {"title": "Noorani Qaida", "summary": "A step-by-step foundation for recognising Arabic letters and reading Quranic words correctly.",
+               "goal": "Build accurate letter recognition, pronunciation and confident beginner reading.",
+               "units": ["Arabic letter recognition and names", "Letter shapes at the beginning, middle and end of words", "Makharij: basic articulation points", "Harakat: Fatha, Kasra and Damma", "Tanween and sukoon", "Madd letters and basic stretching", "Tashdeed and doubled sounds", "Joining letters and reading short words", "Guided revision and reading assessment"],
+               "outcomes": ["Recognise Arabic letters and their connected forms", "Read common combinations with correct short vowels", "Apply basic pronunciation and stretching rules"]},
+        "ur": {"title": "نورانی قاعدہ", "summary": "عربی حروف پہچاننے اور قرآنی الفاظ درست پڑھنے کی مرحلہ وار بنیاد۔",
+               "goal": "حروف کی درست پہچان، تلفظ اور ابتدائی روانی پیدا کرنا۔",
+               "units": ["عربی حروف کی پہچان اور نام", "لفظ کے شروع، درمیان اور آخر میں حروف کی شکلیں", "مخارجِ حروف کا ابتدائی تعارف", "حرکات: زبر، زیر اور پیش", "تنوین اور سکون", "حروفِ مد اور بنیادی کھینچاؤ", "تشدید اور دوہرے صوتی اثرات", "حروف ملا کر مختصر الفاظ پڑھنا", "دہرائی اور ابتدائی قرأت کا جائزہ"],
+               "outcomes": ["عربی حروف اور ان کی جڑی ہوئی شکلیں پہچاننا", "عام حروفی ترکیبیں درست حرکات کے ساتھ پڑھنا", "بنیادی تلفظ اور مد کے اصول اپنانا"]},
+    },
+    "Qaida & Nazra Quran": {
+        "en": {"title": "Qaida & Nazra Quran", "summary": "A structured transition from Qaida practice to accurate, fluent Quran recitation.",
+               "goal": "Read assigned Quran passages accurately with attention to pronunciation, pacing and stopping signs.",
+               "units": ["Qaida review and diagnostic reading", "Word blending and fluency exercises", "Reading short and long Quranic words", "Practical pronunciation correction", "Introductory Tajweed in recitation", "Waqf signs and suitable stopping", "Daily lesson and cumulative revision", "Reading fluency and accuracy assessment"],
+               "outcomes": ["Read assigned passages with increasing fluency", "Recognise common stopping signs", "Identify and correct recurring pronunciation errors"]},
+        "ur": {"title": "قاعدہ و ناظرہ قرآن", "summary": "قاعدہ کی مشق سے قرآنِ کریم کی درست اور رواں تلاوت تک منظم نصاب۔",
+               "goal": "تلفظ، رفتار اور علاماتِ وقف کا خیال رکھتے ہوئے مقررہ آیات درست پڑھنا۔",
+               "units": ["قاعدہ کی دہرائی اور ابتدائی جائزہ", "الفاظ جوڑنے اور روانی کی مشق", "چھوٹے اور بڑے قرآنی الفاظ کی قرأت", "عملی طور پر تلفظ کی اصلاح", "تلاوت میں تجوید کا ابتدائی استعمال", "علاماتِ وقف اور مناسب جگہ رکنا", "روزانہ سبق اور پچھلے اسباق کی دہرائی", "روانی اور درستگی کا جائزہ"],
+               "outcomes": ["مقررہ آیات بتدریج بہتر روانی سے پڑھنا", "عام علاماتِ وقف پہچاننا", "بار بار ہونے والی تلفظ کی غلطیاں درست کرنا"]},
+    },
+    "Tajweed": {
+        "en": {"title": "Tajweed", "summary": "Applied rules for reciting the Quran with correct articulation and measured recitation.",
+               "goal": "Understand core Tajweed rules and apply them during supervised recitation.",
+               "units": ["Makharij and Sifaat of letters", "Noon sakin and tanween rules", "Meem sakin rules", "Ghunnah and its appropriate duration", "Qalqalah letters and practice", "Madd types and measured length", "Rules of ra and laam where applicable", "Waqf and ibtida: stopping and restarting", "Listening, correction and practical assessment"],
+               "outcomes": ["Explain and identify core recitation rules", "Apply rules in selected passages", "Improve consistency through listening and guided practice"]},
+        "ur": {"title": "تجوید", "summary": "قرآنِ کریم کو درست مخارج اور مناسب انداز میں پڑھنے کے عملی اصول۔",
+               "goal": "تجوید کے بنیادی قواعد سمجھنا اور استاد کی نگرانی میں تلاوت پر لاگو کرنا۔",
+               "units": ["مخارج اور صفاتِ حروف", "نون ساکن اور تنوین کے احکام", "میم ساکن کے احکام", "غنہ اور اس کی مناسب مقدار", "قلقلہ کے حروف اور مشق", "مد کی اقسام اور مقدار", "راء اور لام کے متعلقہ احکام", "وقف و ابتدا: رکنے اور دوبارہ شروع کرنے کے اصول", "سماعت، اصلاح اور عملی جائزہ"],
+               "outcomes": ["تلاوت کے بنیادی قواعد سمجھنا اور پہچاننا", "منتخب آیات میں قواعد کا اطلاق کرنا", "سماعت اور مسلسل مشق سے ادائیگی بہتر کرنا"]},
+    },
+    "Hifz-e-Quran": {
+        "en": {"title": "Hifz-e-Quran", "summary": "A balanced memorisation programme with new lesson, recent revision and long-term revision.",
+               "goal": "Build accurate memorisation and durable revision habits at an individually suitable pace.",
+               "units": ["Baseline assessment and personal memorisation plan", "Sabaq: new lesson with careful listening", "Sabqi: revision of recently memorised portions", "Manzil: systematic older revision", "Tajweed and pronunciation during memorisation", "Daily repetition and home revision routine", "Weekly review and mistake log", "Periodic listening tests and progress review"],
+               "outcomes": ["Follow a realistic daily memorisation plan", "Maintain recently learned and older portions", "Track errors and demonstrate retention in review tests"]},
+        "ur": {"title": "حفظِ قرآن", "summary": "نئے سبق، حالیہ دہرائی اور پرانے محفوظ حصے کی متوازن ترتیب۔",
+               "goal": "طالب علم کی استعداد کے مطابق درست حفظ اور مستقل دہرائی کی عادت بنانا۔",
+               "units": ["ابتدائی جائزہ اور انفرادی منصوبۂ حفظ", "سبق: نئے حصے کو سن کر اور دہرا کر یاد کرنا", "سبقی: حالیہ محفوظ حصے کی دہرائی", "منزل: پرانے محفوظ حصے کی منظم دہرائی", "حفظ کے ساتھ تجوید اور درست تلفظ", "روزانہ تکرار اور گھر کی دہرائی کا معمول", "ہفتہ وار جائزہ اور غلطیوں کا ریکارڈ", "دورانی سماعت اور پیش رفت کا جائزہ"],
+               "outcomes": ["قابلِ عمل روزانہ منصوبے کے مطابق حفظ کرنا", "نئے اور پرانے محفوظ حصے برقرار رکھنا", "غلطیوں کا ریکارڈ رکھ کر جائزوں میں یادداشت دکھانا"]},
+    },
+    "Islamiat": {
+        "en": {"title": "Islamiat", "summary": "Age-appropriate Islamic beliefs, worship, character and everyday practice.",
+               "goal": "Connect foundational Islamic knowledge with respectful conduct and daily life.",
+               "units": ["Core beliefs and the articles of faith", "Pillars of Islam and their meaning", "Life of Prophet Muhammad ﷺ: selected events and lessons", "Stories and lessons from the prophets", "Good manners, honesty and keeping promises", "Family, neighbour and community rights", "Cleanliness, responsibility and daily worship", "Age-appropriate questions, review and reflection"],
+               "outcomes": ["Describe key foundational beliefs and practices", "Recognise examples of good character", "Relate lessons to daily choices and responsibilities"]},
+        "ur": {"title": "اسلامیات", "summary": "عمر اور جماعت کے مطابق بنیادی عقائد، عبادات، اخلاق اور روزمرہ اسلامی تعلیمات۔",
+               "goal": "بنیادی اسلامی علم کو اچھے کردار اور روزمرہ زندگی سے جوڑنا۔",
+               "units": ["بنیادی عقائد اور ارکانِ ایمان", "ارکانِ اسلام اور ان کا مفہوم", "سیرتِ نبوی ﷺ کے منتخب واقعات اور اسباق", "انبیاء علیہم السلام کے واقعات اور رہنمائی", "اچھے اخلاق، سچائی اور وعدے کی پابندی", "والدین، پڑوسی اور معاشرے کے حقوق", "صفائی، ذمہ داری اور روزمرہ عبادات", "عمر کے مطابق سوالات، دہرائی اور غوروفکر"],
+               "outcomes": ["بنیادی عقائد اور عبادات بیان کرنا", "اچھے کردار کی مثالیں پہچاننا", "تعلیمات کو روزمرہ فیصلوں اور ذمہ داریوں سے جوڑنا"]},
+    },
+    "Duas & Salah": {
+        "en": {"title": "Duas & Salah", "summary": "Practical learning of purification, prayer, daily supplications and their meanings.",
+               "goal": "Perform basic worship steps confidently and learn selected supplications with understanding.",
+               "units": ["Purity and cleanliness; wudu steps", "Prayer times, preparation and conditions of Salah", "Prayer positions and sequence", "Essential recitations and their pronunciation", "Daily supplications for common situations", "Morning and evening remembrances", "Meanings and practical use of selected duas", "Guided prayer practice and review"],
+               "outcomes": ["Demonstrate the steps of wudu and Salah", "Recite selected duas with improving accuracy", "Understand when and why selected supplications are used"]},
+        "ur": {"title": "دعائیں اور نماز", "summary": "طہارت، نماز، روزمرہ دعاؤں اور ان کے معانی کی عملی تعلیم۔",
+               "goal": "عبادت کے بنیادی مراحل اعتماد سے ادا کرنا اور منتخب دعائیں سمجھ کر یاد کرنا۔",
+               "units": ["پاکیزگی اور وضو کے مراحل", "نماز کے اوقات، تیاری اور شرائط", "نماز کی حرکات اور ترتیب", "ضروری قرأت اور ان کا درست تلفظ", "روزمرہ کے عام مواقع کی دعائیں", "صبح و شام کے اذکار", "منتخب دعاؤں کے معانی اور عملی استعمال", "نماز کی رہنمائی کے ساتھ مشق اور دہرائی"],
+               "outcomes": ["وضو اور نماز کے مراحل عملی طور پر دکھانا", "منتخب دعائیں بتدریج درست پڑھنا", "دعاؤں کے مواقع اور مفہوم سمجھنا"]},
+    },
+    "Quran Translation": {
+        "en": {"title": "Quran Translation", "summary": "A guided introduction to Quranic vocabulary and the meaning of selected verses.",
+               "goal": "Help learners understand the plain meaning of selected passages without replacing qualified tafsir.",
+               "units": ["Common Quranic words and repeated expressions", "Word-by-word meaning of selected short surahs", "Basic Arabic word patterns and pronouns", "Sentence structure and verse meaning", "Meaning of selected passages in context", "Key themes and connections between verses", "Vocabulary revision and short comprehension tasks", "Oral explanation and learning review"],
+               "outcomes": ["Recognise frequently repeated Quranic vocabulary", "Follow word-by-word meaning in selected passages", "Summarise the basic meaning of studied verses responsibly"]},
+        "ur": {"title": "قرآن کا ترجمہ", "summary": "قرآنی الفاظ اور منتخب آیات کے مفہوم کو سمجھنے کا رہنمائی پر مبنی تعارف۔",
+               "goal": "منتخب آیات کا سادہ مفہوم سمجھنے میں مدد دینا؛ یہ مستند تفسیر کا متبادل نہیں۔",
+               "units": ["عام قرآنی الفاظ اور بار بار آنے والی تراکیب", "منتخب مختصر سورتوں کا لفظ بہ لفظ مطلب", "عربی الفاظ کی بنیادی ساختیں اور ضمائر", "جملے کی ساخت اور آیت کا مفہوم", "سیاق کے ساتھ منتخب آیات کے معانی", "اہم موضوعات اور آیات کا باہمی ربط", "الفاظ کی دہرائی اور مختصر فہم کی مشقیں", "زبانی وضاحت اور تعلیمی جائزہ"],
+               "outcomes": ["بار بار آنے والے قرآنی الفاظ پہچاننا", "منتخب آیات کا لفظی مطلب سمجھنا", "پڑھی گئی آیات کا بنیادی مفہوم ذمہ داری سے بیان کرنا"]},
+    },
+    "Quran Understanding": {
+        "en": {"title": "Quran Understanding", "summary": "Theme-based study that connects Quranic messages with character, reflection and daily life.",
+               "goal": "Build thoughtful engagement with selected Quranic passages using age-appropriate, reliable teaching.",
+               "units": ["How to approach a passage and identify its central theme", "Themes of mercy, justice, patience and gratitude", "Prophetic stories and their lessons", "Character, family and social responsibilities", "Reflection on creation and personal conduct", "Connecting related verses and themes", "Age-appropriate context and reliable explanation", "Reflection journal, discussion and review"],
+               "outcomes": ["Identify the main message of selected passages", "Connect studied themes with ethical choices", "Express reflections respectfully and distinguish translation from tafsir"]},
+        "ur": {"title": "قرآن فہمی", "summary": "منتخب قرآنی پیغامات کو اخلاق، غوروفکر اور روزمرہ زندگی سے جوڑ کر سمجھنا۔",
+               "goal": "عمر کے مطابق اور معتبر رہنمائی کے ساتھ منتخب آیات پر غوروفکر کی صلاحیت پیدا کرنا۔",
+               "units": ["آیات کے مجموعے کو پڑھنا اور مرکزی موضوع پہچاننا", "رحمت، انصاف، صبر اور شکر کے موضوعات", "انبیاء کے واقعات اور ان سے ملنے والے اسباق", "کردار، خاندان اور معاشرتی ذمہ داریاں", "کائنات اور اپنے عمل پر غوروفکر", "متعلقہ آیات اور موضوعات میں ربط", "عمر کے مطابق سیاق اور معتبر وضاحت", "غوروفکر کی ڈائری، گفتگو اور دہرائی"],
+               "outcomes": ["منتخب آیات کا مرکزی پیغام پہچاننا", "پڑھے گئے موضوعات کو اخلاقی فیصلوں سے جوڑنا", "ترجمے اور تفسیر کے فرق کو سمجھتے ہوئے مؤدبانہ اظہار کرنا"]},
+    },
+}
+
+
+# Detailed bilingual teacher lesson cores: one entry for every topic in COURSE_CATALOG.
+CURRICULUM_DETAILED_CORES = {'Noorani Qaida': [("Begin with recognition rather than speed. Explain that each Arabic letter has a name, a written shape, and a sound; these are related but are not the same thing. Show only a small set at first, compare look-alike letters from the approved Qaida, and draw attention to dots and their positions. Let the child see the letter, hear the teacher pronounce it, point to it, and then say it. Keep examples in the learner's current lesson and do not ask the child to guess from memory alone.", 'رفتار سے پہلے پہچان مضبوط کریں۔ سمجھائیں کہ ہر عربی حرف کا نام، لکھی ہوئی شکل اور آواز ہوتی ہے؛ یہ تینوں متعلق تو ہیں لیکن ایک چیز نہیں۔ ابتدا میں چند حروف دکھائیں، منظور شدہ قاعدے میں ملتے جلتے حروف کا موازنہ کریں اور نقطوں کی تعداد اور جگہ واضح کریں۔ بچہ پہلے حرف دیکھے، استاد کی آواز سنے، پھر اس کی طرف اشارہ کرکے خود ادا کرے۔ مثالیں اسی قاعدے سے لیں جو بچے کے درجے کے مطابق ہو اور محض اندازے سے پڑھنے کی عادت نہ بننے دیں۔'), ('A letter can look different when it joins a word, yet it remains the same letter. Compare isolated, initial, medial, and final forms using the course Qaida. Teach the child to notice the main body and dots, then trace how the letter connects to its neighbour. Some Arabic letters do not connect to the following letter; use the exact examples in the approved lesson instead of expecting every shape to join. Ask learners to match forms before reading complete words.', 'ایک حرف لفظ میں جڑنے پر مختلف دکھائی دے سکتا ہے، مگر اس کی شناخت وہی رہتی ہے۔ قاعدے سے حرف کی الگ، ابتدائی، درمیانی اور آخری شکلوں کا موازنہ کروائیں۔ بچے کو بنیادی شکل اور نقطوں پر توجہ دینا سکھائیں، پھر دکھائیں کہ حرف اپنے پڑوسی حرف سے کیسے جڑتا ہے۔ عربی کے بعض حروف اپنے بعد آنے والے حرف سے نہیں جڑتے؛ اس لیے منظور شدہ قاعدے کی اصل مثالیں استعمال کریں اور ہر حرف کے جڑنے کی توقع نہ دلائیں۔ مکمل لفظ پڑھنے سے پہلے شکلیں ملوانے کی مشق کروائیں۔'), ('Makharij means the points or areas from which letter sounds are articulated. Introduce the broad areas—throat, tongue, lips, and nasal passage—without turning the lesson into a medical diagram. The teacher should model the sound accurately from a trusted recitation and invite the learner to listen before repeating. Compare only sounds that the learner can safely attempt. Explain that a sound is not corrected by shouting or forcing the mouth; slow listening, gentle modelling, and one correction at a time are more effective.', 'مخارج سے مراد وہ جگہیں ہیں جہاں سے حروف کی آواز ادا ہوتی ہے۔ ابتدائی سبق میں حلق، زبان، ہونٹ اور ناک کی گونج جیسے بڑے حصوں کا تعارف دیں، مگر اسے پیچیدہ جسمانی خاکہ نہ بنائیں۔ استاد معتبر قرأت سے درست آواز کا نمونہ دے اور بچے سے پہلے توجہ سے سننے، پھر دہرانے کو کہے۔ صرف انہی آوازوں کا تقابل کریں جن کی مشق بچے کے لیے مناسب ہو۔ آواز درست کرنے کے لیے چیخنا یا منہ پر زور ڈالنا ضروری نہیں؛ آہستہ سننا، صحیح نمونہ اور ایک وقت میں ایک اصلاح زیادہ مفید ہے۔'), ("Harakat are short vowel signs that change how a consonant is read. Keep the letter fixed and change only the sign: Fatha is conventionally taught with an 'a' sound, Kasra with an 'i' sound, and Damma with a 'u' sound, following the school's pronunciation standard. The child should learn to identify the sign before saying the sound. Avoid lengthening a short vowel into a Madd sound. Use the same letter in a three-way contrast, then mix examples so the child must recognise, not merely memorise the order.", "حرکات مختصر آوازوں کی علامتیں ہیں جو حرف پڑھنے کا طریقہ بدلتی ہیں۔ حرف ایک ہی رکھیں اور صرف علامت بدلیں: مدرسے کے تلفظ کے معیار کے مطابق زبر سے عموماً 'اَ'، زیر سے 'اِ' اور پیش سے 'اُ' کی مختصر آواز سکھائی جاتی ہے۔ بچے کو آواز ادا کرنے سے پہلے حرکت پہچاننا سکھائیں۔ مختصر حرکت کو مد کی طرح لمبا نہ کریں۔ ایک ہی حرف کی تینوں صورتوں کا تقابل کروائیں، پھر مثالوں کی ترتیب بدل دیں تاکہ بچہ صرف ترتیب یاد نہ کرے بلکہ علامت پہچانے۔"), ('Tanween is shown by paired vowel signs and is commonly heard as an n-like ending in the relevant reading context. Sukoon marks a consonant without a following short vowel. Demonstrate the difference using the approved Qaida examples and read each item slowly first, then naturally. A common beginner error is adding an extra vowel after a sakin letter or separating the final sound unnecessarily. Ask the learner to point to the sign, explain what it signals, and read the complete combination without inserting an extra sound.', 'تنوین دوہری حرکت سے ظاہر ہوتی ہے اور متعلقہ قرأت میں آخر پر نون جیسی آواز سنائی دیتی ہے۔ سکون بتاتا ہے کہ حرف کے ساتھ اس کے بعد مختصر حرکت نہیں ہے۔ منظور شدہ قاعدے کی مثالوں سے دونوں کا فرق واضح کریں؛ پہلے آہستہ، پھر مناسب رفتار سے پڑھیں۔ نئے طالب علم کی عام غلطی ساکن حرف کے بعد اضافی حرکت لگا دینا یا آخری آواز کو غیر ضروری طور پر الگ کرنا ہے۔ بچے سے علامت کی طرف اشارہ، اس کا مطلب بیان اور پوری ترکیب بغیر اضافی آواز کے پڑھنے کو کہیں۔'), ("Madd means extending a sound where the written pattern and recitation rule require it. At beginner level, connect the familiar long-vowel letters to the relevant preceding vowel as taught in the approved Qaida: Alif with Fatha, Ya sakin with Kasra, and Waw sakin with Damma in the standard beginner presentation. This is not permission to stretch every sound freely. Model a short contrast between a short vowel and a Madd example, keep the duration consistent with the school's method, and ask the learner to identify why the sound is longer.", 'مد کا مطلب وہاں آواز کو کھینچنا ہے جہاں لکھی ہوئی ترکیب اور قرأت کا قاعدہ اس کا تقاضا کرے۔ ابتدائی درجے میں منظور شدہ قاعدے کے مطابق حروفِ مد کو ان سے پہلے آنے والی حرکت سے جوڑ کر سمجھائیں: زبر کے بعد الف، زیر کے بعد ساکن یا، اور پیش کے بعد ساکن واو کی معروف ابتدائی مثالیں۔ اس کا مطلب یہ نہیں کہ ہر آواز کو اپنی مرضی سے لمبا کیا جائے۔ مختصر حرکت اور مد کی مثال کا فرق دکھائیں، مقدار یکساں رکھیں اور بچے سے پوچھیں کہ آواز کہاں اور کیوں لمبی ہے۔'), ('Shaddah indicates that the consonant is strengthened or doubled in the reading pattern. Teach the child to give the letter its full value rather than skipping it or inserting an unrelated vowel. Compare a teacher-approved pair with and without Shaddah, first slowly and then inside the full word. Explain the practical sequence gently: hold the first part appropriately and move into the vowelled part without a false pause. Listen for clarity, not force. The learner should locate the sign and repeat the full word accurately.', 'تشدید اس بات کی علامت ہے کہ قرأت میں حرف کو مضبوط یا دوہری ادائیگی کے ساتھ پڑھا جاتا ہے۔ بچے کو بتائیں کہ حرف کو نہ چھوڑے اور نہ اس میں غیر ضروری حرکت شامل کرے۔ منظور شدہ مثال میں تشدید کے ساتھ اور بغیر تشدید کا تقابل پہلے آہستہ، پھر پورے لفظ کے اندر کروائیں۔ عملی طور پر سمجھائیں کہ حرف کا پہلا حصہ مناسب طور پر ادا کرکے حرکت والے حصے میں منتقل ہونا ہے، درمیان میں غلط وقفہ نہیں دینا۔ زور لگانے کے بجائے صاف ادائیگی سنیں۔ بچہ تشدید کی جگہ پہچان کر پورا لفظ درست دہرائے۔'), ("Reading a word means joining its sounds in the written order instead of naming each letter separately forever. Begin by pointing to each letter and sign, then blend two small parts and finally read the whole word. Keep a steady pace and do not encourage guessing from the word's overall shape. If the learner makes an error, return to the exact letter or sign that caused it, model that part, and blend again. Increase word length only when the previous pattern is reasonably secure.", 'لفظ پڑھنے کا مطلب حروف کو لکھی ہوئی ترتیب کے مطابق ملانا ہے، نہ کہ ہمیشہ ہر حرف کا نام الگ الگ بولتے رہنا۔ پہلے ہر حرف اور حرکت کی طرف اشارہ کریں، پھر دو چھوٹے حصے ملائیں اور آخر میں پورا لفظ پڑھوائیں۔ رفتار مناسب رکھیں اور لفظ کی مجموعی شکل دیکھ کر اندازہ لگانے کی حوصلہ افزائی نہ کریں۔ غلطی ہو تو اسی حرف یا حرکت کی طرف واپس جائیں جس سے غلطی ہوئی، نمونہ دیں اور پھر دوبارہ ملوا کر پڑھائیں۔ پچھلی ترکیب مضبوط ہونے پر ہی لفظ کی لمبائی بڑھائیں۔'), ('A review lesson should reveal what the learner can do independently, not just what the learner can repeat immediately after the teacher. Choose a balanced sample of letters, connected forms, short vowels, sukoon, Madd, Shaddah, and short words from material already taught. First allow an independent attempt, then give one prompt if needed, and record recurring errors accurately. Do not introduce a large new rule during the assessment. End by naming a strength and one next practice goal so the child understands progress as a series of achievable steps.', 'دہرائی کے سبق میں یہ جانچیں کہ بچہ خود کیا کر سکتا ہے، نہ کہ صرف استاد کے فوراً بعد دہرا سکتا ہے۔ پہلے پڑھے ہوئے مواد سے حروف، جڑی شکلیں، حرکات، سکون، مد، تشدید اور مختصر الفاظ کا متوازن نمونہ منتخب کریں۔ پہلے خود کوشش کا موقع دیں، ضرورت پر ایک اشارہ دیں اور بار بار ہونے والی غلطیاں درست طور پر نوٹ کریں۔ جائزے کے دوران بڑی نئی قاعدہ بندی شروع نہ کریں۔ آخر میں بچے کی ایک خوبی اور اگلی مشق کا ایک ہدف بتائیں تاکہ ترقی قابلِ حصول مراحل میں نظر آئے۔')], 'Qaida & Nazra Quran': [('A diagnostic reading is a kind starting point, not an exam designed to embarrass the child. Ask the learner to read a short familiar passage and listen for letter identity, vowel accuracy, joining, Madd, stopping and confidence. Do not correct every issue at once. Note two strengths and one priority. Explain that the plan is personalised: strong areas will be reviewed briefly, while the main teaching time is spent on the most useful next skill.', 'ابتدائی قرأت کا جائزہ بچے کو شرمندہ کرنے والا امتحان نہیں بلکہ درست تعلیمی منصوبہ بنانے کا طریقہ ہے۔ مانوس مختصر عبارت پڑھوائیں اور حروف کی پہچان، حرکات، اتصال، مد، وقف اور اعتماد سے سنیں۔ ہر غلطی ایک ساتھ درست نہ کریں۔ دو خوبیاں اور ایک ترجیحی ضرورت لکھیں۔ بچے کو سمجھائیں کہ منصوبہ اسی کی ضرورت کے مطابق ہوگا: مضبوط حصوں کی مختصر دہرائی ہوگی اور زیادہ وقت اگلی اہم مہارت پر صرف ہوگا۔'), ('Fluency grows when accurate small units become connected reading. Start with a word the learner can read correctly, mark the syllable or letter groups, and combine them gradually without adding pauses that are not in the word. Teacher and learner read together once, then the child tries independently. Speed is a later outcome; first establish correct letters, vowels and rhythm. Compare the second attempt with the first and describe one concrete improvement.', 'روانی اس وقت بڑھتی ہے جب درست چھوٹے حصے آپس میں مل کر پڑھے جائیں۔ ایسے لفظ سے شروع کریں جسے بچہ درست پڑھ سکتا ہو، اس کے حروفی یا صوتی حصے واضح کریں اور انہیں آہستہ آہستہ ملائیں، غیر ضروری وقفہ نہ لگنے دیں۔ پہلے استاد اور طالب علم ساتھ پڑھیں، پھر بچہ خود کوشش کرے۔ رفتار بعد کا نتیجہ ہے؛ پہلے حروف، حرکات اور مناسب تسلسل درست کریں۔ دوسری کوشش کا پہلی کوشش سے تقابل کرکے ایک واضح بہتری بتائیں۔'), ('Longer Quranic words can contain several letters, vowel signs, and lengthening patterns. Teach the learner to move through the word from right to left, identify each written component, and preserve the sequence while blending. Break a difficult word into meaningful reading groups, but do not change its written order or omit a sign. Use only the assigned Mushaf or Qaida passage. After separate practice, read the whole word in its surrounding phrase so the learner reconnects accuracy with natural recitation.', 'لمبے قرآنی الفاظ میں کئی حروف، حرکات اور مد کی صورتیں ہو سکتی ہیں۔ بچے کو دائیں سے بائیں پڑھتے ہوئے ہر لکھی ہوئی علامت پہچاننا اور ترتیب برقرار رکھتے ہوئے حروف ملانا سکھائیں۔ مشکل لفظ کو پڑھنے کے مناسب حصوں میں تقسیم کریں، مگر لکھی ہوئی ترتیب نہ بدلیں اور کوئی علامت نہ چھوڑیں۔ صرف مقررہ مصحف یا قاعدے کی عبارت استعمال کریں۔ الگ مشق کے بعد پورا لفظ اس کے فقرے میں پڑھوائیں تاکہ درستگی اور رواں تلاوت آپس میں جڑیں۔'), ("Pronunciation correction works best when the learner can hear the difference. Select one recurring sound or sign, provide an accurate model, and explain what to listen for. Ask the learner to repeat a short piece rather than a long passage. Correct the exact point—letter, vowel, timing, or stopping—and then immediately let the learner try again. Record what improved. A respectful tone matters: praise effort and accuracy, avoid labels such as 'bad reader', and never let speed hide a pronunciation error.", "تلفظ کی اصلاح اس وقت بہتر ہوتی ہے جب طالب علم فرق سن سکے۔ ایک بار بار ہونے والی آواز یا علامت منتخب کریں، درست نمونہ دیں اور بتائیں کہ کس بات کو سننا ہے۔ لمبی عبارت کے بجائے مختصر حصہ دہرائیں۔ مخصوص مسئلے—حرف، حرکت، مقدار یا وقف—کی اصلاح کریں اور فوراً دوبارہ پڑھوائیں۔ بہتری نوٹ کریں۔ احترام والا انداز ضروری ہے: کوشش اور درستگی کی تعریف کریں، بچے کو 'خراب قاری' جیسے نام نہ دیں اور رفتار کو تلفظ کی غلطی چھپانے نہ دیں۔"), ('Introductory Tajweed in Nazra means applying one familiar rule while reading, not stopping after every word to deliver a long theory lesson. Choose a rule already taught, name the cue that reveals it, and find a teacher-approved example in the passage. Let the learner identify the rule before reading. Model correct recitation, practise the short phrase, then return to the whole line. Keep a note of the next rule for a later lesson instead of overloading the learner today.', 'ناظرہ میں تجوید کا ابتدائی استعمال یہ ہے کہ تلاوت کے دوران پہلے سے سکھایا ہوا ایک قاعدہ لاگو کیا جائے، نہ کہ ہر لفظ پر رک کر طویل نظری گفتگو کی جائے۔ پہلے سے پڑھا ہوا قاعدہ منتخب کریں، اس کی پہچان بتائیں اور عبارت میں استاد کی منظور شدہ مثال دکھائیں۔ پڑھنے سے پہلے بچے سے قاعدہ شناخت کروائیں۔ درست قرأت کا نمونہ دیں، مختصر فقرے کی مشق کرائیں اور پھر پوری سطر پڑھوائیں۔ آج بہت زیادہ قواعد اکٹھے دینے کے بجائے اگلے سبق کے لیے ایک قاعدہ نوٹ کریں۔'), ('Waqf marks guide where stopping, pausing, or continuing is appropriate in the Mushaf used by the institution. Teach the meaning of the marks from that approved copy because presentation and teaching conventions may differ. A stop is not merely taking a breath: the reader must also consider whether the next start preserves a sensible connection. Demonstrate a short passage, explain the selected sign, model the pause and restart, and let the learner practise. If unsure, ask the qualified teacher rather than inventing a rule.', 'علاماتِ وقف ادارے کے استعمال کردہ مصحف میں بتاتی ہیں کہ کہاں رکنا، ٹھہرنا یا جاری رکھنا مناسب ہے۔ علامتوں کا مطلب اسی منظور شدہ نسخے سے پڑھائیں کیونکہ صورتِ پیش کش اور تدریسی طریقہ مختلف ہو سکتے ہیں۔ وقف صرف سانس لینے کا نام نہیں؛ دوبارہ شروع کرتے وقت معنی کا مناسب ربط بھی دیکھنا ہوتا ہے۔ مختصر عبارت دکھائیں، منتخب علامت سمجھائیں، رکنے اور شروع کرنے کا نمونہ دیں اور بچے سے مشق کروائیں۔ شک کی صورت میں قاعدہ خود گھڑنے کے بجائے اہل استاد سے پوچھیں۔'), ('A daily lesson should contain a manageable new portion and planned revision of earlier work. Begin by checking the previous lesson, then teach the new passage in short phrases, and finish by connecting it with what came before. The learner should know exactly what to practise and how success will be judged: correct reading, not simply number of lines. Keep a record of the portion, one recurring difficulty, and a practical home target. This makes progress visible and prevents old errors from becoming habits.', 'روزانہ سبق میں نیا حصہ اتنا ہو کہ اسے درست پڑھا جا سکے، اور پچھلے کام کی دہرائی بھی طے ہو۔ ابتدا میں پچھلا سبق سنیں، پھر نئی عبارت کو چھوٹے فقروں میں پڑھائیں اور آخر میں اسے سابقہ سبق سے جوڑیں۔ بچے کو معلوم ہو کہ کس چیز کی مشق کرنی ہے اور کامیابی کس طرح دیکھی جائے گی: اصل معیار درست قرأت ہے، صرف سطروں کی تعداد نہیں۔ سبق، بار بار آنے والی ایک مشکل اور گھر کی قابلِ عمل مشق نوٹ کریں۔ اس سے ترقی نظر آتی ہے اور غلط عادتیں پختہ ہونے سے بچتی ہیں۔'), ('A reading assessment should measure accuracy and fluency separately. Ask the learner to read an unfamiliar but level-appropriate assigned passage, then a familiar one. Listen for letter sounds, signs, joining, appropriate length, rule application and stopping. Do not make an overall judgement from one stumble. Give a brief feedback summary with one success, one priority, and a clear next step. Repeat a comparable passage later to see whether practice helped; record the result objectively and keep the learner encouraged.', 'قرأت کے جائزے میں درستگی اور روانی کو الگ الگ جانچیں۔ پہلے درجے کے مطابق ایسا مقررہ حصہ پڑھوائیں جو نیا ہو، پھر مانوس حصہ۔ حروف، علامات، اتصال، مناسب مقدار، قاعدے کے اطلاق اور وقف پر توجہ دیں۔ ایک لغزش کی بنیاد پر مجموعی فیصلہ نہ کریں۔ آخر میں ایک کامیابی، ایک ترجیح اور واضح اگلا قدم بتائیں۔ بعد میں اسی درجے کا دوسرا حصہ پڑھوا کر دیکھیں کہ مشق سے فائدہ ہوا یا نہیں؛ نتیجہ حقیقت پسندانہ انداز میں لکھیں اور بچے کی حوصلہ افزائی برقرار رکھیں۔')], 'Tajweed': [("Makharij describe where a sound is formed; Sifaat describe qualities that distinguish it. Teach the two ideas separately before asking the learner to apply them together. Use a trusted recitation model and the school's Tajweed reference. Demonstrate a small group of contrasting sounds, explain one audible cue, and let the learner identify it while listening. The aim is a recognisable, accurate sound—not an exaggerated performance. Keep correction gentle and specific, and refer advanced articulation questions to a qualified Tajweed teacher.", 'مخارج بتاتے ہیں کہ آواز کہاں سے ادا ہوتی ہے، جبکہ صفات ان خوبیوں کو بیان کرتی ہیں جو ایک حرف کو دوسرے سے ممتاز کرتی ہیں۔ دونوں تصورات کو الگ سمجھائیں، پھر ان کا مشترک اطلاق کروائیں۔ معتبر قرأت اور مدرسے کا تجوید ماخذ استعمال کریں۔ چند متقابل آوازیں دکھائیں، ایک قابلِ سماعت فرق واضح کریں اور بچے سے سن کر پہچاننے کو کہیں۔ مقصد درست اور قابلِ شناخت آواز ہے، مبالغہ آمیز ادائیگی نہیں۔ اصلاح نرم اور مخصوص رکھیں، اور مشکل مخارج کے سوالات اہل تجوید استاد کے سپرد کریں۔'), ("Noon sakin and Tanween rules depend on the letter that follows. In the commonly taught framework, learners distinguish Izhar, Idgham, Iqlab, and Ikhfa; detailed letter groups and conditions must be taught exactly as listed in the institution's chosen Tajweed reference and recitation tradition. Start with the recognition cue, not a long list to memorise blindly. Show one approved example of each rule, ask the learner to identify the following letter, state the rule, then recite the example correctly.", 'نون ساکن اور تنوین کا حکم بعد میں آنے والے حرف سے متعلق ہوتا ہے۔ عام تدریسی ترتیب میں اظہار، ادغام، اقلاب اور اخفاء کا فرق سکھایا جاتا ہے؛ حروف کے گروہ اور تفصیلی شرائط ادارے کے منتخب تجوید ماخذ اور قرأت کے طریقے کے مطابق بالکل درست پڑھائیں۔ محض لمبی فہرست یاد کرانے کے بجائے پہلے پہچان کی علامت سمجھائیں۔ ہر حکم کی ایک منظور شدہ مثال دکھائیں، بعد والا حرف پہچنوائیں، حکم کا نام پوچھیں اور پھر درست تلاوت کروائیں۔'), ('Meem sakin has three commonly taught patterns: Ikhfa Shafawi, Idgham Mimi, and Izhar Shafawi. Explain that the following letter helps determine the reading, and that the lips and sound quality must be observed according to the approved method. Use a clear recitation sample; first point to the meem sakin and next letter, then have the learner name the rule. Practise short phrases and compare the target sound with a common mistake without overstating or creating unfamiliar examples.', 'میم ساکن کے تین معروف احکام اخفاء شفوی، ادغام میمی اور اظہار شفوی ہیں۔ سمجھائیں کہ بعد میں آنے والا حرف حکم پہچاننے میں مدد دیتا ہے اور ہونٹوں کی کیفیت اور آواز کو منظور شدہ طریقے کے مطابق دیکھنا ہوتا ہے۔ واضح قرأت کی مثال استعمال کریں؛ پہلے میم ساکن اور اگلے حرف کی نشاندہی کریں، پھر بچے سے حکم کا نام پوچھیں۔ مختصر فقروں میں مشق کروائیں اور مطلوبہ آواز کا عام غلطی سے تقابل کریں؛ غیر مانوس یا خود ساختہ قرآنی مثالیں نہ بنائیں۔'), ("Ghunnah is a nasal resonance used in specified recitation patterns. Teach the learner to recognise where the rule requires it, then model the duration according to the school's approved recitation standard. The aim is steady and appropriate resonance, not an arbitrary long sound or a forced nose-only voice. Let the learner listen with eyes on the printed example, identify the rule, imitate a short phrase, and then recite in context. Correct timing and the underlying letter rule separately.", 'غنہ مخصوص قرأت کے مقامات پر ناک کی گونج کے ساتھ ادا ہونے والی آواز ہے۔ پہلے پہچنوائیں کہ قاعدے کے مطابق کہاں غنہ درکار ہے، پھر مدرسے کے منظور شدہ طریقے کے مطابق اس کی مقدار دکھائیں۔ مقصد مناسب اور یکساں گونج ہے، نہ اپنی مرضی سے طویل آواز کھینچنا اور نہ زبردستی ناک سے آواز نکالنا۔ بچہ مثال دیکھتے ہوئے سنے، حکم پہچانے، مختصر فقرہ دہرائے اور پھر سیاق میں پڑھے۔ مقدار اور بنیادی حرفی حکم کی اصلاح الگ الگ کریں۔'), ('Qalqalah is heard on the recognised Qalqalah letters when the relevant sukoon condition applies. Teach the standard group used by the institution, often remembered as قطب جد, and explain that the sound is a controlled bounce rather than an added full vowel. Model examples from the approved Mushaf, first in a clear slow recitation and then in context. Ask the learner to locate the letter and condition before reciting. Avoid turning the bounce into a loud extra syllable.', "قلقلہ مخصوص حروف پر متعلقہ سکون کی صورت میں سنائی دیتا ہے۔ ادارے میں پڑھائے جانے والے معروف حروف کے مجموعے، عموماً 'قطب جد'، کی پہچان کروائیں اور سمجھائیں کہ یہ قابو میں رہنے والی بازگشت ہے، اضافی مکمل حرکت نہیں۔ منظور شدہ مصحف سے مثالیں پہلے واضح اور آہستہ، پھر سیاق میں پڑھیں۔ تلاوت سے پہلے بچے سے حرف اور متعلقہ شرط پہچنوائیں۔ قلقلہ کو زور دار اضافی ہجے میں تبدیل نہ ہونے دیں۔"), ("Madd rules describe how long a vowel sound is held in particular patterns. Start with the familiar natural Madd, then introduce other categories only when the learner has mastered their recognition cues. The duration, names, and subdivisions must follow the institution's selected Tajweed reference and recitation tradition. Demonstrate comparable examples at a steady pace, ask what causes the extension, and have the learner mark the pattern before reciting. Do not reward extra-long stretching; consistency and correct rule recognition are the target.", 'مد کے احکام بتاتے ہیں کہ خاص ترکیبوں میں آواز کتنی مقدار تک کھینچی جائے۔ پہلے معروف مدِ اصلی سمجھائیں، پھر دوسری اقسام اسی وقت متعارف کروائیں جب طالب علم پہچان کی علامتیں سمجھ لے۔ مقدار، نام اور ذیلی اقسام ادارے کے منتخب تجوید ماخذ اور قرأت کے طریقے کے مطابق ہوں۔ ملتی ہوئی مثالیں یکساں رفتار سے پڑھیں، سبب پوچھیں اور تلاوت سے پہلے قاعدہ نشان زد کروائیں۔ غیر ضروری لمبی آواز کو درست نہ سمجھیں؛ اصل ہدف قاعدے کی درست پہچان اور یکسانیت ہے۔'), ('The rules of Ra and the Lam in the name of Allah require attention to context and the recitation method being taught. Explain that a letter may be read with heaviness or lightness according to specific conditions; it is not a matter of personal preference. Use the approved examples and first ask the learner to identify the surrounding vowel or preceding context. Model the sound, then practise in a short phrase. Do not generalise one example to every occurrence; check the precise rule in the course reference.', 'راء اور لفظِ اللہ کے لام کے احکام میں سیاق اور پڑھائے جانے والے طریقۂ قرأت کا خیال ضروری ہے۔ سمجھائیں کہ مخصوص شرائط کے مطابق حرف موٹا یا باریک پڑھا جا سکتا ہے؛ یہ ذاتی پسند کا معاملہ نہیں۔ منظور شدہ مثالیں استعمال کریں اور پہلے بچے سے متعلقہ حرکت یا سابقہ سیاق پہچنوائیں۔ آواز کا نمونہ دیں، پھر مختصر فقرے میں مشق کروائیں۔ ایک مثال کا حکم ہر جگہ لاگو نہ کریں؛ درست شرط نصابی تجوید ماخذ سے دیکھیں۔'), ('Waqf is stopping; Ibtida is choosing where and how to resume. A technically possible stop may still make the meaning unclear if the reader restarts from an unsuitable point. Teach the signs from the actual Mushaf used in the school and explain the meaning-related reason for a suitable pause in simple terms. Demonstrate the whole phrase, pause, and restart. Ask the learner to justify the chosen place using the taught guide. If meaning is uncertain, the teacher should consult a reliable tafsir or Tajweed reference.', 'وقف رکنے اور ابتدا دوبارہ شروع کرنے کے مناسب مقام کو منتخب کرنے کا نام ہے۔ کوئی جگہ سانس لینے کے لحاظ سے ممکن ہو سکتی ہے مگر وہاں سے دوبارہ شروع کرنے پر معنی غیر واضح ہو سکتے ہیں۔ مدرسے کے استعمال کردہ مصحف کی علامات پڑھائیں اور سادہ الفاظ میں سمجھائیں کہ مناسب وقف معنی کو واضح رکھنے میں کیوں مدد دیتا ہے۔ پورا فقرہ پڑھ کر رکنے اور دوبارہ شروع کرنے کا نمونہ دیں۔ بچے سے منظور شدہ رہنما کی مدد سے وجہ پوچھیں؛ معنی میں شک ہو تو معتبر تفسیر یا تجوید ماخذ دیکھیں۔'), ('An applied assessment should test recognition and recitation, not recitation alone. Prepare a short approved passage containing only rules already taught. Ask the learner to mark the rule, describe the recognition cue, and read the passage aloud. Record each correction by category—articulation, rule recognition, duration, or stopping—so practice is focused. Give one precise model and ask for a retry. Finish with one strength, one priority, and a small review assignment; advanced disputes should be taken to a qualified teacher.', 'عملی جائزے میں قاعدے کی پہچان اور تلاوت دونوں جانچیں، صرف تلاوت نہیں۔ منظور شدہ مختصر عبارت منتخب کریں جس میں صرف پہلے سے سکھائے گئے قواعد ہوں۔ بچے سے قاعدہ نشان زد کروائیں، پہچان کی علامت بیان کروائیں اور عبارت بلند آواز سے پڑھوائیں۔ اصلاح کو مخارج، قاعدے کی پہچان، مقدار یا وقف کے خانوں میں لکھیں تاکہ مشق مخصوص ہو۔ ایک واضح نمونہ دیں اور دوبارہ کوشش کروائیں۔ آخر میں ایک خوبی، ایک ترجیح اور مختصر دہرائی مقرر کریں؛ پیچیدہ اختلافی سوال اہل استاد کو دکھائیں۔')], 'Hifz-e-Quran': [("A baseline assessment discovers the learner's current reading accuracy, memorisation strength, revision habits, attention span, and realistic available practice time. It should not compare one child unfavourably with another. Listen to previously memorised material, identify a few stable portions and a few weak links, and discuss the home routine with the family where appropriate. Set an achievable plan with separate targets for new lesson, recent revision (Sabqi), and older revision (Manzil). Review the plan regularly and adjust the amount rather than treating a fixed page count as success.", 'ابتدائی جائزہ بچے کی موجودہ قرأت، حفظ کی مضبوطی، دہرائی کی عادت، توجہ اور دستیاب وقت کو سمجھنے کے لیے ہوتا ہے۔ اس کا مقصد ایک بچے کا دوسرے سے منفی موازنہ کرنا نہیں۔ پہلے محفوظ حصے کی سماعت کریں، چند مضبوط مقامات اور چند کمزور روابط شناخت کریں، اور مناسب ہو تو گھر کے معمول پر سرپرست سے بات کریں۔ نیا سبق، سبقی اور منزل کے الگ قابلِ حصول اہداف رکھیں۔ منصوبہ باقاعدگی سے دیکھیں اور صرف صفحات کی مقررہ تعداد کو کامیابی سمجھنے کے بجائے مقدار ضرورت کے مطابق بدلیں۔'), ("Sabaq is the new portion being memorised. Accuracy should come before quantity: the learner listens to the teacher's correct recitation, follows the written text, repeats short phrases, and links them gradually. A useful routine is listen, look, repeat, close the text briefly, recite, and check again. Do not ask a child to memorise a mispronounced phrase; correct it first from the approved Mushaf and recitation model. Keep chunks small enough to retain, and test a start from the middle as well as the beginning.", 'سبق نیا حصہ ہے جسے یاد کیا جا رہا ہو۔ مقدار سے پہلے درستگی ضروری ہے: طالب علم استاد کی صحیح قرأت سنے، متن پر نظر رکھے، مختصر فقروں کو دہرائے اور پھر انہیں آہستہ آہستہ جوڑے۔ مفید ترتیب یہ ہے: سننا، دیکھنا، دہرانا، کچھ دیر متن بند کرنا، سنانا اور دوبارہ جانچنا۔ غلط تلفظ والا فقرہ یاد نہ کروائیں؛ پہلے منظور شدہ مصحف اور قرأت کے نمونے سے درست کریں۔ حصے اتنے مختصر رکھیں کہ یاد رہیں، اور شروع سے سنانے کے ساتھ درمیان سے آغاز بھی چیک کریں۔'), ("Sabqi is revision of recently memorised portions. Its purpose is to move recent learning into stable recall rather than leaving yesterday's lesson fragile while adding new material. Use cumulative review: include today's assigned recent portion and link the starting point or ending point with neighbouring passages. Listen without reading along where the learner is ready, and note exact transition errors. If a phrase repeatedly fails, return to that phrase, repair it, and test the connection again before adding more new memorisation.", 'سبقی حال ہی میں یاد کیے گئے حصے کی دہرائی ہے۔ اس کا مقصد حالیہ سبق کو مضبوط یادداشت میں منتقل کرنا ہے تاکہ نیا مواد بڑھاتے ہوئے کل کا سبق کمزور نہ رہ جائے۔ جمعی دہرائی کروائیں: مقررہ حالیہ حصہ سنیں اور اس کے آغاز یا اختتام کو ساتھ والے حصے سے جوڑیں۔ جب بچہ تیار ہو تو ساتھ متن دیکھے بغیر سنیں، اور ربط کی مخصوص غلطیاں نوٹ کریں۔ جو فقرہ بار بار بھولتا ہو، اسی کی دوبارہ مشق کرائیں، پھر مزید نیا حفظ دینے سے پہلے اس کا ربط دوبارہ چیک کریں۔'), ("Manzil is the planned revision of older memorised portions. Older material often weakens when new lesson and recent revision consume the whole routine, so Manzil needs protected, realistic time. Divide it according to the learner's capacity and use a repeating schedule that can actually be maintained. Test selected starting points, not only a familiar beginning. Record weak transitions and schedule them again soon. The goal is reliable long-term retention with accurate recitation, not an impressive but unsustainable daily target.", 'منزل پرانے محفوظ حصے کی مقررہ دہرائی ہے۔ جب نیا سبق اور سبقی پورا وقت لے لیں تو پرانا حفظ کمزور ہو سکتا ہے، اس لیے منزل کے لیے مستقل اور حقیقت پسندانہ وقت محفوظ رکھیں۔ بچے کی استعداد کے مطابق حصے بنائیں اور ایسا دہرائی شیڈول اپنائیں جس پر واقعی عمل ہو سکے۔ صرف مانوس آغاز نہیں بلکہ مختلف مقامات سے بھی سنیں۔ کمزور روابط لکھیں اور انہیں جلد دوبارہ دہرائیں۔ مقصد دیرپا یادداشت اور درست تلاوت ہے، نہ ایسا روزانہ ہدف جو برقرار نہ رہ سکے۔'), ("Memorisation should strengthen Tajweed, not train the learner to repeat an error until it becomes familiar. Before a new phrase is committed to memory, check the letters, vowels, Madd, and rules that the learner already knows. Use a reliable teacher model and the school's chosen Mushaf and recitation tradition. If the child memorises a mistake, stop, correct the source, and re-establish the phrase slowly before linking it to the next phrase. Record pronunciation priorities without making the learner afraid to attempt recitation.", 'حفظ سے تجوید مضبوط ہونی چاہیے، نہ کہ غلطی بار بار دہرا کر اسے عادت بنایا جائے۔ نیا فقرہ پختہ کرنے سے پہلے حروف، حرکات، مد اور پہلے سے سکھائے گئے قواعد کی جانچ کریں۔ معتبر استاد کا نمونہ، مدرسے کا منتخب مصحف اور قرأت کا طریقہ اپنائیں۔ اگر غلطی یاد ہو جائے تو رکیں، اصل تلفظ درست کریں اور اگلے فقرے سے جوڑنے سے پہلے موجودہ حصے کو آہستہ دوبارہ پختہ کریں۔ تلفظ کے اہم نکات نوٹ کریں، مگر بچے کو تلاوت کی کوشش سے خوف زدہ نہ کریں۔'), ("A daily routine needs a small, clear target, repeated retrieval, and short breaks suited to the learner's age. Plan separate times for new lesson, Sabqi, and Manzil instead of leaving all revision until the end. Ask the learner to explain which part will be practised first and how they will check it. A family member can support a regular time and quiet space, but should not replace the teacher's correction or pressure the child through long sessions. Keep quality, energy and consistency in view.", 'روزانہ معمول میں واضح چھوٹا ہدف، بار بار یاد سے سنانے کی کوشش اور بچے کی عمر کے مطابق مختصر وقفے ہوں۔ نئے سبق، سبقی اور منزل کے لیے الگ وقت رکھیں، تمام دہرائی آخر پر نہ چھوڑیں۔ بچے سے پوچھیں کہ پہلے کون سا حصہ پڑھے گا اور اپنی درستگی کیسے جانچے گا۔ گھر کا فرد مستقل وقت اور پُرسکون جگہ میں مدد دے سکتا ہے، مگر استاد کی اصلاح کی جگہ نہیں لے سکتا اور نہ طویل نشستوں کے دباؤ سے بچے کو تھکانا چاہیے۔ معیار، توانائی اور تسلسل تینوں اہم ہیں۔'), ('A weekly review shows patterns that are hard to see in one daily lesson. Use the same categories each week: missed word, substitution, order error, hesitation, and Tajweed issue where appropriate. Record the location precisely, then distinguish a one-time slip from a repeated weak link. Choose one or two priorities for the next week and recognise what improved. A mistake log is a teaching tool, not a punishment list. Share it in supportive language so the learner knows exactly what to practise next.', 'ہفتہ وار جائزہ ایسی عادتیں سامنے لاتا ہے جو ایک روزانہ سبق میں واضح نہیں ہوتیں۔ ہر ہفتے ایک جیسے خانے استعمال کریں: لفظ چھوٹنا، لفظ بدلنا، ترتیب کی غلطی، جھجک یا تجوید کا مسئلہ جہاں مناسب ہو۔ غلطی کا مقام واضح لکھیں اور ایک وقتی لغزش کو بار بار کمزور ہونے والے ربط سے الگ کریں۔ اگلے ہفتے کے لیے ایک یا دو ترجیحات منتخب کریں اور بہتری بھی نوٹ کریں۔ غلطیوں کا ریکارڈ سزا کی فہرست نہیں بلکہ تدریسی ذریعہ ہے؛ اسے حوصلہ افزا انداز میں شیئر کریں۔'), ("Periodic listening tests should confirm retention, accuracy, and independence over time. Select comparable portions and a few different starting points, then listen without giving away the next words. If the learner struggles, note whether the issue is memory, a transition, pronunciation, or pressure. Explain the result privately and kindly; do not use comparison or public embarrassment. Review the learner's plan with recent records, celebrate a specific gain, and adjust the next period's lesson and revision amounts to match the evidence.", 'دورانی سماعت کے ٹیسٹ سے وقت کے ساتھ یادداشت، درستگی اور خود مختاری کی تصدیق ہونی چاہیے۔ ملتے جلتے حصے اور چند مختلف آغاز منتخب کریں، پھر اگلے الفاظ بتائے بغیر سنیں۔ مشکل ہو تو معلوم کریں کہ مسئلہ یادداشت، ربط، تلفظ یا دباؤ ہے۔ نتیجہ الگ اور نرمی سے سمجھائیں؛ موازنہ یا سب کے سامنے شرمندہ نہ کریں۔ حالیہ ریکارڈ کے ساتھ منصوبہ دیکھیں، ایک واضح بہتری کی تعریف کریں، اور آئندہ سبق و دہرائی کی مقدار شواہد کے مطابق بدلیں۔')], 'Islamiat': [("Teach the articles of faith as connected beliefs, not just a list to recite. Use the school's approved text to present the exact items and wording taught at the learner's level. Explain each idea in age-appropriate language, then invite the child to paraphrase it without turning the lesson into a debate. Distinguish knowing a definition from understanding what it means in daily life—for example, how belief encourages responsibility, hope, gratitude, and truthful conduct. For detailed theological questions, refer to the institution's qualified teacher.", 'ارکانِ ایمان کو صرف زبانی فہرست کے بجائے آپس میں مربوط عقائد کے طور پر پڑھائیں۔ طالب علم کے درجے کے مطابق منظور شدہ نصاب سے درست فہرست اور الفاظ استعمال کریں۔ ہر خیال سادہ عمر کے مطابق زبان میں سمجھائیں اور بچے سے اپنے الفاظ میں بیان کروائیں، مگر اسے مناظرے میں نہ بدلیں۔ تعریف جاننے اور روزمرہ زندگی میں مفہوم سمجھنے میں فرق واضح کریں؛ مثلاً ایمان ذمہ داری، امید، شکر اور سچائی کی ترغیب کیسے دیتا ہے۔ تفصیلی عقیدے کے سوالات ادارے کے اہل استاد کی طرف بھیجیں۔'), ("The pillars of Islam describe foundational acts and commitments in Muslim life. Present their names and explanations exactly as approved by the school, then connect each with its basic purpose and the habits it supports. Do not reduce worship to a checklist without meaning, and do not burden a child with adult-level legal detail. Ask the learner to explain one pillar in simple language and give an age-appropriate example of preparation or conduct related to it. Specific rulings should be taught from the school's established reference.", 'ارکانِ اسلام مسلمان کی زندگی کی بنیادی عبادات اور ذمہ داریوں کو بیان کرتے ہیں۔ مدرسے کے منظور شدہ نصاب کے مطابق ان کے نام اور وضاحت پیش کریں، پھر ہر رکن کے بنیادی مقصد اور اس سے پیدا ہونے والی عادتوں کو جوڑیں۔ عبادت کو بے معنی فہرست نہ بنائیں اور بچے پر بالغوں کی سطح کی فقہی تفصیل کا بوجھ نہ ڈالیں۔ ایک رکن سادہ الفاظ میں سمجھانے اور اس سے متعلق عمر کے مطابق تیاری یا عمل کی مثال دینے کو کہیں۔ مخصوص شرعی احکام مدرسے کے مستند ماخذ سے پڑھائیں۔'), ("A Seerah lesson should place a selected event in its historical context, present only details supported by the school's reliable Seerah source, and then identify what the event teaches. Begin with where the event sits in the life of the Prophet Muhammad ﷺ, explain the sequence clearly, and ask what people did and why. Avoid adding dramatic dialogue or facts that the source does not support. Invite learners to identify one quality such as patience, courage, trust, or mercy only when the taught event actually illustrates it.", 'سیرت کا سبق کسی منتخب واقعے کو تاریخی سیاق میں رکھے، صرف مدرسے کے معتبر سیرت ماخذ سے ثابت تفصیلات بیان کرے، اور پھر واقعے سے ملنے والی رہنمائی پہچانے۔ پہلے بتائیں کہ واقعہ نبی کریم ﷺ کی زندگی کے کس مرحلے سے متعلق ہے، پھر ترتیب واضح کریں اور پوچھیں کہ لوگوں نے کیا کیا اور کیوں۔ ایسی ڈرامائی گفتگو یا معلومات شامل نہ کریں جن کی ماخذ میں تائید نہیں۔ صبر، حوصلہ، امانت یا رحمت جیسی صفت اسی وقت اخذ کروائیں جب پڑھایا گیا واقعہ واقعی اس کی مثال ہو۔'), ('Stories of the prophets should be taught from reliable, approved sources, with the difference between established information and popular unverified additions kept clear. Read or summarise the selected story in sequence: setting, challenge, response, and the lesson supported by the source. Ask the child to retell it in their own words and identify which action demonstrated trust, patience, obedience, or care. Avoid inventing conversations or details. The aim is understanding and ethical learning, not simply remembering dramatic scenes.', 'انبیاء علیہم السلام کے واقعات معتبر اور منظور شدہ ماخذ سے پڑھائیں، اور ثابت شدہ معلومات اور مشہور مگر غیر مصدقہ اضافوں میں فرق رکھیں۔ منتخب واقعہ ترتیب سے بیان کریں: پس منظر، پیش آنے والا مسئلہ، جواب اور ماخذ سے ثابت ہونے والا سبق۔ بچے سے اپنے الفاظ میں واقعہ سنانے اور یہ بتانے کو کہیں کہ کس عمل میں توکل، صبر، اطاعت یا خیر خواہی ظاہر ہوئی۔ اپنی طرف سے مکالمے یا تفصیلات نہ بنائیں۔ مقصد سمجھ بوجھ اور اخلاقی رہنمائی ہے، محض سنسنی خیز مناظر یاد کرنا نہیں۔'), ('Good manners are visible choices, not only polite words. Teach honesty, keeping promises, admitting mistakes, and returning what belongs to others through a realistic child-friendly situation. Ask the learner what options are available, who may be affected, and which choice is truthful and fair. Model a respectful way to correct a mistake: state what happened, take responsibility, and try to repair harm. Praise honesty even when it is uncomfortable. Avoid shaming a child who shares a real mistake; the classroom must feel safe for truthful learning.', 'اچھے اخلاق صرف مؤدبانہ الفاظ نہیں بلکہ نظر آنے والے فیصلے ہیں۔ سچ بولنے، وعدہ پورا کرنے، غلطی ماننے اور دوسرے کی چیز واپس کرنے کو بچے کے مطابق حقیقی صورتِ حال سے سمجھائیں۔ پوچھیں کہ کون سے راستے موجود ہیں، کس پر اثر پڑے گا اور کون سا انتخاب سچا اور منصفانہ ہے۔ غلطی درست کرنے کا باادب طریقہ دکھائیں: حقیقت بیان کرنا، ذمہ داری قبول کرنا اور نقصان پورا کرنے کی کوشش۔ مشکل ہونے کے باوجود سچائی پر تعریف کریں۔ اپنی غلطی بتانے والے بچے کو شرمندہ نہ کریں؛ کلاس میں سیکھنے کے لیے اعتماد ہونا چاہیے۔'), ("Rights and responsibilities are learned through everyday interactions at home and in the community. Explain age-appropriate examples of speaking respectfully, helping within one's ability, protecting others' belongings, and respecting privacy and safety. Clarify that kindness does not mean obeying an unsafe request; a child may tell a trusted adult when something feels wrong. Discuss a neighbour or family scenario and ask how each person might feel. Use the approved teaching material for religious detail and distinguish general courtesy from legal rulings.", 'حقوق اور ذمہ داریاں گھر اور معاشرے کے روزمرہ تعلقات سے سیکھی جاتی ہیں۔ احترام سے بات کرنا، اپنی استطاعت کے مطابق مدد دینا، دوسروں کی چیزوں کی حفاظت اور رازداری و حفاظت کا لحاظ رکھنے کی عمر کے مطابق مثالیں دیں۔ واضح کریں کہ مہربانی کا مطلب کسی غیر محفوظ مطالبے کو ماننا نہیں؛ اگر کوئی بات غلط لگے تو بچہ قابلِ اعتماد بڑے کو بتا سکتا ہے۔ خاندان یا پڑوسی کی ایک صورتِ حال پر گفتگو کریں اور پوچھیں کہ ہر فرد کیا محسوس کر سکتا ہے۔ دینی تفصیل منظور شدہ نصاب سے دیں اور اخلاقی آداب کو فقہی حکم سے الگ رکھیں۔'), ("Cleanliness, responsibility, and worship connect habits with care for oneself and others. Discuss personal cleanliness, keeping learning materials tidy, using water responsibly, and preparing for daily worship according to the school's approved teaching. Model one action instead of giving a long lecture of instructions. Ask the child to describe the order, perform it where appropriate, and explain how it supports readiness and consideration for others. Avoid turning cultural preferences into religious requirements; detailed rulings must come from the assigned course source.", 'صفائی، ذمہ داری اور عبادت کی تیاری ایسی عادتیں ہیں جو اپنی اور دوسروں کی دیکھ بھال سے جڑتی ہیں۔ ذاتی صفائی، پڑھنے کا سامان ترتیب سے رکھنا، پانی ذمہ داری سے استعمال کرنا اور منظور شدہ نصاب کے مطابق عبادت کی تیاری پر بات کریں۔ صرف ہدایات کی طویل تقریر کے بجائے ایک عمل کرکے دکھائیں۔ بچے سے ترتیب بیان اور مناسب ہو تو عملی مظاہرہ کروائیں، پھر پوچھیں کہ اس سے تیاری اور دوسروں کا خیال کیسے رکھا جاتا ہے۔ ثقافتی پسند کو شرعی فرض نہ بنائیں؛ فقہی تفصیل مقررہ ماخذ سے دیں۔'), ("A reflection lesson consolidates knowledge by asking the learner to explain, apply, and question respectfully. Begin with a quick recap across the studied units; ask the learner to choose a topic they remember and explain why it matters. Use a real-life scenario to check application, then invite a question they still have. Correct misunderstandings with the school's source rather than improvising an answer. Close with one personal learning goal and a brief task that a family member can discuss without turning it into a test or argument.", 'غوروفکر کا سبق سیکھی ہوئی بات کو سمجھانے، عمل میں لانے اور احترام سے سوال کرنے کے ذریعے مضبوط کرتا ہے۔ پڑھے ہوئے موضوعات کی مختصر دہرائی سے آغاز کریں؛ بچے سے ایک پسندیدہ یا یاد رہ جانے والا موضوع منتخب کرکے اس کی اہمیت بتانے کو کہیں۔ اطلاق جانچنے کے لیے روزمرہ صورتِ حال دیں اور ایک ایسا سوال پوچھیں جو ابھی باقی ہو۔ غلط فہمی کو خود سے جواب گھڑنے کے بجائے منظور شدہ نصاب سے درست کریں۔ آخر میں ذاتی سیکھنے کا ایک ہدف اور گھر میں گفتگو کے لیے مختصر کام دیں، اسے امتحان یا بحث نہ بنائیں۔')], 'Duas & Salah': [("Purity and wudu are practical acts that should be taught through a clear demonstration and the school's selected fiqh method. First explain the purpose of cleanliness in simple language, then show the steps in the exact order taught by the course. Distinguish the actions the curriculum treats as required from recommended details, and do not mix different methods without explanation. Let the learner narrate each step, perform it with appropriate materials, and identify where common mistakes occur. Correct privately and focus on the approved standard rather than frightening the child.", 'طہارت اور وضو ایسے عملی اعمال ہیں جنہیں واضح نمونے اور مدرسے کے منتخب فقہی طریقے کے مطابق سکھانا چاہیے۔ پہلے صفائی کا مقصد سادہ زبان میں سمجھائیں، پھر نصاب کے مطابق مراحل اسی ترتیب میں دکھائیں۔ نصاب میں لازم سمجھے گئے اعمال اور مستحب تفصیلات کا فرق واضح کریں، مختلف طریقے بے وضاحت ایک ساتھ نہ ملائیں۔ بچے سے ہر مرحلہ بیان اور مناسب وسائل کے ساتھ عملی مظاہرہ کروائیں، اور عام غلطیوں کی جگہ پہچنوائیں۔ اصلاح احترام سے اور الگ کریں؛ بچے کو خوف زدہ کرنے کے بجائے منظور شدہ طریقے پر توجہ دیں۔'), ("Prayer times and preparation should follow the local timetable and the school's approved prayer teaching. Explain that worship has a time and preparation process, and discuss cleanliness, appropriate clothing, the direction of prayer, and a suitable place according to the course reference. Teach learners to check a trusted timetable with an adult rather than guess. Avoid giving a universal clock time because prayer times change with date and location. Let the child arrange the preparation steps in order and explain what to do if uncertain.", 'نماز کے اوقات اور تیاری مقامی اوقات نامے اور مدرسے کے منظور شدہ طریقۂ تعلیم کے مطابق سکھائیں۔ سمجھائیں کہ عبادت کا وقت اور تیاری کا طریقہ ہوتا ہے؛ صفائی، مناسب لباس، قبلے کی سمت اور موزوں جگہ پر نصابی ماخذ کے مطابق بات کریں۔ بچے کو اندازہ لگانے کے بجائے کسی بڑے کے ساتھ معتبر اوقات نامہ دیکھنا سکھائیں۔ ایک ہی گھڑی کا وقت سب کے لیے مقرر نہ کریں کیونکہ تاریخ اور مقام کے لحاظ سے اوقات بدلتے ہیں۔ بچے سے تیاری کے مراحل ترتیب میں لگوائیں اور شک کی صورت میں پوچھنے کا طریقہ سمجھائیں۔'), ("Prayer movements must be taught in the sequence and form used by the institution's approved guide. Demonstrate the transition between positions slowly, using clear verbal cues. Explain that calmness and following the taught order matter more than rushing. Let the child name the next position before showing it, practise one movement at a time, and then connect the sequence. Keep corrections specific and avoid overloading the child with minor details before the basic sequence is secure. Refer differences in method to the qualified teacher.", 'نماز کی حرکات مدرسے کے منظور شدہ رہنما میں سکھائی گئی ترتیب اور صورت کے مطابق پڑھائیں۔ ہر حالت سے اگلی حالت میں جانے کا نمونہ آہستہ اور واضح زبانی اشاروں کے ساتھ دکھائیں۔ سمجھائیں کہ جلدی کرنے سے زیادہ اطمینان اور سکھائی گئی ترتیب کی پابندی اہم ہے۔ حرکت دکھانے سے پہلے بچے سے اگلی حالت کا نام پوچھیں، پہلے ایک حرکت کی مشق کروائیں اور پھر پوری ترتیب جوڑیں۔ بنیادی ترتیب مضبوط ہونے سے پہلے معمولی تفصیلات کا بوجھ نہ ڈالیں۔ طریقوں کے اختلافات اہل استاد سے واضح کروائیں۔'), ('Essential recitations should be taught from the exact approved text, not reconstructed from memory or paraphrased. Show the written wording, pronounce a small phrase accurately, explain the articulation points the child already knows, and repeat with feedback. Teach meaning only from the approved translation at an age-appropriate level. Separate memorisation, pronunciation, and understanding into different checks. If the teacher is unsure about a word, vowel, or wording, pause and verify it from the approved source before teaching it.', 'ضروری قرأت کے الفاظ عین منظور شدہ متن سے سکھائیں؛ یادداشت سے دوبارہ بنا کر یا اپنے الفاظ میں بدل کر نہ پڑھائیں۔ تحریری متن دکھائیں، مختصر فقرہ درست ادا کریں، بچے کو معلوم مخارج سمجھائیں اور اصلاح کے ساتھ دہرائیں۔ معنی صرف منظور شدہ ترجمے سے عمر کے مناسب درجے پر بیان کریں۔ حفظ، تلفظ اور مفہوم کو الگ الگ جانچیں۔ اگر کسی لفظ، حرکت یا عبارت پر استاد کو شک ہو تو پڑھانے سے پہلے توقف کرکے معتبر منظور شدہ متن سے تصدیق کرے۔'), ('Daily supplications are learned best when the learner knows the situation in which each one is taught. Select only the supplications assigned in the course book, explain the occasion, show the exact wording, and practise pronunciation in short chunks. Explain meaning from the approved source without adding claims about guaranteed outcomes that the source does not state. Ask the learner to match a situation to the correct dua, then recite it with the text visible. Never invent Arabic wording or cite an unverified narration.', 'روزمرہ دعائیں اس وقت بہتر سیکھی جاتی ہیں جب بچہ جانتا ہو کہ ہر دعا کس موقع پر پڑھائی گئی ہے۔ نصابی کتاب میں مقررہ دعائیں منتخب کریں، موقع سمجھائیں، بالکل درست الفاظ دکھائیں اور مختصر حصوں میں تلفظ کی مشق کروائیں۔ منظور شدہ ماخذ سے معنی بیان کریں مگر ایسے یقینی نتائج کے دعوے نہ کریں جو ماخذ میں موجود نہیں۔ بچے سے صورتِ حال کے مطابق دعا منتخب کروائیں، پھر متن سامنے رکھ کر پڑھوائیں۔ عربی الفاظ خود نہ گھڑیں اور غیر مصدقہ روایت کا حوالہ نہ دیں۔'), ("Morning and evening remembrances should be taught from the school's approved compilation with its exact wording, order, and any quantity the course requires. Explain the idea of remembering Allah in a calm routine and help the learner understand how a regular time supports consistency. Do not add or remove repetitions based on guesswork. Teach a small assigned selection first, practise accurately, then review meaning from the approved translation. Family support may help create a calm routine, but the teacher remains responsible for the teaching source.", 'صبح و شام کے اذکار مدرسے کے منظور شدہ مجموعے سے عین الفاظ، ترتیب اور نصاب میں مقررہ تعداد کے مطابق پڑھائیں۔ اللہ کو یاد کرنے کے تصور کو پُرسکون معمول سے جوڑیں اور سمجھائیں کہ مستقل وقت سے پابندی کیسے پیدا ہوتی ہے۔ اندازے سے تکرار کی تعداد نہ بڑھائیں نہ گھٹائیں۔ پہلے مختصر مقررہ مجموعہ درست پڑھائیں، پھر منظور شدہ ترجمے سے معنی دہرائیں۔ گھر والوں کی مدد معمول بنانے میں مفید ہو سکتی ہے، لیکن تدریسی ماخذ کی ذمہ داری استاد پر ہے۔'), ('Understanding a dua includes its occasion, its words, and its basic meaning. Read the approved Arabic text first, explain difficult vocabulary only as supported by the assigned translation, then ask the learner to restate the meaning in simple language. Discuss why the occasion fits the supplication without promising an outcome or inventing a special virtue. Practise one realistic situation: the learner identifies the occasion, chooses the correct assigned dua, and recites it accurately. Record any pronunciation or vocabulary that needs more practice.', 'دعا کو سمجھنے میں اس کا موقع، الفاظ اور بنیادی معنی شامل ہیں۔ پہلے منظور شدہ عربی متن پڑھیں، مشکل الفاظ صرف مقررہ ترجمے کی تائید سے سمجھائیں، پھر بچے سے سادہ زبان میں مفہوم بیان کروائیں۔ گفتگو کریں کہ یہ موقع دعا سے کیسے متعلق ہے، مگر کسی یقینی نتیجے یا غیر ثابت خاص فضیلت کا وعدہ نہ کریں۔ ایک عملی صورتِ حال دیں: بچہ موقع پہچانے، مقررہ دعا منتخب کرے اور درست پڑھے۔ تلفظ یا الفاظ کی وہ مشکل نوٹ کریں جس پر مزید مشق چاہیے۔'), ('Guided prayer practice brings the learned parts together, but it should not become a rushed performance. Start with preparation, then move through the approved sequence while the teacher models and names each stage. Pause for the learner to explain the next step and recite the assigned text. Observe movement, order, pronunciation, and attentiveness separately. Correct one priority at a time and repeat the relevant portion. End with a simple checklist so the learner can see what is secure and what will be practised in the next lesson.', 'رہنمائی میں نماز کی مشق سیکھی ہوئی چیزوں کو یکجا کرتی ہے، مگر اسے جلدی میں مظاہرہ نہ بنائیں۔ تیاری سے آغاز کریں، پھر استاد ہر مرحلہ دکھاتے اور نام بتاتے ہوئے منظور شدہ ترتیب سے گزرے۔ بچے کو اگلا مرحلہ بتانے اور مقررہ عبارت پڑھنے کا موقع دیں۔ حرکات، ترتیب، تلفظ اور توجہ الگ الگ دیکھیں۔ ایک وقت میں ایک اہم اصلاح کرکے متعلقہ حصہ دوبارہ کروائیں۔ آخر میں مختصر فہرست سے بتائیں کہ کیا مضبوط ہے اور اگلے سبق میں کس چیز کی مشق ہوگی۔')], 'Quran Translation': [('Repeated Quranic words and expressions are easier to understand when studied in phrases rather than isolated lists. Choose a short assigned passage from the approved translation curriculum, identify only a few target words, and explain their basic meaning in that particular context. Some Arabic words can carry different meanings in different places, so do not promise that one Urdu or English equivalent always fits. Ask the learner to locate the word in its phrase, say the approved meaning, and then explain the phrase in simple language.', 'بار بار آنے والے قرآنی الفاظ اور تراکیب کو الگ فہرست کے بجائے فقروں میں پڑھنے سے زیادہ آسانی سے سمجھا جا سکتا ہے۔ منظور شدہ ترجمہ نصاب سے مختصر عبارت منتخب کریں، چند مطلوبہ الفاظ چنیں اور اسی سیاق میں ان کا بنیادی مطلب سمجھائیں۔ عربی کے بعض الفاظ مختلف مقامات پر مختلف مفہوم دے سکتے ہیں، اس لیے ایک اردو یا انگریزی معنی کو ہر جگہ لازمی نہ کہیں۔ بچے سے لفظ کو فقرے میں تلاش، منظور شدہ معنی بیان اور پھر پورا فقرہ سادہ زبان میں سمجھانے کو کہیں۔'), ("Word-by-word study should support the meaning of the whole passage, not replace it. Use a short surah or passage chosen by the course and consult the school's approved translation. Read the Arabic passage first, point to each target word, explain its assigned meaning, and then rebuild the phrase in natural Urdu or English. Make clear that word order and grammar can affect the final meaning. Never invent or silently alter a Quranic translation; mark uncertain vocabulary for the teacher to verify from the source.", 'لفظ بہ لفظ مطالعہ پورے متن کا مفہوم سمجھنے میں مدد دے، اس کی جگہ نہ لے۔ کورس کی منتخب مختصر سورت یا عبارت لیں اور مدرسے کا منظور شدہ ترجمہ دیکھیں۔ پہلے عربی عبارت پڑھیں، ہر مطلوبہ لفظ کی طرف اشارہ کریں، مقررہ معنی سمجھائیں اور پھر فقرے کو رواں اردو یا انگریزی میں بنائیں۔ واضح کریں کہ لفظوں کی ترتیب اور قواعد پورے معنی کو متاثر کر سکتے ہیں۔ قرآنی ترجمہ خود نہ گھڑیں اور نہ خاموشی سے بدلیں؛ مشکوک لفظ کی تصدیق ماخذ سے کریں۔'), ('Basic Arabic patterns help learners notice relationships between words, while pronouns show who is being referred to. Introduce only the grammar needed for the selected verse and use the course reference for the exact analysis. Identify a simple pattern, compare two examples already approved by the text, and ask what changes and what remains similar. Do not turn this stage into advanced grammar. The goal is to support comprehension while respecting that a full Arabic analysis may require more expertise than the current lesson level.', 'عربی کی بنیادی ساختیں الفاظ کے درمیان تعلق سمجھنے میں مدد دیتی ہیں، جبکہ ضمائر بتاتے ہیں کہ کس کی طرف اشارہ ہے۔ منتخب آیت سمجھنے کے لیے جتنے قواعد درکار ہوں اتنے ہی متعارف کروائیں اور درست تجزیے کے لیے نصابی ماخذ دیکھیں۔ ایک آسان ساخت دکھائیں، ماخذ کی منظور شدہ دو مثالوں کا موازنہ کریں اور پوچھیں کہ کیا بدلا اور کیا یکساں رہا۔ اس مرحلے کو اعلیٰ قواعد کا سبق نہ بنائیں۔ مقصد فہم میں مدد ہے؛ مکمل عربی تجزیے کے لیے موجودہ سطح سے زیادہ مہارت درکار ہو سکتی ہے۔'), ("A verse's meaning is built from its words and their grammatical relationships, not from isolated dictionary entries alone. Read the selected passage, identify its main phrase, and use the approved course resource to explain how the parts relate. Ask the learner to distinguish subject, action, description, or connection only at the level taught. Then say the meaning naturally without adding a personal explanation as though it were the translation. Keep the original wording visible and return to it whenever the meaning becomes vague.", 'آیت کا مفہوم الفاظ اور ان کے نحوی تعلق سے بنتا ہے، صرف الگ لغوی معانی سے نہیں۔ منتخب عبارت پڑھیں، اس کا بنیادی فقرہ شناخت کریں اور منظور شدہ نصابی ماخذ سے حصوں کا تعلق سمجھائیں۔ طالب علم کو اتنی ہی سطح پر فاعل، عمل، وصف یا باہمی ربط پہچنوائیں جتنی سکھائی گئی ہے۔ پھر معنی رواں انداز میں بیان کریں، مگر ذاتی تشریح کو ترجمہ بنا کر شامل نہ کریں۔ اصل متن سامنے رکھیں اور معنی مبہم ہونے پر دوبارہ اسی کی طرف رجوع کریں۔'), ('Context helps the learner understand who is being addressed, what is being discussed, and how neighbouring verses shape the passage. Begin with the approved translation and any assigned context note. Read the surrounding section rather than extracting a phrase alone. Separate the plain translation from explanatory notes or tafsir, and label each appropriately. Ask which details are directly stated in the material and which are explanation. If the lesson source does not support a claim, leave it open and check with a qualified teacher.', 'سیاق طالب علم کو سمجھاتا ہے کہ خطاب کس سے ہے، گفتگو کس بارے میں ہے اور ساتھ والی آیات پورے متن کے مفہوم کو کیسے واضح کرتی ہیں۔ منظور شدہ ترجمے اور مقررہ سیاقی نوٹ سے آغاز کریں۔ صرف ایک فقرہ نکالنے کے بجائے اس کے آس پاس کا حصہ پڑھیں۔ سادہ ترجمے کو وضاحتی نوٹ یا تفسیر سے الگ رکھیں اور ہر ایک کی حیثیت واضح کریں۔ پوچھیں کہ کون سی بات متن میں صاف موجود ہے اور کون سی وضاحت ہے۔ اگر ماخذ کسی دعوے کی تائید نہ کرے تو اسے قطعی نہ کہیں اور اہل استاد سے تصدیق کریں۔'), ("Themes connect passages through a shared message, but a connection should be supported by the text and the approved teaching source. Select a central theme, identify the words or ideas that support it, and compare a related passage only after establishing the first passage's meaning. Avoid treating two verses as identical just because they share a word. Ask the learner to explain the connection in one sentence and point to the evidence. Keep differences and context visible rather than forcing every passage into one simplified slogan.", 'موضوعات مختلف آیات کو مشترک پیغام کے ذریعے جوڑ سکتے ہیں، لیکن ہر ربط کی تائید متن اور منظور شدہ تعلیمی ماخذ سے ہونی چاہیے۔ مرکزی موضوع منتخب کریں، اس کی تائید کرنے والے الفاظ یا خیالات نشان زد کریں، پھر پہلی عبارت کا معنی سمجھنے کے بعد متعلقہ عبارت کا موازنہ کریں۔ صرف مشترک لفظ کی بنیاد پر دو آیات کو ایک جیسا نہ کہیں۔ بچے سے ایک جملے میں ربط بیان اور دلیل دکھانے کو کہیں۔ سیاق اور فرق واضح رکھیں؛ ہر عبارت کو ایک آسان نعرے میں زبردستی نہ سمیٹیں۔'), ('Vocabulary review should test recall, context, and sentence-level understanding. Mix familiar words, show each inside its original phrase, and ask the learner for the approved meaning and a plain explanation of the phrase. Include a few deliberately confusing items so the learner practises checking context rather than guessing. Correct misunderstandings from the source and note words that need another example. The goal is steady comprehension, not memorising every possible dictionary meaning of an Arabic word.', 'الفاظ کی دہرائی میں یادداشت، سیاق اور پورے جملے کی سمجھ تینوں جانچیں۔ مانوس الفاظ کی ترتیب بدلیں، ہر لفظ اصل فقرے میں دکھائیں اور بچے سے منظور شدہ معنی اور فقرے کی سادہ وضاحت مانگیں۔ چند ایسی مثالیں بھی شامل کریں جن میں سیاق دیکھنا ضروری ہو، تاکہ بچہ اندازہ لگانے کے بجائے متن سے تصدیق کرے۔ غلط فہمی ماخذ سے درست کریں اور دوبارہ مثال درکار الفاظ نوٹ کریں۔ مقصد مسلسل فہم ہے، عربی لفظ کے ہر ممکن لغوی معنی کو یاد کرنا نہیں۔'), ("An oral explanation lets the learner show understanding in their own words. Ask for the passage's plain meaning, two key vocabulary items, and one point that remains uncertain. Do not expect the child to produce a scholarly tafsir. Listen for whether the response matches the approved translation and context. If the child gives a personal reflection, acknowledge it as reflection rather than correcting it as a translation unless it contradicts the material. Finish by choosing the next vocabulary or comprehension target based on the evidence from the learner's response.", 'زبانی وضاحت سے طالب علم اپنے الفاظ میں فہم دکھا سکتا ہے۔ اس سے عبارت کا سادہ مفہوم، دو اہم الفاظ کے معنی اور ایک غیر واضح بات پوچھیں۔ بچے سے علمی تفسیر کی توقع نہ رکھیں۔ دیکھیں کہ جواب منظور شدہ ترجمے اور سیاق سے مطابقت رکھتا ہے یا نہیں۔ اگر بچہ ذاتی غوروفکر بیان کرے تو اسے غوروفکر کے طور پر تسلیم کریں، ترجمہ نہ سمجھیں؛ البتہ اگر وہ ماخذ سے متصادم ہو تو وضاحت کریں۔ آخر میں جواب کی بنیاد پر اگلا لفظی یا فہمی ہدف منتخب کریں۔')], 'Quran Understanding': [("To identify a passage's central theme, the learner must first read it in context and establish the plain meaning using the approved translation. Ask: what is being discussed, who is addressed, what words or ideas repeat, and what message is supported by the surrounding text? Distinguish the main theme from an interesting side detail. Ask the learner to point to the words or source note supporting the answer. Where several interpretations exist, teach the institution's approved explanation and do not present personal speculation as the only meaning.", 'کسی عبارت کا مرکزی موضوع پہچاننے کے لیے پہلے اسے سیاق میں پڑھنا اور منظور شدہ ترجمے سے بنیادی معنی سمجھنا ضروری ہے۔ پوچھیں: گفتگو کس بارے میں ہے، خطاب کس سے ہے، کون سے الفاظ یا خیالات بار بار آئے ہیں، اور ساتھ کے متن سے کون سا پیغام ثابت ہوتا ہے؟ مرکزی موضوع کو کسی دلچسپ ضمنی بات سے الگ رکھیں۔ بچے سے وہ الفاظ یا ماخذی نوٹ دکھانے کو کہیں جو جواب کی تائید کرتے ہیں۔ جہاں متعدد تفسیری پہلو ہوں، ادارے کی منظور شدہ وضاحت پڑھائیں اور ذاتی قیاس کو واحد معنی نہ بنائیں۔'), ("Mercy, justice, patience, and gratitude become meaningful when learners explore them through an approved passage and an age-appropriate real-life example. Define one theme plainly, read the assigned source, and identify what the text actually says. Then ask how the value might appear in a child's life: sharing fairly, waiting without harming others, thanking people, or showing care. Make clear that examples illustrate an ethical connection; they are not new tafsir. Invite the learner to name evidence from the lesson and a respectful question.", 'رحمت، انصاف، صبر اور شکر جیسے موضوعات اس وقت واضح ہوتے ہیں جب طالب علم انہیں منظور شدہ عبارت اور عمر کے مطابق حقیقی مثال کے ساتھ سمجھتا ہے۔ ایک موضوع سادہ الفاظ میں بیان کریں، مقررہ ماخذ پڑھیں اور پہچانیں کہ متن میں حقیقتاً کیا کہا گیا ہے۔ پھر پوچھیں کہ یہ قدر بچے کی زندگی میں کیسے ظاہر ہو سکتی ہے: منصفانہ بانٹنا، دوسروں کو نقصان پہنچائے بغیر انتظار کرنا، لوگوں کا شکریہ ادا کرنا یا خیال رکھنا۔ واضح کریں کہ روزمرہ مثال اخلاقی ربط ہے، نئی تفسیر نہیں۔ بچے سے ماخذی دلیل اور مؤدبانہ سوال بھی لیں۔'), ("A prophetic story should be drawn from the approved source and taught in sequence. Help the learner identify the setting, the challenge, the decision, the outcome as reported, and the lesson supported by the text. Do not add invented dialogue or modern details. Ask how the lesson can be applied without assuming that every historical situation is identical to a child's life. Keep the source visible, let the learner retell it, and distinguish a reliable lesson from a speculative detail.", 'نبی یا رسول کے واقعے کو منظور شدہ ماخذ سے لے کر ترتیب سے پڑھائیں۔ بچے سے پس منظر، مسئلہ، فیصلہ، ماخذ میں بیان کردہ نتیجہ اور متن سے ثابت سبق پہچنوائیں۔ اپنی طرف سے مکالمہ یا جدید تفصیل شامل نہ کریں۔ پوچھیں کہ سبق کو موجودہ زندگی میں کیسے اپنایا جا سکتا ہے، مگر ہر تاریخی صورتِ حال کو بچے کی زندگی کے عین برابر نہ سمجھیں۔ ماخذ سامنے رکھیں، بچے سے واقعہ دوبارہ سنوائیں اور معتبر سبق کو قیاسی تفصیل سے الگ کریں۔'), ("Character and social responsibility link a text's message to choices about honesty, fairness, care, family duties, and community life. Start with the approved passage and identify the principle it supports. Present one age-appropriate scenario, ask what each person knows and feels, and discuss more than one possible response. Evaluate actions by the principle taught, not by embarrassment or blame. Make a careful distinction between a general ethical application and a specific religious ruling, which should be taken from the approved reference.", 'کردار اور معاشرتی ذمہ داری قرآنی پیغام کو سچائی، انصاف، خیر خواہی، خاندانی فرائض اور معاشرتی زندگی کے فیصلوں سے جوڑتے ہیں۔ منظور شدہ عبارت سے آغاز کریں اور اس سے ثابت اصول پہچانیں۔ عمر کے مطابق ایک صورتِ حال دیں، پوچھیں کہ ہر فرد کیا جانتا اور محسوس کرتا ہے، پھر ایک سے زیادہ ممکنہ جوابوں پر گفتگو کریں۔ عمل کو سکھائے گئے اصول پر جانچیں، شرمندگی یا الزام پر نہیں۔ عمومی اخلاقی اطلاق اور خاص شرعی حکم میں فرق واضح رکھیں؛ حکم منظور شدہ ماخذ سے لیا جائے۔'), ("Reflection on creation and personal conduct should begin with careful observation and a source-based question, not a claim that every personal thought is the verse's definitive interpretation. Read the selected material in context, ask what it draws attention to, and invite the learner to describe an observation or gratitude response. Then separate three things: what the text says, what the approved explanation adds, and what the learner personally reflects. This distinction encourages thoughtful learning while preventing unsupported claims from being presented as scripture.", 'کائنات اور اپنے عمل پر غوروفکر کا آغاز محتاط مشاہدے اور ماخذ سے متعلق سوال سے ہو، اس دعوے سے نہیں کہ ہر ذاتی خیال آیت کی حتمی تفسیر ہے۔ منتخب عبارت سیاق میں پڑھیں، پوچھیں کہ اس میں کس طرف توجہ دلائی گئی ہے اور طالب علم سے مشاہدہ یا شکر کا اظہار کروائیں۔ پھر تین چیزیں الگ کریں: متن کیا کہتا ہے، منظور شدہ وضاحت کیا اضافہ کرتی ہے، اور طالب علم کا ذاتی غوروفکر کیا ہے۔ یہ فرق سوچ سمجھ کر سیکھنے میں مدد دیتا ہے اور غیر ثابت بات کو قرآن کی طرف منسوب ہونے سے روکتا ہے۔'), ("Connecting related verses requires a shared theme and evidence from reliable sources. First establish the meaning of the current passage, then compare a second assigned passage and identify the real point of connection. Similar vocabulary alone may not mean identical context or ruling. Ask the learner to explain the connection and one difference. Keep references available so the answer can be checked. The teacher should avoid extracting verses to support a preconceived point and should use the institution's approved tafsir when deeper connections are involved.", 'متعلقہ آیات میں ربط پیدا کرنے کے لیے مشترک موضوع اور معتبر ماخذ سے دلیل ضروری ہے۔ پہلے موجودہ عبارت کا مفہوم واضح کریں، پھر دوسری مقررہ عبارت سے موازنہ کرکے اصل ربط پہچانیں۔ صرف ملتا جلتا لفظ ہونے سے سیاق یا حکم ایک جیسا نہیں ہو جاتا۔ بچے سے ربط اور ایک فرق بیان کروائیں۔ حوالہ سامنے رکھیں تاکہ جواب کی تصدیق ہو سکے۔ استاد پہلے سے طے شدہ بات ثابت کرنے کے لیے آیات کو سیاق سے الگ نہ کرے؛ گہرا ربط سمجھانے کے لیے ادارے کی منظور شدہ تفسیر استعمال کرے۔'), ('Age-appropriate context means giving enough background for comprehension without burdening a child with unsupported historical claims or complex disputes. Explain the words and immediate context, use the assigned reliable source, and state clearly when the lesson guide does not contain enough information. Separate translation, source-based explanation, and personal reflection. Encourage questions respectfully and make a note to verify any point that needs specialist knowledge. This builds a habit of learning responsibly rather than treating the first simple explanation as the only possible scholarly treatment.', 'عمر کے مطابق سیاق دینے کا مطلب اتنا پس منظر فراہم کرنا ہے جتنا سمجھ کے لیے ضروری ہو، نہ کہ غیر ثابت تاریخی دعووں یا پیچیدہ اختلافات کا بوجھ بچے پر ڈالنا۔ الفاظ اور قریب کے سیاق کو سمجھائیں، مقررہ معتبر ماخذ استعمال کریں اور واضح کہیں کہ رہنما میں کسی بات کی کافی معلومات نہ ہوں تو اسے جانچنا ہوگا۔ ترجمہ، ماخذی وضاحت اور ذاتی غوروفکر الگ رکھیں۔ سوالات کو احترام سے لیں اور ماہر علم سے تصدیق درکار بات نوٹ کریں۔ اس سے ذمہ داری سے سیکھنے کی عادت بنتی ہے اور پہلی سادہ وضاحت کو واحد علمی تعبیر نہیں سمجھا جاتا۔'), ("A reflection journal turns the lesson into a record of what the learner understood, what evidence helped, and what question remains. Use three short prompts: 'The passage's main message is…', 'The part of the lesson that supports my answer is…', and 'I would like to ask…'. Make clear that a personal reflection is not itself a Quranic quotation or tafsir. Discuss a few responses respectfully and assess whether the learner can distinguish source evidence from a personal application. End with a review target and a question for the next lesson.", "غوروفکر کی ڈائری اس سبق کو محفوظ کرتی ہے کہ طالب علم نے کیا سمجھا، کس دلیل سے مدد ملی اور کون سا سوال باقی ہے۔ تین مختصر سوال دیں: 'عبارت کا مرکزی پیغام یہ ہے…'، 'سبق کا وہ حصہ جو میرے جواب کی تائید کرتا ہے…' اور 'میں یہ سوال پوچھنا چاہتا/چاہتی ہوں…'۔ واضح کریں کہ ذاتی غوروفکر خود قرآنی اقتباس یا تفسیر نہیں ہے۔ چند جوابات پر احترام سے گفتگو کریں اور دیکھیں کہ بچہ ماخذی دلیل اور ذاتی اطلاق میں فرق کر سکتا ہے یا نہیں۔ آخر میں دہرائی کا ہدف اور اگلے سبق کے لیے سوال منتخب کریں۔")]}
+
+# Broad ISO 4217 currency-code list for common and major international currencies.
+CURRENCIES = sorted(set("""AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNY COP CRC CUP CVE CZK DJF DKK DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HRK HTG HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB RWF SAR SBD SCR SDG SEK SGD SHP SLE SLL SOS SRD SSP STN SVC SYP SZL THB TJS TMT TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XCD XOF XPF YER ZAR ZMW ZWL""".split()))
+CURRENCY_NAMES = {
+    "PKR":"Pakistani Rupee", "USD":"US Dollar", "GBP":"Pound Sterling", "EUR":"Euro",
+    "SAR":"Saudi Riyal", "AED":"UAE Dirham", "QAR":"Qatari Riyal", "KWD":"Kuwaiti Dinar",
+    "BHD":"Bahraini Dinar", "OMR":"Omani Rial", "INR":"Indian Rupee", "BDT":"Bangladeshi Taka",
+    "LKR":"Sri Lankan Rupee", "NPR":"Nepalese Rupee", "CAD":"Canadian Dollar", "AUD":"Australian Dollar",
+    "NZD":"New Zealand Dollar", "CHF":"Swiss Franc", "CNY":"Chinese Yuan", "JPY":"Japanese Yen",
+    "KRW":"South Korean Won", "HKD":"Hong Kong Dollar", "SGD":"Singapore Dollar", "MYR":"Malaysian Ringgit",
+    "IDR":"Indonesian Rupiah", "THB":"Thai Baht", "TRY":"Turkish Lira", "ZAR":"South African Rand",
+    "EGP":"Egyptian Pound", "NGN":"Nigerian Naira", "BRL":"Brazilian Real", "MXN":"Mexican Peso",
+    "RUB":"Russian Ruble", "SEK":"Swedish Krona", "NOK":"Norwegian Krone", "DKK":"Danish Krone",
+    "PLN":"Polish Zloty", "CZK":"Czech Koruna", "HUF":"Hungarian Forint", "ILS":"Israeli New Shekel"
+}
+LEVELS = ["Beginner", "Level 1", "Level 2", "Level 3", "Intermediate", "Advanced", "Hifz"]
+STATUSES = ["Active", "Inactive", "Pending"]
+PAYMENT_STATUSES = ["Paid", "Unpaid", "Partial"]
+
+
+def password_hash(password, salt=None):
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 260000)
+    return salt + "$" + digest.hex()
+
+
+def password_matches(password, stored):
+    try:
+        salt, expected = stored.split("$", 1)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 260000).hex()
+        return secrets.compare_digest(actual, expected)
+    except Exception:
+        return False
+
+
+def timestamp():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def safe_backup(path):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return None
+    folder = os.path.join(os.path.dirname(path), "backups")
+    os.makedirs(folder, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    target = os.path.join(folder, os.path.basename(path) + "." + stamp + ".bak")
+    shutil.copy2(path, target)
+    return target
+
+
+def prune_backups(folder, keep, starts_with="", ends_with=""):
+    """Delete the oldest backup files so only the newest `keep` remain (only files matching our own naming)."""
+    try:
+        keep = int(keep)
+    except (TypeError, ValueError):
+        return 0
+    if keep < 1 or not os.path.isdir(folder):
+        return 0
+    found = []
+    for name in os.listdir(folder):
+        full = os.path.join(folder, name)
+        if name.startswith(starts_with) and name.endswith(ends_with) and os.path.isfile(full):
+            found.append((os.path.getmtime(full), full))
+    found.sort(reverse=True)
+    removed = 0
+    for _mtime, full in found[keep:]:
+        try:
+            os.remove(full)
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def normalize_whatsapp_number(raw):
+    """Return WhatsApp's international digits-only number, or an empty string if invalid.
+
+    Numbers entered with + or 00 keep their explicit country code. A local number
+    beginning with 0, or a Pakistani mobile number written without its leading 0,
+    is normalized to Pakistan's 92 country code.
+    """
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    explicit_international = value.startswith("+") or value.startswith("00")
+    digits = "".join(ch for ch in value if ch.isdigit())
+    if digits.startswith("00"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = "92" + digits[1:]
+    elif len(digits) == 10 and digits.startswith("3") and not explicit_international:
+        digits = "92" + digits
+    if not (10 <= len(digits) <= 15):
+        return ""
+    return digits
+
+
+class SchoolDB:
+    @staticmethod
+    def _schema_needs_prechange_backup(path):
+        """Return True only when setup() is about to change an existing school schema."""
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return False
+        expected = {
+            "students": {"id", "full_name", "guardian_name", "phone", "course", "monthly_fee", "currency", "status", "age", "class_time", "level", "admission_date", "email", "notes", "image_path"},
+            "teachers": {"id", "full_name", "email", "phone", "status", "qualification", "experience", "availability", "image_path"},
+            "attendance": {"id", "student_id", "class_date", "status", "teacher_id", "approved", "notes"},
+            "payments": {"id", "student_id", "amount", "currency", "payment_date", "month", "status", "notes"},
+            "fees": {"id", "student", "month", "amount", "currency", "status"},
+            "fee_invoices": {"id", "student_id", "month", "amount_due", "currency", "created_at"},
+            "users": {"id", "username", "password_hash", "role", "teacher_id", "student_id", "active", "created_at", "failed_attempts", "lockout_until"},
+            "progress": {"id", "student_id", "course", "level", "lesson", "score", "teacher_id", "notes", "entry_date"},
+            "teacher_students": {"id", "teacher_id", "student_id"},
+            "class_sessions": {"id", "student_id", "teacher_id", "session_date", "start_time", "end_time", "session_type", "status", "notes", "created_at"},
+            "weekly_class_schedule": {"id", "student_id", "teacher_id", "weekday", "start_time", "end_time", "created_at"},
+            "quran_progress": {"id", "student_id", "teacher_id", "session_date", "record_type", "juz_number", "surah", "ayah_from", "ayah_to", "lesson_number", "quality", "notes", "created_at"},
+            "course_curriculum": {"course_key", "pdf_name", "pdf_data", "uploaded_at", "uploaded_by"},
+        }
+        conn = None
+        try:
+            conn = sqlite3.connect(path, timeout=2.0)
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+            if not tables:
+                return False
+            # Any known school database that is missing a table/column needs a pre-migration copy.
+            for table, columns in expected.items():
+                if table not in tables:
+                    return True
+                present = {r[1] for r in conn.execute(f'PRAGMA table_info("{table}")')}
+                if not columns.issubset(present):
+                    return True
+            # Legacy-name normalization in setup() also changes existing data.
+            if "name" in {r[1] for r in conn.execute('PRAGMA table_info("students")')}:
+                return True
+            if "full name" in {r[1] for r in conn.execute('PRAGMA table_info("teachers")')}:
+                return True
+            return False
+        except sqlite3.Error:
+            # Preserve a copy of an unreadable non-empty DB before attempting setup.
+            return True
+        finally:
+            if conn is not None:
+                conn.close()
+
+    def __init__(self, path):
+        self.path = path
+        parent_folder = os.path.dirname(os.path.abspath(path))
+        os.makedirs(parent_folder, exist_ok=True)
+        needs_backup = self._schema_needs_prechange_backup(path)
+        self.backup_path = safe_backup(path) if needs_backup else None
+        # Create the local backup directory even on a fresh installation with an empty DB.
+        os.makedirs(os.path.join(parent_folder, "backups"), exist_ok=True)
+        self.conn = sqlite3.connect(path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys = ON")
+        self.setup()
+
+    def close(self):
+        self.conn.close()
+
+    def columns(self, table):
+        return [row["name"] for row in self.conn.execute(f'PRAGMA table_info("{table}")')]
+
+    def ensure_columns(self, table, definitions):
+        existing = set(self.columns(table))
+        for name, definition in definitions.items():
+            if name not in existing:
+                self.conn.execute(f'ALTER TABLE "{table}" ADD COLUMN "{name}" {definition}')
+
+    def setup(self):
+        c = self.conn
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL DEFAULT '',
+            guardian_name TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            course TEXT DEFAULT '',
+            monthly_fee REAL DEFAULT 0,
+            currency TEXT DEFAULT 'PKR',
+            status TEXT DEFAULT 'Active',
+            age INTEGER,
+            class_time TEXT DEFAULT '',
+            level TEXT DEFAULT 'Beginner',
+            admission_date TEXT DEFAULT '',
+            email TEXT DEFAULT '',
+            notes TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS teachers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            full_name TEXT NOT NULL DEFAULT '',
+            email TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
+            status TEXT DEFAULT 'Active',
+            qualification TEXT DEFAULT '',
+            experience TEXT DEFAULT '',
+            availability TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER,
+            class_date TEXT DEFAULT '',
+            status TEXT DEFAULT 'Present',
+            teacher_id INTEGER,
+            approved INTEGER DEFAULT 0,
+            notes TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER,
+            amount REAL DEFAULT 0,
+            currency TEXT DEFAULT 'PKR',
+            payment_date TEXT DEFAULT '',
+            month TEXT DEFAULT '',
+            status TEXT DEFAULT 'Paid',
+            notes TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS fees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student TEXT DEFAULT '',
+            month TEXT DEFAULT '',
+            amount REAL DEFAULT 0,
+            currency TEXT DEFAULT 'PKR',
+            status TEXT DEFAULT 'Unpaid'
+        );
+        CREATE TABLE IF NOT EXISTS fee_invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            month TEXT NOT NULL,
+            amount_due REAL NOT NULL DEFAULT 0,
+            currency TEXT NOT NULL DEFAULT 'PKR',
+            created_at TEXT DEFAULT '',
+            UNIQUE(student_id, month)
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('admin','teacher','student')),
+            teacher_id INTEGER,
+            student_id INTEGER,
+            active INTEGER DEFAULT 1,
+            created_at TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            course TEXT DEFAULT '',
+            level TEXT DEFAULT '',
+            lesson TEXT DEFAULT '',
+            score REAL,
+            teacher_id INTEGER,
+            notes TEXT DEFAULT '',
+            entry_date TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS teacher_students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            teacher_id INTEGER NOT NULL,
+            student_id INTEGER NOT NULL,
+            UNIQUE(teacher_id, student_id)
+        );
+        CREATE TABLE IF NOT EXISTS class_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            teacher_id INTEGER,
+            session_date TEXT NOT NULL,
+            start_time TEXT DEFAULT '',
+            end_time TEXT DEFAULT '',
+            session_type TEXT DEFAULT 'Extra',
+            status TEXT DEFAULT 'Scheduled',
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS weekly_class_schedule (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            teacher_id INTEGER,
+            weekday TEXT NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT DEFAULT '',
+            created_at TEXT DEFAULT '',
+            UNIQUE(student_id, weekday, start_time)
+        );
+        CREATE TABLE IF NOT EXISTS quran_progress (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_id INTEGER NOT NULL,
+            teacher_id INTEGER,
+            session_date TEXT NOT NULL DEFAULT '',
+            record_type TEXT NOT NULL DEFAULT 'Sabaq / سبق',
+            juz_number INTEGER,
+            surah TEXT DEFAULT '',
+            ayah_from TEXT DEFAULT '',
+            ayah_to TEXT DEFAULT '',
+            lesson_number TEXT DEFAULT '',
+            quality TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
+            created_at TEXT DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_quran_progress_student_date
+            ON quran_progress(student_id, session_date);
+        CREATE INDEX IF NOT EXISTS idx_quran_progress_teacher
+            ON quran_progress(teacher_id);
+        CREATE TABLE IF NOT EXISTS course_curriculum (
+            course_key TEXT PRIMARY KEY,
+            pdf_name TEXT NOT NULL DEFAULT '',
+            pdf_data BLOB,
+            uploaded_at TEXT NOT NULL DEFAULT '',
+            uploaded_by TEXT NOT NULL DEFAULT ''
+        );
+        """)
+        # Safely extend older databases without deleting their existing records.
+        self.ensure_columns("students", {
+            "full_name": "TEXT DEFAULT ''", "guardian_name": "TEXT DEFAULT ''",
+            "phone": "TEXT DEFAULT ''", "course": "TEXT DEFAULT ''",
+            "monthly_fee": "REAL DEFAULT 0", "currency": "TEXT DEFAULT 'PKR'",
+            "status": "TEXT DEFAULT 'Active'", "age": "INTEGER",
+            "class_time": "TEXT DEFAULT ''", "level": "TEXT DEFAULT 'Beginner'",
+            "admission_date": "TEXT DEFAULT ''", "email": "TEXT DEFAULT ''",
+            "notes": "TEXT DEFAULT ''", "image_path": "TEXT DEFAULT ''"
+        })
+        self.ensure_columns("teachers", {
+            "full_name": "TEXT DEFAULT ''", "email": "TEXT DEFAULT ''",
+            "phone": "TEXT DEFAULT ''", "status": "TEXT DEFAULT 'Active'",
+            "qualification": "TEXT DEFAULT ''", "experience": "TEXT DEFAULT ''",
+            "availability": "TEXT DEFAULT ''", "image_path": "TEXT DEFAULT ''"
+        })
+        self.ensure_columns("attendance", {
+            "student_id": "INTEGER", "class_date": "TEXT DEFAULT ''",
+            "status": "TEXT DEFAULT 'Present'", "teacher_id": "INTEGER",
+            "approved": "INTEGER DEFAULT 0", "notes": "TEXT DEFAULT ''"
+        })
+        self.ensure_columns("payments", {
+            "student_id": "INTEGER", "amount": "REAL DEFAULT 0",
+            "currency": "TEXT DEFAULT 'PKR'", "payment_date": "TEXT DEFAULT ''",
+            "month": "TEXT DEFAULT ''", "status": "TEXT DEFAULT 'Paid'",
+            "notes": "TEXT DEFAULT ''"
+        })
+        self.ensure_columns("fees", {
+            "student": "TEXT DEFAULT ''", "month": "TEXT DEFAULT ''",
+            "amount": "REAL DEFAULT 0", "currency": "TEXT DEFAULT 'PKR'",
+            "status": "TEXT DEFAULT 'Unpaid'"
+        })
+        self.ensure_columns("users", {
+            "teacher_id": "INTEGER", "student_id": "INTEGER",
+            "active": "INTEGER DEFAULT 1", "created_at": "TEXT DEFAULT ''",
+            "failed_attempts": "INTEGER DEFAULT 0", "lockout_until": "TEXT DEFAULT ''"
+        })
+        self.ensure_columns("progress", {
+            "student_id": "INTEGER", "course": "TEXT DEFAULT ''",
+            "level": "TEXT DEFAULT ''", "lesson": "TEXT DEFAULT ''",
+            "score": "REAL", "teacher_id": "INTEGER",
+            "notes": "TEXT DEFAULT ''", "entry_date": "TEXT DEFAULT ''"
+        })
+        # Older version used "full name" with a space.
+        teacher_cols = self.columns("teachers")
+        if "full name" in teacher_cols:
+            c.execute('UPDATE teachers SET full_name = "full name" WHERE COALESCE(full_name, \'\') = \'\'')
+        # Normalize old student name columns if present.
+        student_cols = self.columns("students")
+        if "name" in student_cols:
+            c.execute('UPDATE students SET full_name = name WHERE COALESCE(full_name, \'\') = \'\'')
+        c.commit()
+
+    def scalar(self, sql, args=()):
+        row = self.conn.execute(sql, args).fetchone()
+        return row[0] if row else 0
+
+    def first_admin_exists(self):
+        return self.scalar("SELECT COUNT(*) FROM users WHERE lower(trim(role))='admin'") > 0
+
+
+# --- Shared-wallpaper identity header settings (saved per database) ---
+# Separate cover photos and decorative header presets are intentionally removed.
+HEADER_DEFAULTS = {
+    "header_height": "112",
+    "header_tagline": "",
+}
+
+
+class SchoolApp:
+    def __init__(self, root, db):
+        self.root = root
+        self.db = db
+        self.user = None
+        # Bounded, per-window caches: PhotoImage objects must not leak across Tk roots.
+        self._il_button_texture_cache = LRUCache(160)
+        self._il_button_source_cache = LRUCache(24)
+        self._il_workspace_wallpaper_cache = LRUCache(8)
+        self._shared_wallpaper_cache = LRUCache(12)
+        self._attendance_bubble_image_cache = LRUCache(48)
+        self._il_logo_photo_cache = LRUCache(48)
+        # Institution branding is stored in the selected local database, not online.
+        self.db.conn.execute("CREATE TABLE IF NOT EXISTS app_settings (setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL DEFAULT '')")
+        backup_folder = os.path.join(os.path.dirname(os.path.abspath(self.db.path)), "backups")
+        os.makedirs(backup_folder, exist_ok=True)
+        default_settings = {
+            "institute_id": str(uuid.uuid4()),
+            "institution_name_en": DEFAULT_INSTITUTION_NAME,
+            "institution_name_ur": DEFAULT_INSTITUTION_NAME_UR,
+            "logo_path": "",
+            "primary_color": DEFAULT_PRIMARY_COLOR,
+            "background_color": DEFAULT_BACKGROUND_COLOR,
+            "text_color": DEFAULT_TEXT_COLOR,
+            "english_font": "Arial",
+            "urdu_font": "Jameel Noori Nastaleeq",
+            "font_size": "12",
+            "font_size_heading": "14",
+            "font_size_body": "12",
+            "font_size_fields": "12",
+            "font_size_buttons": "12",
+            "font_size_tables": "11",
+            "language": "en",
+            "header_height": "112",
+            "header_tagline": "",
+            "backup_second_folder": backup_folder,
+            "backup_keep": "30",
+            "background_image_path": "",
+            "background_transparency": "68",
+            "page_backgrounds": "{}",
+            "theme_mode": "light",
+            "nav_orientation": "row",
+            "wallpaper_enabled": "0",
+        }
+        self.db.conn.executemany(
+            "INSERT OR IGNORE INTO app_settings(setting_key,setting_value) VALUES(?,?)",
+            default_settings.items())
+        # Apply the new red default only when the saved theme still matches a
+        # previous built-in palette. Any genuinely customized colors are preserved.
+        current_brand = self.db.conn.execute(
+            "SELECT setting_value FROM app_settings WHERE setting_key='primary_color'").fetchone()
+        previous_defaults = {"#0F7457", "#174B3D", "#16634B", "#1B6E53", "#0D6B50",
+                             "#16785B", "#1F6F55", "#2563EB", "#10765B", "#0F5132"}
+        self.db.conn.execute("UPDATE app_settings SET setting_value='Arial' WHERE setting_key='english_font' AND setting_value='Aptos'")
+        self.db.conn.execute("UPDATE app_settings SET setting_value='auto' WHERE setting_key='text_color' AND setting_value IN ('#173D32','#132D23','#000000')")
+        if current_brand and str(current_brand[0]).strip().upper() in previous_defaults:
+            migration = {
+                "primary_color": DEFAULT_PRIMARY_COLOR,
+                "background_color": DEFAULT_BACKGROUND_COLOR,
+            }
+            self.db.conn.executemany(
+                "INSERT INTO app_settings(setting_key,setting_value) VALUES(?,?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                migration.items())
+        self.db.conn.commit()
+        self.settings = self._read_settings()
+        if str(self.settings.get("background_transparency", "68")).strip() == "84":
+            # 84 was the old, very faint shipped default; 68 makes the same wallpaper legible.
+            self.settings["background_transparency"] = "68"
+            self.db.conn.execute(
+                "INSERT INTO app_settings(setting_key,setting_value) VALUES('background_transparency','68') "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value='68'")
+            self.db.conn.commit()
+        global APP_LANGUAGE
+        APP_LANGUAGE = "ur" if self.settings.get("language", "en").lower() == "ur" else "en"
+        self.language = APP_LANGUAGE
+        self._idle_timer_id = None
+        self._last_activity = time.monotonic()
+        self._idle_timeout_minutes = self._read_idle_timeout()
+        self._idle_binding_ids = []
+        global FONT_SCALE
+        try:
+            FONT_SCALE = min(1.8, max(0.8, int(self.settings.get("font_size", "10")) / 10.0))
+        except (TypeError, ValueError):
+            FONT_SCALE = 1.0
+        # Per-area font sizes: users can tune each area independently or set all together.
+        self.root._taha_font_sizes = {
+            "global": int(self.settings.get("font_size", "12") or 12),
+            "heading": int(self.settings.get("font_size_heading", "14") or 14),
+            "body": int(self.settings.get("font_size_body", "12") or 12),
+            "fields": int(self.settings.get("font_size_fields", "12") or 12),
+            "buttons": int(self.settings.get("font_size_buttons", "12") or 12),
+            "tables": int(self.settings.get("font_size_tables", "11") or 11),
+        }
+        self.brand_name = self.settings.get("institution_name_en", DEFAULT_INSTITUTION_NAME) or DEFAULT_INSTITUTION_NAME
+        self.brand_name_ur = self.settings.get("institution_name_ur", "")
+        self.slogan_en = self.settings.get("institution_slogan_en", "Learn • Practice • Grow in Quranic Knowledge")
+        self.slogan_ur = self.settings.get("institution_slogan_ur", "تعلیم، تربیت اور قرآن کی روشنی")
+        self.logo_path = self.settings.get("logo_path", "")
+        # Restore saved branding colors before styling widgets on every launch.
+        global GREEN, GREEN_HOVER, APP_BG, DARK, UI_FONT, UI_BOLD_FONT, URDU_FONT
+        saved_primary = self.settings.get("primary_color", GREEN)
+        saved_background = self.settings.get("background_color", APP_BG)
+        saved_text = self.settings.get("text_color", DARK)
+        try:
+            self.root.winfo_rgb(saved_primary)
+            GREEN = saved_primary
+            GREEN_HOVER = saved_primary   # recalculated by _apply_theme_palette()
+        except tk.TclError:
+            pass
+        try:
+            self.root.winfo_rgb(saved_background)
+            APP_BG = saved_background
+        except tk.TclError:
+            pass
+        try:
+            if str(saved_text).strip().lower() != "auto":
+                self.root.winfo_rgb(saved_text)
+                DARK = saved_text
+        except tk.TclError:
+            pass
+        try:
+            installed_fonts = {str(name).casefold(): str(name) for name in self.root.tk.call("font", "families")}
+            requested_english = self.settings.get("english_font", "Arial")
+            if requested_english.strip().casefold() == "aptos":
+                requested_english = "Arial"   # old default -> new default
+            UI_FONT = installed_fonts.get(requested_english.casefold(), installed_fonts.get("arial", "Arial"))
+            requested_urdu = self.settings.get("urdu_font", "Jameel Noori Nastaleeq")
+            URDU_FONT = installed_fonts.get(requested_urdu.casefold(), choose_urdu_font(self.root))
+        except Exception:
+            UI_FONT = self.settings.get("english_font", "Arial") or "Arial"
+            URDU_FONT = choose_urdu_font(self.root)
+        UI_BOLD_FONT = UI_FONT
+        self._apply_theme_palette()
+        self.root.title("Institute Ledger")
+        screen_w = max(1020, self.root.winfo_screenwidth() - 48)
+        screen_h = max(680, self.root.winfo_screenheight() - 96)
+        self.root.geometry(f"{min(1480, screen_w)}x{min(880, screen_h)}")
+        self.root.minsize(min(1020, screen_w), min(680, screen_h))
+        self.root.configure(bg=APP_BG)
+        self.nav_button_refs = {}
+        self.active_nav_label = None
+        self.style()
+        self._install_idle_activity_tracking()
+        if not self.db.first_admin_exists():
+            self.first_admin_setup()
+        else:
+            self.login_screen()
+
+    def _apply_theme_palette(self):
+        """Set the shared light/day or dark/night palette and theme preset tokens."""
+        global APP_BG, CARD_BG, BORDER, DARK, MUTED, PALE, SOFT_GREEN, GREEN_HOVER, GREEN
+        global ACCENT, ACCENT_HOVER, ACCENT_LIGHT, DANGER, DANGER_HOVER, DANGER_LIGHT, GOLD
+        mode = str(self.settings.get("theme_mode", "light") or "light").strip().lower()
+        if mode not in ("light", "dark"):
+            mode = "light"
+        self.theme_mode = mode
+
+        preset_key = str(self.settings.get("theme_preset", "emerald") or "emerald").strip().lower()
+        preset = THEME_PRESETS.get(preset_key, THEME_PRESETS["emerald"])
+
+        custom_primary = str(self.settings.get("primary_color", "") or "").strip()
+        if preset_key == "custom" and custom_primary:
+            primary = custom_primary
+            hover = self._mix_color(primary, "#000000", 0.22) if hasattr(self, "root") else primary
+            light = self._mix_color(primary, "#FFFFFF", 0.82) if hasattr(self, "root") else "#E8F4EE"
+        else:
+            primary = preset["primary"]
+            hover = preset["primary_hover"]
+            light = preset["primary_light"]
+
+        # Legacy default values saved by older versions are treated as "not customised".
+        legacy_text = {"#173D32", "#132D23", "#000000", "AUTO", ""}
+        user_text = str(self.settings.get("text_color", "") or "").strip()
+        user_bg = str(self.settings.get("background_color", "") or "").strip()
+        legacy_bg = {"#F3F6F5", "#F8FAF8", ""}
+
+        GREEN = primary
+        GREEN_HOVER = hover
+        ACCENT = preset["accent"]
+        ACCENT_HOVER = preset["accent_hover"]
+        ACCENT_LIGHT = preset["accent_light"]
+        GOLD = ACCENT_LIGHT
+
+        if mode == "dark":
+            APP_BG = preset.get("bg_dark", "#121A16")
+            CARD_BG = preset.get("card_dark", "#1D2823")
+            BORDER = preset.get("border_dark", "#2E3F37")
+            DARK = preset.get("text_dark", "#EAF2EE")
+            MUTED = preset.get("muted_dark", "#9BB0A6")
+            PALE = preset.get("card_dark", "#1D2823")
+            SOFT_GREEN = self._mix_color(GREEN, "#000000", 0.45) if hasattr(self, "root") else "#1D2823"
+        else:
+            APP_BG = preset.get("bg_light", "#F8FAF8")
+            CARD_BG = preset.get("card_light", "#FFFFFF")
+            BORDER = preset.get("border_light", "#DCE5E0")
+            DARK = preset.get("text_light", "#132D23")
+            MUTED = preset.get("muted_light", "#5D736A")
+            PALE = preset.get("primary_subtle", "#E8F4EE")
+            SOFT_GREEN = light
+            # Honour a custom background / text colour chosen in Settings (light mode).
+            try:
+                if user_bg and user_bg.upper() not in legacy_bg:
+                    self.root.winfo_rgb(user_bg)
+                    APP_BG = user_bg
+                    if on_color(user_bg, "#FFFFFF", "#000000") == "#FFFFFF":
+                        # Dark custom background: cards, borders and text follow it.
+                        CARD_BG = mix(user_bg, "#FFFFFF", 0.08)
+                        BORDER = mix(user_bg, "#FFFFFF", 0.22)
+                        MUTED = mix(user_bg, "#FFFFFF", 0.68)
+                        PALE = CARD_BG
+                        SOFT_GREEN = mix(user_bg, "#FFFFFF", 0.14)
+                        DARK = "#FFFFFF"
+                    else:
+                        DARK = "#000000"
+            except (tk.TclError, AttributeError):
+                pass
+            # An explicit text colour always wins; "auto" keeps the contrast choice above.
+            try:
+                if user_text and user_text.upper() not in legacy_text:
+                    self.root.winfo_rgb(user_text)
+                    DARK = user_text
+            except (tk.TclError, AttributeError):
+                pass
+
+        try:
+            if hasattr(self, "root") and self.root.winfo_exists():
+                self.root.configure(bg=APP_BG)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def style(self):
+        """Consistent, crisp styling for the complete desktop application."""
+        s = ttk.Style(self.root)
+        style_font = URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT
+        def fs(value):
+            return max(9, int(round(value * max(0.8, min(1.8, FONT_SCALE)))))
+        # Use the selected installed font for Tk's named fonts as well as ttk styles.
+        # Windows performs font antialiasing; avoiding tiny fallback bitmap fonts is
+        # the most reliable way to keep text sharp across menus, text fields and dialogs.
+        for font_name, base_size in (("TkDefaultFont", 10), ("TkTextFont", 10),
+                                     ("TkMenuFont", 10), ("TkHeadingFont", 12),
+                                     ("TkCaptionFont", 10), ("TkSmallCaptionFont", 9),
+                                     ("TkIconFont", 10), ("TkTooltipFont", 9)):
+            try:
+                named_font = tkfont.nametofont(font_name, root=self.root)
+                named_font.configure(family=style_font, size=fs(base_size))
+            except (tk.TclError, TypeError):
+                pass
+        try:
+            s.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        s.configure("TFrame", background=APP_BG)
+        s.configure("Workspace.TFrame", background=APP_BG)
+        s.configure("Card.TFrame", background=CARD_BG)
+        s.configure("TLabel", background=APP_BG, foreground=DARK, font=(style_font, fs(10)))
+        s.configure("Title.TLabel", background=APP_BG, foreground=GREEN, font=(style_font, fs(20), "bold"))
+        s.configure("Sub.TLabel", background=APP_BG, foreground=MUTED, font=(style_font, fs(10)))
+        s.configure("Card.TLabel", background=CARD_BG, foreground=DARK, font=(style_font, fs(10)))
+        s.configure("TLabelframe", background=APP_BG, foreground=DARK, bordercolor=BORDER, relief="solid")
+        s.configure("TLabelframe.Label", background=APP_BG, foreground=GREEN, font=(style_font, fs(10), "bold"))
+        s.configure("Heading.TLabel", background=APP_BG, foreground=DARK, font=(style_font, fs(13), "bold"))
+        s.configure("Card.Heading.TLabel", background=CARD_BG, foreground=DARK, font=(style_font, fs(13), "bold"))
+        # Uniform default button color across the application. Semantic status controls
+        # (Present/Absent/Leave) keep their separate state colors intentionally.
+        s.configure("TButton", font=(style_font, fs(10)), padding=(11, 7), background=GREEN,
+                    foreground=WHITE, bordercolor=GREEN, focusthickness=1, focuscolor="#9ACDBB",
+                    relief="flat", borderwidth=0)
+        s.map("TButton", background=[("disabled", "#DCE8E2"), ("pressed", GREEN_HOVER), ("active", GREEN_HOVER)],
+              foreground=[("disabled", "#8E9D96"), ("pressed", WHITE), ("active", WHITE)])
+        s.configure("Accent.TButton", background=GREEN, foreground=WHITE, padding=(13, 8),
+                    bordercolor=GREEN, font=(style_font, fs(10), "bold"), focusthickness=1,
+                    focuscolor="#9ACDBB", relief="flat", borderwidth=0)
+        s.map("Accent.TButton", background=[("disabled", "#DCE8E2"), ("pressed", GREEN_HOVER), ("active", GREEN_HOVER)],
+              foreground=[("disabled", "#8E9D96"), ("active", WHITE), ("pressed", WHITE)])
+        # Semantic button styles are reused by attendance controls throughout the app.
+        for style_name, base, pale, text in (
+                ("Present.TButton", "#157347", "#E1F4E8", "#157347"),
+                ("Absent.TButton", "#B42318", "#FCE8E6", "#B42318"),
+                ("Leave.TButton", "#A15C07", "#FDF0D5", "#A15C07")):
+            s.configure(style_name, background=pale, foreground=text, padding=(9, 6),
+                        font=(style_font, fs(9), "bold"), relief="flat", borderwidth=0,
+                        focuscolor="#9ACDBB", focusthickness=1)
+            s.map(style_name, background=[("pressed", base), ("active", base)],
+                  foreground=[("pressed", WHITE), ("active", WHITE), ("disabled", "#9AA6A0")])
+        s.configure("Treeview", background=CARD_BG, fieldbackground=CARD_BG, foreground=DARK,
+                    font=(style_font, fs(10)), rowheight=fs(34), borderwidth=0, bordercolor=CARD_BG,
+                    lightcolor=BORDER, darkcolor=BORDER, relief="flat")
+        s.map("Treeview", background=[("selected", GREEN)], foreground=[("selected", on_color(GREEN, "#FFFFFF", "#000000"))])
+        s.configure("Treeview.Heading", background=GREEN, foreground=on_color(GREEN, "#FFFFFF", "#000000"),
+                    font=(style_font, fs(10), "bold"), padding=(10, 9), relief="flat",
+                    borderwidth=0, bordercolor=GREEN)
+        s.map("Treeview.Heading", background=[("pressed", GREEN_HOVER), ("active", GREEN_HOVER)],
+              foreground=[("active", on_color(GREEN_HOVER, "#FFFFFF", "#000000")), ("pressed", on_color(GREEN_HOVER, "#FFFFFF", "#000000"))])
+        s.configure("TEntry", fieldbackground=CARD_BG, foreground=DARK, font=(style_font, fs(10)),
+                    padding=(8, 7), bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
+                    insertcolor=GREEN, relief="flat")
+        s.map("TEntry", bordercolor=[("focus", GREEN)], lightcolor=[("focus", GREEN)],
+              darkcolor=[("focus", GREEN)])
+        s.configure("TCombobox", fieldbackground=CARD_BG, background=CARD_BG, foreground=DARK,
+                    font=(style_font, fs(10)), padding=(8, 6), arrowcolor=GREEN,
+                    bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, relief="flat")
+        s.map("TCombobox", fieldbackground=[("readonly", CARD_BG), ("focus", CARD_BG)],
+              foreground=[("readonly", DARK)], bordercolor=[("focus", GREEN)])
+        s.map("TCombobox", fieldbackground=[("readonly", CARD_BG)], foreground=[("readonly", DARK)])
+        s.configure("TCheckbutton", background=APP_BG, foreground=DARK, font=(style_font, fs(10)),
+                    padding=(3, 3))
+        s.map("TCheckbutton", foreground=[("disabled", "#9AA6A0"), ("active", GREEN)])
+        s.configure("TRadiobutton", background=APP_BG, foreground=DARK, font=(style_font, fs(10)),
+                    padding=(3, 3))
+        s.map("TRadiobutton", foreground=[("disabled", "#9AA6A0"), ("active", GREEN)])
+        s.configure("TScrollbar", background=BORDER, troughcolor=APP_BG, bordercolor=APP_BG,
+                    arrowcolor=GREEN, gripcount=0, relief="flat", borderwidth=0)
+        s.map("TScrollbar", background=[("active", MUTED), ("pressed", GREEN)])
+        self._install_wallpaper_button_styles(s, style_font, fs)
+        if not getattr(self, "_il_dialog_palette_hooked", False):
+            self._il_dialog_palette_hooked = True
+            try:
+                self.root.bind_class("Toplevel", "<Map>", self._on_toplevel_map_palette, add="+")
+            except tk.TclError:
+                pass
+
+    def _on_toplevel_map_palette(self, event):
+        """Give every dialog the same flat, function-colored buttons (once per dialog)."""
+        win = getattr(event, "widget", None)
+        try:
+            if not isinstance(win, tk.Toplevel) or getattr(win, "_il_palette_done", False):
+                return
+            win._il_palette_done = True
+            win.after(40, lambda w=win: self._apply_button_palette(w) if w.winfo_exists() else None)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _button_texture_photos(self, width, height, tint=GREEN, wallpaper_mix=0.42):
+        """Retired: buttons are flat solid colors now. Kept so old callers stay harmless."""
+        return None
+
+    def _resize_tk_button_texture(self, widget, width, height):
+        """Retired: buttons are flat solid colors now."""
+        return
+
+    def _install_wallpaper_button_styles(self, style, style_font, fs):
+        """Flat, solid ttk button styles. No wallpaper, pen or clip texture anywhere.
+
+        Colors follow the button's function:
+          primary / save / add  -> brand color      (TButton, Accent.TButton)
+          information / open    -> BLUE             (Info.TButton)
+          print / export        -> ORANGE           (Export.TButton)
+          delete / dangerous    -> RED              (Danger.TButton)
+          secondary             -> white + outline  (Secondary.TButton)
+        """
+        disabled_bg, disabled_fg = "#DCE8E2", "#7C8B84"
+        if getattr(self, "theme_mode", "light") == "dark":
+            disabled_bg, disabled_fg = "#2A3731", "#7F948A"
+
+        def flat(name, base, fg=None, hover=None, pressed=None, bold=True, padding=(12, 8),
+                 outline=None, anchor="center"):
+            fg = fg or on_color(base)
+            hover = hover or shade(base, 0.12)
+            pressed = pressed or shade(base, 0.22)
+            edge = outline or base
+            try:
+                style.configure(name, background=base, foreground=fg, bordercolor=edge,
+                                lightcolor=edge, darkcolor=edge, relief="flat",
+                                borderwidth=1 if outline else 0, padding=padding, anchor=anchor,
+                                font=(style_font, fs(10), "bold" if bold else "normal"),
+                                focuscolor=GREEN, focusthickness=2)
+                style.map(name,
+                          background=[("disabled", disabled_bg), ("pressed", pressed), ("active", hover)],
+                          foreground=[("disabled", disabled_fg), ("pressed", on_color(pressed)),
+                                      ("active", on_color(hover))],
+                          bordercolor=[("focus", GREEN)] if outline else [])
+            except tk.TclError:
+                pass
+
+        flat("TButton", GREEN, hover=GREEN_HOVER, bold=False, padding=(11, 7))
+        flat("Accent.TButton", GREEN, hover=GREEN_HOVER, padding=(13, 8))
+        flat("Primary.TButton", GREEN, hover=GREEN_HOVER, padding=(13, 8))
+        flat("Info.TButton", SEM_BLUE, padding=(13, 8))
+        flat("Export.TButton", SEM_ORANGE, padding=(13, 8))
+        flat("Danger.TButton", SEM_RED, padding=(13, 8))
+        flat("Secondary.TButton", CARD_BG, fg=DARK, hover=SOFT_GREEN, pressed=PALE,
+             outline=BORDER, padding=(13, 8))
+        column = str(self.settings.get("nav_orientation", "row")).lower() == "column"
+        flat("Nav.TButton", CARD_BG, fg=DARK, hover=SOFT_GREEN, pressed=PALE,
+             padding=(12, 9), anchor="w" if column else "center")
+        flat("NavActive.TButton", GREEN, hover=GREEN_HOVER, padding=(12, 9),
+             anchor="w" if column else "center")
+        self._il_active_button_style_signature = (GREEN, GREEN_HOVER, CARD_BG, APP_BG, SEM_BLUE,
+                                                  str(self.settings.get("theme_mode", "light")))
+
+    _BUTTON_ROLE_WORDS = (
+        ("absent", r"\b(absent)\b|غیر حاضر"),
+        ("present", r"\b(present)\b|حاضر"),
+        ("leave", r"\b(leave)\b|چھٹی"),
+        ("danger", r"\b(delete|remove|reject|clear|deactivate|disable|erase|discard)\b|حذف|ہٹائیں"),
+        ("secondary", r"\b(cancel|close|back|skip|later|no thanks|reset)\b|منسوخ|بند کریں|واپس"),
+        ("export", r"\b(print|export|download|certificates?|pdf|csv|excel|receipt|save as)\b|پرنٹ|ڈاؤن لوڈ|سرٹیفکیٹ|اسناد"),
+        ("info", r"\b(refresh|reload|open|view|show|details?|timetable|preview|select|browse|choose|search|filter)\b|ریفریش|تازہ|کھولیں|دیکھیں|تلاش"),
+    )
+    _LEGACY_BRAND_BGS = {"#0F5132", "#0A3622", "#0F7457", "#0B624A", "#10765B", "#174B3D",
+                         "#16634B", "#1B6E53", "#0D6B50", "#16785B", "#1F6F55", "#0B5F49"}
+
+    def _button_role(self, text):
+        """Function of a button, derived from its label (English or Urdu)."""
+        text = str(text or "").casefold()
+        for role, pattern in self._BUTTON_ROLE_WORDS:
+            if re.search(pattern, text):
+                return role
+        return "primary"
+
+    def _role_colors(self, role):
+        """(background, foreground, hover) for a function role. Fixed, never primary-dependent
+        except for the 'primary' role."""
+        if role == "info":
+            base = SEM_BLUE
+        elif role == "export":
+            base = SEM_ORANGE
+        elif role == "danger":
+            base = SEM_RED
+        elif role == "present":
+            base = "#157347"
+        elif role == "absent":
+            base = "#B42318"
+        elif role == "leave":
+            base = "#A15C07"
+        elif role == "secondary":
+            return CARD_BG, DARK, SOFT_GREEN
+        else:
+            return GREEN, on_color(GREEN), GREEN_HOVER
+        return base, on_color(base), shade(base, 0.12)
+
+    def _is_brand_or_default_bg(self, color):
+        c = str(color or "").strip()
+        if not c:
+            return True
+        up = c.upper()
+        if up in self._LEGACY_BRAND_BGS or up in (str(GREEN).upper(), str(GREEN_HOVER).upper()):
+            return True
+        # Default (unstyled) Tk button faces.
+        return c in ("SystemButtonFace", "#d9d9d9", "#D9D9D9", "#ececec", "#ECECEC")
+
+    def _apply_tk_button_texture(self, widget):
+        """Flat, solid, function-colored fill for classic Tk buttons (no image, no texture)."""
+        try:
+            if not widget.winfo_exists() or getattr(widget, "_il_keep_style", False):
+                return
+            role = getattr(widget, "_il_role", None)
+            if role is None:
+                role = self._button_role(widget.cget("text"))
+                forced = role in ("present", "absent", "leave", "danger")
+                if not forced and not self._is_brand_or_default_bg(widget.cget("bg")):
+                    return  # deliberately colored by its page (calendar cell, chip, ...)
+                widget._il_role = role
+            bg, fg, hover = self._role_colors(role)
+            cfg = dict(bg=bg, fg=fg, activebackground=hover, activeforeground=on_color(hover),
+                       relief="flat", bd=0, cursor="hand2", takefocus=1)
+            if role == "secondary":
+                cfg.update(highlightthickness=1, highlightbackground=BORDER, highlightcolor=GREEN)
+            else:
+                cfg.update(highlightthickness=0, highlightbackground=bg, highlightcolor=GREEN)
+            widget.configure(**cfg)
+            widget._il_bg, widget._il_hover = bg, hover
+            if not getattr(widget, "_il_hover_bound", False):
+                widget._il_hover_bound = True
+                widget.bind("<Enter>", lambda e, w=widget: self._tk_button_hover(w, True), add="+")
+                widget.bind("<Leave>", lambda e, w=widget: self._tk_button_hover(w, False), add="+")
+                widget.bind("<FocusIn>", lambda e, w=widget: w.configure(highlightthickness=2), add="+")
+                widget.bind("<FocusOut>", lambda e, w=widget: w.configure(
+                    highlightthickness=1 if getattr(w, "_il_role", "") == "secondary" else 0), add="+")
+        except (tk.TclError, AttributeError, TypeError):
+            return
+
+    def _tk_button_hover(self, widget, inside):
+        try:
+            if str(widget.cget("state")) == "disabled":
+                return
+            widget.configure(bg=widget._il_hover if inside else widget._il_bg)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _apply_ttk_button_role(self, widget):
+        """Pick the matching flat ttk style (Info / Export / Danger / Secondary) from the label."""
+        try:
+            if getattr(widget, "_il_keep_style", False):
+                return
+            current = str(widget.cget("style") or "TButton")
+            if current not in ("TButton", "Accent.TButton", "Primary.TButton", "Info.TButton",
+                               "Export.TButton", "Danger.TButton", "Secondary.TButton"):
+                return  # Nav, Present/Absent/Leave, calendar styles keep their own look
+            role = getattr(widget, "_il_role", None) or self._button_role(widget.cget("text"))
+            target = {"info": "Info.TButton", "export": "Export.TButton", "danger": "Danger.TButton",
+                      "secondary": "Secondary.TButton", "present": "Present.TButton",
+                      "absent": "Absent.TButton", "leave": "Leave.TButton"}.get(role)
+            if target and target != current:
+                widget.configure(style=target)
+        except (tk.TclError, AttributeError):
+            pass
+
+    def clear_root(self):
+        # Stop any in-flight collapsing-header animation before rebuilding the window.
+        header_after = getattr(self, "_header_animation_after_id", None)
+        if header_after:
+            try:
+                self.root.after_cancel(header_after)
+            except tk.TclError:
+                pass
+        self._header_animation_after_id = None
+        self._active_header_shell = None
+        self._active_header_inner = None
+        self._active_header_canvas = None
+        self._header_restore_before = None
+        self._main_page_canvas = None
+        self._header_collapse_progress = 0.0
+        self._header_nested_scroll_positions = {}
+        self._header_nested_scrolled = False
+        # Floating notification UI uses a separate transparent Toplevel on Windows,
+        # so explicitly clean it up when switching to login or rebuilding the shell.
+        for attr in ("_notification_animation_after_id", "_notification_refresh_after_id"):
+            after_id = getattr(self, attr, None)
+            if after_id:
+                try:
+                    self.root.after_cancel(after_id)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+        for sequence, attr in (("<Configure>", "_notification_overlay_binding"),
+                               ("<Map>", "_notification_overlay_map_binding")):
+            binding_id = getattr(self, attr, None)
+            if binding_id:
+                try:
+                    self.root.unbind(sequence, binding_id)
+                except (tk.TclError, AttributeError):
+                    pass
+                setattr(self, attr, None)
+        overlay = getattr(self, "notification_bell_window", None)
+        if overlay is not None:
+            try:
+                overlay.destroy()
+            except tk.TclError:
+                pass
+        self.notification_bell_window = None
+        self.notification_bell = None
+        self._draw_notification_bell = None
+        for child in self.root.winfo_children():
+            child.destroy()
+
+    def _mix_color(self, c1, c2, t):
+        """Blend two colors (0 = c1, 1 = c2). Used so the banner follows the saved brand color."""
+        try:
+            a = [v // 257 for v in self.root.winfo_rgb(c1)]
+            b = [v // 257 for v in self.root.winfo_rgb(c2)]
+        except tk.TclError:
+            return c1
+        return "#%02x%02x%02x" % tuple(int(x + (y - x) * t) for x, y in zip(a, b))
+
+    def _header_cfg(self, overrides=None):
+        """Return the small identity-header settings; the wallpaper is global."""
+        raw = dict(HEADER_DEFAULTS)
+        raw.update({k: str(v) for k, v in self.settings.items() if k in HEADER_DEFAULTS})
+        if overrides:
+            raw.update({k: str(v) for k, v in overrides.items() if k in HEADER_DEFAULTS})
+        try:
+            height = max(70, min(150, int(raw.get("header_height", "112"))))
+        except (TypeError, ValueError):
+            height = 112
+        return {"height": height, "tagline": str(raw.get("header_tagline", "") or "").strip()}
+
+    def _banner_text(self, canvas, x, y, text, size, weight, fill, center_w=None, tag="fg"):
+        """Draw a single-language banner caption with its matching font."""
+        text = _language_text(text)
+        size = max(8, int(round(size * max(0.8, min(1.8, FONT_SCALE)))))
+        runs = _split_script_runs(text) or [(str(text), _has_urdu_text(text))]
+        parts, total = [], 0
+        for part, is_urdu in runs:
+            family = URDU_FONT if is_urdu else UI_FONT
+            width = tkfont.Font(root=self.root, font=(family, size, weight)).measure(part)
+            parts.append((part, family, width))
+            total += width
+        if center_w is not None:
+            x = max(0, (center_w - total) / 2)
+        for part, family, width in parts:
+            canvas.create_text(x, y, text=part, anchor="w", fill=fill, font=(family, size, weight), tags=tag)
+            x += width
+        return total
+
+    def _paint_shared_wallpaper(self, canvas, width, height):
+        """The header / top bar is a flat solid surface. The wallpaper is never painted here."""
+        try:
+            canvas.delete("bg")
+            canvas.configure(bg=CARD_BG)
+        except tk.TclError:
+            pass
+
+    def _observe_scrollable_widget(self, widget):
+        """Chain a scrollable widget's existing yscrollcommand to the shared header controller.
+
+        The original scrollbar callback is preserved. This makes scrollbar dragging,
+        mouse-wheel scrolling, keyboard scrolling and programmatic yview changes use
+        the same header state instead of relying on a few hand-wired page callbacks.
+        """
+        try:
+            if widget is None or not widget.winfo_exists():
+                return False
+            if getattr(widget, "_il_header_scroll_bridge_installed", False):
+                return True
+            if not isinstance(widget, (tk.Canvas, ttk.Treeview, tk.Listbox, tk.Text)):
+                return False
+            original = str(widget.cget("yscrollcommand") or "").strip()
+            original_parts = tuple(widget.tk.splitlist(original)) if original else ()
+
+            def chained(first, last, target=widget, previous=original_parts):
+                # Never break the existing scrollbar's set(first, last) callback.
+                if previous:
+                    try:
+                        target.tk.call(*previous, first, last)
+                    except tk.TclError:
+                        pass
+                try:
+                    self._sync_header_to_scroll_position(target, first, last)
+                except (tk.TclError, AttributeError, TypeError, ValueError):
+                    pass
+
+            widget.configure(yscrollcommand=chained)
+            widget._il_header_scroll_bridge_installed = True
+            # Immediately synchronize if a restored/viewer widget was already scrolled
+            # before its Map event reached the shared observer.
+            self._sync_header_to_scroll_position(widget)
+            return True
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            return False
+
+    def _observe_scrollable_tree(self, parent):
+        """Attach the shared scroll observer to all current descendants of a page/dialog."""
+        try:
+            stack = [parent]
+            while stack:
+                current = stack.pop()
+                if not current.winfo_exists():
+                    continue
+                self._observe_scrollable_widget(current)
+                try:
+                    stack.extend(reversed(current.winfo_children()))
+                except tk.TclError:
+                    pass
+        except (tk.TclError, AttributeError, TypeError):
+            pass
+
+    def _header_scroll_widget_mapped(self, event):
+        """Observe scrollable widgets when dynamically-created dialogs/sections appear."""
+        widget = getattr(event, "widget", None)
+        try:
+            if widget is None or str(widget.winfo_toplevel()) != str(self.root):
+                return None
+            # Map can fire before a widget's yscrollcommand is configured. Defer
+            # until the current construction/layout callback has completed.
+            self.root.after_idle(lambda target=widget: self._observe_scrollable_widget(target))
+        except (tk.TclError, AttributeError):
+            pass
+        return None
+
+    def _header_scroll_widget_destroyed(self, event):
+        """Forget destroyed nested scroll panes so they cannot keep the header collapsed."""
+        widget = getattr(event, "widget", None)
+        if widget is None:
+            return None
+        try:
+            positions = getattr(self, "_header_nested_scroll_positions", {})
+            removed = positions.pop(str(widget), None) is not None
+            if removed:
+                self._sync_header_to_scroll_position()
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            pass
+        return None
+
+    def _sync_header_to_scroll_position(self, nested_widget=None, first=None, last=None):
+        """Top bar is sticky/fixed; no hiding or collapse on scroll."""
+        return
+
+    def _animate_header_collapse(self, collapsed):
+        """Top bar is sticky/fixed; keep header always visible at full height."""
+        shell = getattr(self, "_active_header_shell", None)
+        inner = getattr(self, "_active_header_inner", None)
+        full_height = int(getattr(self, "_active_header_full_height", 0) or 0)
+        try:
+            if shell is not None and shell.winfo_exists() and full_height > 0:
+                shell.configure(height=full_height)
+                shell.pack_propagate(False)
+            if inner is not None and inner.winfo_exists():
+                inner.place_configure(x=0, y=0, relwidth=1, height=full_height)
+        except tk.TclError:
+            pass
+        self._header_collapse_progress = 0.0
+        self._header_animation_active = False
+
+    def _build_header(self, parent, cfg, subtitle, user_info=None):
+        """Build a compact identity header over the same wallpaper used by every page."""
+        H = cfg["height"]
+        full_height = H + 3
+        shell = tk.Frame(parent, bg=CARD_BG, height=full_height, bd=0, highlightthickness=0)
+        shell.pack(fill="x")
+        shell.pack_propagate(False)
+        inner = tk.Frame(shell, bg=CARD_BG, bd=0, highlightthickness=0)
+        inner.place(x=0, y=0, relwidth=1, height=full_height)
+        self._active_header_shell = shell
+        self._active_header_inner = inner
+        self._active_header_full_height = full_height
+        self._header_collapse_progress = 0.0
+        self._header_animation_after_id = None
+
+        text_color = DARK
+        sub_color = MUTED
+        banner = tk.Canvas(inner, height=H, highlightthickness=0, bd=0, bg=CARD_BG)
+        banner.place(x=0, y=0, relwidth=1, height=H)
+        self._active_header_canvas = banner
+        text_x = 104
+        logo_drawn = False
+        if self.logo_path and os.path.isfile(self.logo_path) and Image is not None:
+            try:
+                self._header_logo = self._circular_logo_photo(self.logo_path, 64, "#FFFFFF", 3)
+                if self._header_logo is None:
+                    raise ValueError("logo photo could not be prepared")
+                banner.create_image(58, H // 2, image=self._header_logo, anchor="center", tags="fg")
+                text_x = 28 + 64 + 16
+                logo_drawn = True
+            except Exception:
+                pass
+        if not logo_drawn:
+            banner.create_oval(26, H // 2 - 30, 86, H // 2 + 30, fill=GREEN,
+                               outline=self._mix_color(GREEN, "#FFFFFF", 0.45), width=2, tags="fg")
+            banner.create_text(56, H // 2, text=(self._brand_display_name()[:1] or "T").upper(),
+                               fill=WHITE, font=(UI_FONT, 22, "bold"), tags="fg")
+
+        display_brand = self._brand_display_name()
+        has_ur = APP_LANGUAGE == "ur"
+        title_size = 18 if len(display_brand) > 35 else 22
+        top = (H - (76 if has_ur else 46)) / 2
+        title_font = URDU_FONT if has_ur else UI_FONT
+        banner.create_text(text_x, top + (28 if has_ur else 15), text=display_brand, anchor="w",
+                           fill=text_color, font=(title_font, title_size, "bold"), tags="fg")
+        self._banner_text(banner, text_x, top + (58 if has_ur else 43), subtitle, 10, "normal", sub_color)
+
+        chip_bg = GREEN
+        chip = tk.Frame(banner, bg=chip_bg, highlightbackground=self._mix_color(GREEN, "#FFFFFF", 0.35),
+                        highlightthickness=1, padx=14, pady=8)
+        smart_label(tk.Label, chip, text="LOCAL  •  OFFLINE", bg=chip_bg, fg=WHITE,
+                    font=(UI_FONT, 9, "bold")).pack()
+        chip_win = banner.create_window(0, H // 2, window=chip, anchor="e", tags="fg")
+
+        card = None
+        card_win = None
+        if user_info:
+            username, role_label = user_info
+            card = tk.Frame(banner, bg=CARD_BG, padx=4, pady=2,
+                            highlightbackground=BORDER, highlightthickness=1, cursor="hand2")
+            avatar = tk.Canvas(card, width=36, height=36, bg=CARD_BG, highlightthickness=0, bd=0)
+            avatar.create_oval(1, 1, 35, 35, fill=GREEN, outline="")
+            avatar.create_text(18, 18, text=(str(username)[:1] or "U").upper(), fill=WHITE,
+                               font=(UI_FONT, 12, "bold"))
+            avatar.pack(side="left", padx=(0, 5))
+            names = tk.Frame(card, bg=CARD_BG)
+            names.pack(side="left")
+            smart_label(tk.Label, names, text=str(username), bg=CARD_BG, fg=DARK,
+                        font=(UI_FONT, 10, "bold"), anchor="w").pack(anchor="w")
+            smart_label(tk.Label, names, text=str(role_label), bg=CARD_BG, fg=MUTED,
+                        font=(UI_FONT, 9), anchor="w").pack(anchor="w")
+            tk.Label(card, text="▾", bg=CARD_BG, fg=GREEN,
+                     font=("Segoe UI Symbol", 11)).pack(side="left", padx=(5, 0))
+            menu = tk.Menu(card, tearoff=0, font=(UI_FONT, 10))
+            menu.add_command(label="Change Password / پاس ورڈ تبدیل کریں", command=self.change_password)
+            menu.add_separator()
+            menu.add_command(label="Log out / لاگ آؤٹ", command=self.login_screen)
+            def open_menu(event):
+                try:
+                    menu.tk_popup(event.x_root, event.y_root + 8)
+                finally:
+                    menu.grab_release()
+            def bind_all_children(widget):
+                widget.bind("<Button-1>", open_menu)
+                for child in widget.winfo_children():
+                    bind_all_children(child)
+            bind_all_children(card)
+            card_win = banner.create_window(0, H // 2, window=card, anchor="e", tags="fg")
+
+        def paint(_event=None):
+            try:
+                w = banner.winfo_width()
+                if w < 50:
+                    return
+                self._paint_shared_wallpaper(banner, w, H)
+                x_right = w - 24
+                if card_win is not None:
+                    banner.coords(card_win, x_right, H // 2)
+                    x_right -= card.winfo_reqwidth() + 16
+                banner.coords(chip_win, x_right, H // 2)
+            except tk.TclError:
+                pass
+        paint_state = {"after": None}
+        def schedule_paint(_event=None):
+            old_id = paint_state.get("after")
+            if old_id is not None:
+                try:
+                    banner.after_cancel(old_id)
+                except tk.TclError:
+                    pass
+            try:
+                paint_state["after"] = banner.after(45, paint)
+            except tk.TclError:
+                paint_state["after"] = None
+        banner.bind("<Configure>", schedule_paint)
+        banner.after_idle(paint)
+        tk.Frame(inner, bg=GREEN, height=3).place(x=0, y=H, relwidth=1, height=3)
+
+        return shell
+
+    def header(self, subtitle="Offline school management system", user_info=None):
+        """Application header. user_info = (username, role_label) is passed only after login."""
+        cfg = self._header_cfg()
+        if user_info is not None and cfg["tagline"]:
+            subtitle = cfg["tagline"]
+        self._build_header(self.root, cfg, subtitle, user_info)
+
+    def header_customizer(self):
+        """Customize the text-only identity area; the background is always the shared app wallpaper."""
+        if not self.user or self.user.get("role") != "admin":
+            messagebox.showerror("Permission denied", "Only an administrator can customize the header.", parent=self.root)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Header Information / ہیڈر کی معلومات")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(bg=APP_BG)
+        body = ttk.Frame(win, padding=20)
+        body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text="Header identity / ادارے کی شناخت", style="Title.TLabel").pack(anchor="w")
+        smart_label(ttk.Label, body,
+            text="The separate cover photo has been removed. This area uses the same wallpaper as the rest of the software. The institution name, slogan and signed-in user information stay in their original positions.",
+            style="Sub.TLabel", wraplength=540, justify="left").pack(anchor="w", pady=(5, 14))
+        tagline_var = tk.StringVar(value=str(self.settings.get("header_tagline", "") or ""))
+        height_var = tk.StringVar(value=str(self.settings.get("header_height", "112") or "112"))
+        smart_label(ttk.Label, body, text="Slogan / نعرہ").pack(anchor="w", pady=(0, 4))
+        ttk.Entry(body, textvariable=tagline_var, width=62).pack(fill="x", pady=(0, 12))
+        smart_label(ttk.Label, body, text="Header height / ہیڈر کی اونچائی").pack(anchor="w", pady=(0, 4))
+        ttk.Combobox(body, textvariable=height_var, values=["80", "100", "112", "130", "150"],
+                     state="readonly", width=10).pack(anchor="w")
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(18, 0))
+        def save():
+            try:
+                height = max(70, min(150, int(height_var.get())))
+            except (TypeError, ValueError):
+                messagebox.showerror("Invalid height", "Choose a valid header height.", parent=win)
+                return
+            values = {"header_tagline": tagline_var.get().strip(), "header_height": str(height)}
+            self.db.conn.executemany(
+                "INSERT INTO app_settings(setting_key,setting_value) VALUES(?,?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                values.items())
+            self.db.conn.commit()
+            self.settings.update(values)
+            win.destroy()
+            self.dashboard()
+        ttk.Button(actions, text="Save & Apply / محفوظ کریں", style="Accent.TButton", command=save).pack(side="right")
+        ttk.Button(actions, text="Cancel / منسوخ", command=win.destroy).pack(side="right", padx=8)
+
+    def first_admin_setup(self):
+        self._active_page_key = "first_setup"
+        self.clear_root()
+        self.header("First-time setup • Create the private administrator account")
+        wrap = ttk.Frame(self.root, padding=28)
+        wrap.pack(fill="both", expand=True)
+        self._install_page_wallpaper(wrap)
+        smart_label(ttk.Label, wrap, text="Create Admin Login / ایڈمن اکاؤنٹ بنائیں", style="Title.TLabel").pack(anchor="w", pady=(8, 6))
+        smart_label(ttk.Label, wrap, text=(
+            "This selected database does not have an administrator account yet. "
+            "If you already use Institute Ledger and have existing records, open your existing database below instead of creating a new account. "
+            "Your databases will not be merged or copied."
+        ), wraplength=1120).pack(anchor="w", pady=(0, 10))
+
+        def open_existing_database():
+            current_path = os.path.abspath(getattr(self.db, "path", "")) if getattr(self.db, "path", "") else ""
+            initial_dir = os.path.dirname(current_path) if current_path and os.path.isdir(os.path.dirname(current_path)) else os.path.expanduser("~")
+            selected = filedialog.askopenfilename(
+                parent=self.root,
+                title="Open existing Institute Ledger database / پرانی ڈیٹابیس کھولیں",
+                initialdir=initial_dir,
+                filetypes=[
+                    ("SQLite databases and backups", "*.db *.sqlite *.sqlite3 *.bak"),
+                    ("All files", "*.*"),
+                ],
+            )
+            if not selected:
+                return
+            selected = os.path.abspath(selected)
+            if current_path and os.path.normcase(os.path.realpath(selected)) == os.path.normcase(os.path.realpath(current_path)):
+                messagebox.showwarning(
+                    "Choose the old database / پرانی ڈیٹابیس منتخب کریں",
+                    "This is the database already open, and it has no administrator account. Please select the older database that contains your records.\n\nیہی ڈیٹابیس ابھی کھلی ہوئی ہے اور اس میں ایڈمن اکاؤنٹ موجود نہیں۔ براہِ کرم وہ پرانی ڈیٹابیس منتخب کریں جس میں آپ کا ریکارڈ موجود ہے۔",
+                    parent=self.root,
+                )
+                return
+
+            has_admin = False
+            try:
+                # Validate the file read-only before changing the saved database choice.
+                uri_path = "file:" + quote(selected.replace("\\", "/"), safe="/:" ) + "?mode=ro"
+                probe = sqlite3.connect(uri_path, uri=True, timeout=3.0)
+                try:
+                    check = probe.execute("PRAGMA quick_check").fetchone()
+                    if not check or str(check[0]).lower() != "ok":
+                        raise sqlite3.DatabaseError("SQLite integrity check failed")
+                    tables = {row[0] for row in probe.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+                    known_school_tables = {
+                        "users", "students", "teachers", "attendance", "payments", "fees",
+                        "progress", "teacher_students", "class_sessions", "weekly_class_schedule",
+                        "course_curriculum", "app_settings"
+                    }
+                    if not tables or not (tables & known_school_tables):
+                        raise sqlite3.DatabaseError("This file does not appear to be an Institute Ledger / school database.")
+                    if "users" in tables:
+                        cols = {row[1] for row in probe.execute('PRAGMA table_info("users")')}
+                        if {"role"}.issubset(cols):
+                            has_admin = probe.execute("SELECT COUNT(*) FROM users WHERE role='admin'").fetchone()[0] > 0
+                finally:
+                    probe.close()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Cannot open database / ڈیٹابیس نہیں کھل سکی",
+                    f"The selected file could not be verified as a school database. No database was changed.\n\n{exc}",
+                    parent=self.root,
+                )
+                return
+
+            if has_admin:
+                detail = "An administrator account was found. The app will reopen to the normal login screen."
+            else:
+                detail = "No administrator account was found in this database. Its existing school records will be kept, and the app will ask you to create the first admin for this database."
+            if not messagebox.askyesno(
+                "Use existing database? / پرانی ڈیٹابیس استعمال کریں؟",
+                f"Use this database in its current location?\n\n{selected}\n\n{detail}\n\nThe app will use this database directly. It will NOT merge it with the currently open empty database. A safety backup is made before any required schema migration.",
+                parent=self.root,
+            ):
+                return
+
+            # Persist the selected database path so the restarted app opens the same data.
+            _save_database_path(selected)
+            try:
+                if getattr(sys, "frozen", False):
+                    restart_command = [sys.executable] + sys.argv[1:]
+                    restart_cwd = os.path.dirname(os.path.abspath(sys.executable))
+                else:
+                    script_path = os.path.abspath(sys.argv[0])
+                    restart_command = [sys.executable, script_path] + sys.argv[1:]
+                    restart_cwd = os.path.dirname(script_path)
+                subprocess.Popen(restart_command, cwd=restart_cwd, close_fds=True)
+            except Exception as exc:
+                # Restore the previous choice if the new app instance cannot launch.
+                if current_path:
+                    _save_database_path(current_path)
+                messagebox.showerror(
+                    "Could not reopen app / پروگرام دوبارہ نہیں کھل سکا",
+                    f"The database choice was not applied because the app could not restart.\n\n{exc}",
+                    parent=self.root,
+                )
+                return
+            try:
+                self.db.close()
+            except Exception:
+                pass
+            self.root.destroy()
+
+        ttk.Button(
+            wrap,
+            text="Already have an account? Open existing database / پہلے سے اکاؤنٹ ہے؟ پرانی ڈیٹابیس کھولیں",
+            command=open_existing_database,
+        ).pack(anchor="w", pady=(0, 18))
+
+        form = ttk.LabelFrame(wrap, text="Create a new administrator for this database / اس ڈیٹابیس کے لیے نیا ایڈمن بنائیں", padding=18)
+        form.pack(anchor="nw", fill="x")
+        username = self.field(form, "Username", 0, "admin")
+        password = self.field(form, "Password (at least 12 characters)", 1, "", show="*")
+        confirm = self.field(form, "Confirm password", 2, "", show="*")
+        def toggle_password(entry, button):
+            showing = entry.cget("show") == ""
+            entry.configure(show="*" if showing else "")
+            button.configure(text="Show" if showing else "Hide")
+        show_password = ttk.Button(form, text="Show", width=7)
+        show_password.configure(command=lambda: toggle_password(password, show_password))
+        show_password.grid(row=1, column=2, sticky="w", padx=(0, 8), pady=7)
+        show_confirm = ttk.Button(form, text="Show", width=7)
+        show_confirm.configure(command=lambda: toggle_password(confirm, show_confirm))
+        show_confirm.grid(row=2, column=2, sticky="w", padx=(0, 8), pady=7)
+        def create():
+            u, p, p2 = username.get().strip(), password.get(), confirm.get()
+            if not u or len(p) < 12:
+                messagebox.showwarning("Check details", "Enter a username and a password of at least 12 characters.")
+                return
+            if p != p2:
+                messagebox.showwarning("Password mismatch", "The two passwords do not match.")
+                return
+            try:
+                self.db.conn.execute(
+                    "INSERT INTO users(username,password_hash,role,active,created_at) VALUES(?,?, 'admin',1,?)",
+                    (u, password_hash(p), timestamp())
+                )
+                self.db.conn.commit()
+                messagebox.showinfo("Ready", "Admin account created. Please log in.")
+                self.login_screen()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Username in use", "Choose a different username.")
+        ttk.Button(form, text="Create Admin / ایڈمن بنائیں", style="Accent.TButton", command=create).grid(row=3, column=1, sticky="w", padx=8, pady=12)
+        # Enter/Return moves through the credential sequence without requiring a mouse.
+        username.bind("<Return>", lambda _e: (password.focus_set(), "break")[1])
+        password.bind("<Return>", lambda _e: (confirm.focus_set(), "break")[1])
+        confirm.bind("<Return>", lambda _e: (create(), "break")[1])
+        self.root.after(100, lambda: username.focus_set() if username.winfo_exists() else None)
+
+    def field(self, parent, label, row, default="", show=None, width=35):
+        smart_label(ttk.Label, parent, text=label).grid(row=row, column=0, sticky="w", padx=8, pady=7)
+        entry = ttk.Entry(parent, width=width, show=show)
+        entry.grid(row=row, column=1, sticky="ew", padx=8, pady=7)
+        if default:
+            entry.insert(0, default)
+        parent.grid_columnconfigure(1, weight=1)
+        return entry
+
+    def _attendance_approval_required(self):
+        """Whether teacher-marked attendance requires admin review (per active database)."""
+        value = str(getattr(self, "settings", {}).get("require_attendance_approval", "1")).strip().lower()
+        return value not in ("0", "false", "off", "no", "disabled")
+
+    def _attendance_approved_for_role(self, role):
+        """Return approved status: teachers follow the setting; admin entries are approved."""
+        return 0 if role == "teacher" and self._attendance_approval_required() else 1
+
+    def _read_idle_timeout(self):
+        """Read the configured idle logout in minutes. Zero disables automatic logout."""
+        try:
+            return max(0, min(240, int(self.settings.get("idle_timeout_minutes", "0"))))
+        except (TypeError, ValueError, AttributeError):
+            return 0
+
+    def _install_idle_activity_tracking(self):
+        """Track real user input once per app instance without interfering with shortcuts."""
+        for sequence, binding_id in getattr(self, "_idle_binding_ids", []):
+            try:
+                if binding_id:
+                    self.root._unbind(('bind', 'all'), binding_id)
+            except (tk.TclError, AttributeError):
+                pass
+        self._idle_binding_ids = []
+        for sequence in ("<Any-KeyPress>", "<Any-ButtonPress>", "<MouseWheel>", "<Button-4>", "<Button-5>"):
+            try:
+                bid = self.root.bind_all(sequence, self._record_idle_activity, add="+")
+                self._idle_binding_ids.append((sequence, bid))
+            except tk.TclError:
+                pass
+
+    def _record_idle_activity(self, _event=None):
+        if self.user is not None:
+            self._last_activity = time.monotonic()
+        return None
+
+    def _has_open_dialog(self):
+        """Return True while a visible Toplevel or a Tk grab is active."""
+        try:
+            grabbed = self.root.grab_current()
+            if grabbed is not None and grabbed.winfo_exists():
+                return True
+            for child in self.root.winfo_children():
+                try:
+                    if child.winfo_class() == "Toplevel" and child.winfo_exists() and child.state() != "withdrawn":
+                        return True
+                except tk.TclError:
+                    continue
+        except tk.TclError:
+            return False
+        return False
+
+    def _cancel_idle_logout(self):
+        if self._idle_timer_id is not None:
+            try:
+                self.root.after_cancel(self._idle_timer_id)
+            except tk.TclError:
+                pass
+            self._idle_timer_id = None
+
+    def _start_idle_logout(self):
+        self._cancel_idle_logout()
+        self._idle_timeout_minutes = self._read_idle_timeout()
+        self._last_activity = time.monotonic()
+        if self.user is not None and self._idle_timeout_minutes > 0:
+            self._idle_timer_id = self.root.after(15000, self._check_idle_logout)
+
+    def _check_idle_logout(self):
+        self._idle_timer_id = None
+        if self.user is None:
+            return
+        self._idle_timeout_minutes = self._read_idle_timeout()
+        if self._idle_timeout_minutes <= 0:
+            return
+        if self._has_open_dialog():
+            # Do not end a session while the user is working inside a dialog.
+            self._idle_timer_id = self.root.after(15000, self._check_idle_logout)
+            return
+        idle_seconds = time.monotonic() - self._last_activity
+        if idle_seconds >= self._idle_timeout_minutes * 60:
+            self.user = None
+            self._cancel_idle_logout()
+            self.login_screen()
+            messagebox.showinfo("Automatic logout / خودکار لاگ آؤٹ",
+                                "You were logged out after inactivity. Please sign in again. /\nغیر فعالیت کی وجہ سے لاگ آؤٹ کیا گیا؛ دوبارہ لاگ اِن کریں۔",
+                                parent=self.root)
+            return
+        self._idle_timer_id = self.root.after(15000, self._check_idle_logout)
+
+    def change_password(self):
+        """Let any signed-in role change its own password after verifying the current one."""
+        if not self.user:
+            return
+        user_id = int(self.user["id"])
+        win = tk.Toplevel(self.root)
+        win.title("Change Password / پاس ورڈ تبدیل کریں")
+        win.transient(self.root)
+        win.grab_set()
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+        self.page_title(body, "Change Password / پاس ورڈ تبدیل کریں",
+                        "Choose at least 8 characters. / کم از کم 8 حروف کا پاس ورڈ رکھیں۔")
+        form = ttk.Frame(body)
+        form.pack(fill="x", expand=False, pady=(8, 0))
+        current = self.field(form, "Current password / موجودہ پاس ورڈ", 1, show="*")
+        new = self.field(form, "New password / نیا پاس ورڈ", 2, show="*")
+        confirm = self.field(form, "Confirm new password / نیا پاس ورڈ دوبارہ", 3, show="*")
+        def save():
+            row = self.db.conn.execute("SELECT password_hash FROM users WHERE id=? AND active=1", (user_id,)).fetchone()
+            if not row or not password_matches(current.get(), row["password_hash"]):
+                messagebox.showerror("Password check / پاس ورڈ کی تصدیق", "Current password is incorrect. / موجودہ پاس ورڈ غلط ہے۔", parent=win)
+                return
+            if len(new.get()) < 8:
+                messagebox.showwarning("Weak password / کمزور پاس ورڈ", "New password must contain at least 8 characters. / نیا پاس ورڈ کم از کم 8 حروف کا ہونا چاہیے۔", parent=win)
+                return
+            if new.get() != confirm.get():
+                messagebox.showwarning("Password mismatch / پاس ورڈ مختلف ہیں", "The new passwords do not match. / دونوں نئے پاس ورڈ ایک جیسے نہیں ہیں۔", parent=win)
+                return
+            stored = password_hash(new.get())
+            self.db.conn.execute("UPDATE users SET password_hash=?, failed_attempts=0, lockout_until='' WHERE id=?", (stored, user_id))
+            self.db.conn.commit()
+            self.user["password_hash"] = stored
+            messagebox.showinfo("Password changed / پاس ورڈ تبدیل", "Your password was changed successfully. / آپ کا پاس ورڈ تبدیل ہو گیا ہے۔", parent=win)
+            win.destroy()
+        buttons = ttk.Frame(body); buttons.pack(fill="x", pady=(12, 0))
+        ttk.Button(buttons, text="Save Password / محفوظ کریں", style="Accent.TButton", command=save).pack(side="right")
+        ttk.Button(buttons, text="Cancel / منسوخ", command=win.destroy).pack(side="right", padx=8)
+        current.focus_set()
+
+    def _brand_display_name(self):
+        """Brand name in the selected interface language only."""
+        if APP_LANGUAGE == "ur":
+            return (self.brand_name_ur or "ادارے کا نام").strip()
+        return (self.brand_name or DEFAULT_INSTITUTION_NAME).strip()
+
+    def _brand_slogan(self):
+        """Brand slogan/tagline in the selected interface language."""
+        if APP_LANGUAGE == "ur":
+            return (getattr(self, "slogan_ur", "") or "تعلیم، تربیت اور قرآن کی روشنی").strip()
+        return (getattr(self, "slogan_en", "") or "Learn • Practice • Grow in Quranic Knowledge").strip()
+
+    def toast(self, message, kind="info"):
+        """Show a modern floating notification banner with proper Urdu Nastaleeq font support."""
+        try:
+            if not getattr(self, "root", None) or not self.root.winfo_exists():
+                return
+            t_win = tk.Toplevel(self.root)
+            t_win.overrideredirect(True)
+            t_win.attributes("-topmost", True)
+            t_win.configure(bg=GREEN)
+            is_urdu = any(0x0600 <= ord(c) <= 0x06FF for c in str(message))
+            f_family = URDU_FONT if is_urdu else UI_FONT
+            f_size = 11 if is_urdu else 10
+            frame = tk.Frame(t_win, bg=GREEN, padx=16, pady=9, highlightbackground=WHITE, highlightthickness=1)
+            frame.pack(fill="both", expand=True)
+            icon = "✓ " if kind in ("info", "success") else ("⚠️ " if kind == "warning" else "ℹ️ ")
+            tk.Label(frame, text=icon + str(message), bg=GREEN, fg=WHITE,
+                     font=(f_family, f_size, "bold" if is_urdu else "normal")).pack(side="left")
+            t_win.update_idletasks()
+            rw, rh = t_win.winfo_reqwidth(), t_win.winfo_reqheight()
+            rx = self.root.winfo_rootx() + self.root.winfo_width() - rw - 30
+            ry = self.root.winfo_rooty() + self.root.winfo_height() - rh - 40
+            t_win.geometry(f"{rw}x{rh}+{max(0, rx)}+{max(0, ry)}")
+            def fade():
+                try:
+                    if t_win.winfo_exists():
+                        t_win.destroy()
+                except tk.TclError:
+                    pass
+            t_win.after(2600, fade)
+        except Exception:
+            pass
+
+    def login_screen(self):
+        """Modern desktop-first green login screen; no institute-name banner strip."""
+        self._cancel_idle_logout()
+        self.user = None
+        self._active_page_key = "login"
+        self.clear_root()
+        # Keep the normal Windows controls, but do not repeat the institution name
+        # in the operating-system title bar.
+        self.root.title("")
+        self.root.configure(bg=APP_BG)
+        self.root.minsize(950, 620)
+        try:
+            if self.root.winfo_width() < 950 or self.root.winfo_height() < 620:
+                self.root.geometry("1180x760")
+        except tk.TclError:
+            pass
+
+        wallpaper = tk.Frame(self.root, bg=APP_BG, bd=0)
+        wallpaper.pack(fill="both", expand=True)
+        # Language toggle floats in the corner; there is no separate institute banner.
+        switch = self._make_language_toggle(wallpaper)
+        switch.place(relx=0.975, rely=0.025, anchor="ne")
+        stage = tk.Frame(wallpaper, bg=APP_BG)
+        stage.pack(fill="both", expand=True, padx=24, pady=(42, 26))
+        # Login is a short fixed viewport: fit one continuous stationery image,
+        # rather than tiling a second partial strip at the bottom edge.
+        stage._il_wallpaper_single_tile = True
+        self._install_page_wallpaper(stage)
+        stage.grid_columnconfigure(0, weight=1)
+        stage.grid_rowconfigure(0, weight=1)
+        # Size the card from the actual available client area. Avoid fixed minimum
+        # heights that can push the action buttons below the visible screen.
+        available_w = max(760, self.root.winfo_width() - 64)
+        available_h = max(470, self.root.winfo_height() - 90)
+        card_w = min(1080, available_w)
+        card_h = min(660, available_h)
+        box = tk.Frame(stage, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, bd=0)
+        box.place(relx=0.5, rely=0.48, anchor="center", width=card_w, height=card_h)
+        box.grid_columnconfigure(0, weight=6, uniform="login_columns")
+        box.grid_columnconfigure(1, weight=5, uniform="login_columns")
+        box.grid_rowconfigure(0, weight=1)
+
+        left = tk.Frame(box, bg=CARD_BG)
+        left.grid(row=0, column=0, sticky="nsew", padx=(24, 22), pady=6)
+        right = tk.Frame(box, bg=PALE, highlightbackground=BORDER, highlightthickness=1)
+        right.grid(row=0, column=1, sticky="nsew", padx=(0, 18), pady=18)
+
+        display_brand = self._brand_display_name()
+        heading = "Welcome back" if APP_LANGUAGE == "en" else "خوش آمدید"
+        helper = "Sign in to continue" if APP_LANGUAGE == "en" else "جاری رکھنے کے لیے لاگ اِن کریں"
+        brand_font = UI_FONT if APP_LANGUAGE == "en" else URDU_FONT
+
+        # Keep the sign-in column compact and vertically balanced on desktop.
+        # The logo lives only in the right identity panel so it is not duplicated.
+        tk.Label(left, text=display_brand, bg=CARD_BG, fg=GREEN,
+                 font=(brand_font, 18 if APP_LANGUAGE == "en" else 20, "bold"),
+                 anchor="center", justify="center", wraplength=420).pack(fill="x", pady=(0, 0))
+        tk.Label(left, text=("Academy Management System" if APP_LANGUAGE == "en" else "اکیڈمی مینجمنٹ سسٹم"),
+                 bg=CARD_BG, fg=MUTED, font=(brand_font, 9), anchor="center").pack(fill="x", pady=(0, 3))
+        tk.Label(left, text=heading + " — " + helper, bg=SOFT_GREEN, fg=DARK,
+                 font=(brand_font, 10), anchor="center", justify="center", wraplength=440,
+                 padx=8, pady=2).pack(fill="x", pady=(0, 3))
+
+        form = tk.Frame(left, bg=CARD_BG)
+        form.pack(fill="x", expand=False)
+        username_label = "Username" if APP_LANGUAGE == "en" else "صارف نام"
+        password_label = "Password" if APP_LANGUAGE == "en" else "پاس ورڈ"
+        role_label = "Sign in as" if APP_LANGUAGE == "en" else "بطور لاگ اِن"
+        role_var = tk.StringVar(value="Admin / ایڈمن")
+        tk.Label(form, text=role_label, bg=CARD_BG, fg=DARK,
+                 font=(brand_font, 9, "bold"), anchor="w").pack(fill="x", pady=(0, 0))
+        role_picker = ttk.Combobox(form, state="readonly", values=("Admin / ایڈمن", "Teacher / استاد"),
+                                   textvariable=role_var, style="LoginLarge.TCombobox")
+        role_picker.pack(fill="x", pady=(0, 2))
+        username_label_widget = tk.Label(form, text=username_label, bg=CARD_BG, fg=DARK,
+                 font=(brand_font, 10, "bold"), anchor="w").pack(fill="x", pady=(0, 0))
+        try:
+            style = ttk.Style(self.root)
+            style.configure("LoginLarge.TEntry", font=(UI_FONT, 12), padding=(6, 2))
+            style.configure("LoginLarge.TCombobox", font=(UI_FONT, 11), padding=(5, 2))
+        except tk.TclError:
+            pass
+        u = ttk.Entry(form, width=1, style="LoginLarge.TEntry")
+        u.pack(fill="x", ipady=0, pady=(0, 2))
+        tk.Label(form, text=password_label, bg=CARD_BG, fg=DARK,
+                 font=(brand_font, 10, "bold"), anchor="w").pack(fill="x", pady=(0, 0))
+        password_row = tk.Frame(form, bg=CARD_BG)
+        password_row.pack(fill="x", pady=(0, 0))
+        p = ttk.Entry(password_row, width=1, show="*", style="LoginLarge.TEntry")
+        p.pack(side="left", fill="x", expand=True)
+        def toggle_login_password():
+            showing = p.cget("show") == ""
+            p.configure(show="*" if showing else "")
+            show_password_button.configure(text=("Show" if showing else "Hide") if APP_LANGUAGE == "en" else ("دکھائیں" if showing else "چھپائیں"))
+        show_password_button = ttk.Button(password_row, text=("Show" if APP_LANGUAGE == "en" else "دکھائیں"), width=7,
+                                          command=toggle_login_password)
+        show_password_button.pack(side="left", padx=(6, 0))
+
+        def login(event=None):
+            username = u.get().strip()
+            row = self.db.conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+            now = datetime.now()
+            if row and int(row["active"] or 0) != 1:
+                messagebox.showerror("Approval pending / منظوری باقی ہے",
+                    "This account is waiting for administrator approval. / یہ اکاؤنٹ ایڈمن کی منظوری کا منتظر ہے۔", parent=self.root)
+                return
+            if row:
+                lock_until = str(row["lockout_until"] or "").strip()
+                if lock_until:
+                    try:
+                        locked_to = datetime.strptime(lock_until, "%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        locked_to = now
+                    if locked_to > now:
+                        remaining = max(1, int((locked_to - now).total_seconds() + 59) // 60)
+                        messagebox.showerror("Account temporarily locked / اکاؤنٹ عارضی طور پر بند",
+                            f"Too many incorrect passwords. Try again in about {remaining} minute(s). / غلط پاس ورڈ زیادہ بار درج ہوئے۔ تقریباً {remaining} منٹ بعد دوبارہ کوشش کریں.", parent=self.root)
+                        return
+                    self.db.conn.execute("UPDATE users SET failed_attempts=0, lockout_until='' WHERE id=?", (row["id"],))
+                    self.db.conn.commit()
+                    row = self.db.conn.execute("SELECT * FROM users WHERE id=?", (row["id"],)).fetchone()
+            # Student accounts are not part of the current release. Keep legacy
+            # student rows intact, but do not permit them to authenticate.
+            if row and str(row["role"] or "").strip().lower() == "student":
+                messagebox.showerror(
+                    "Student login unavailable / طالب علم لاگ اِن دستیاب نہیں",
+                    "Student login is not included in this release. Please contact the administrator. / اس ریلیز میں طالب علم لاگ اِن شامل نہیں ہے۔ منتظم سے رابطہ کریں۔",
+                    parent=self.root)
+                return
+            selected_role = "admin" if role_var.get().startswith("Admin") else "teacher"
+            valid = bool(row and str(row["role"] or "").strip().lower() == selected_role
+                         and int(row["active"] or 0) == 1
+                         and password_matches(p.get(), row["password_hash"]))
+            if not valid:
+                if row:
+                    attempts = int(row["failed_attempts"] or 0) + 1
+                    if attempts >= 5:
+                        lock_until = (now + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                        self.db.conn.execute("UPDATE users SET failed_attempts=0, lockout_until=? WHERE id=?", (lock_until, row["id"]))
+                        self.db.conn.commit()
+                        message = "Five incorrect attempts. This account is locked for 5 minutes. / پانچ غلط کوششیں؛ اکاؤنٹ 5 منٹ کے لیے بند کر دیا گیا ہے۔"
+                    else:
+                        self.db.conn.execute("UPDATE users SET failed_attempts=?, lockout_until='' WHERE id=?", (attempts, row["id"]))
+                        self.db.conn.commit()
+                        message = f"Username or password is incorrect. Attempts remaining before lockout: {5-attempts}. / صارف نام یا پاس ورڈ غلط ہے۔ لاک ہونے سے پہلے باقی کوششیں: {5-attempts}۔"
+                else:
+                    message = "Username or password is incorrect, or the account is inactive. / صارف نام یا پاس ورڈ غلط ہے، یا اکاؤنٹ غیر فعال ہے۔"
+                messagebox.showerror("Login failed / لاگ اِن ناکام", message, parent=self.root)
+                return
+            self.db.conn.execute("UPDATE users SET failed_attempts=0, lockout_until='' WHERE id=?", (row["id"],))
+            self.db.conn.commit()
+            self.user = dict(self.db.conn.execute("SELECT * FROM users WHERE id=?", (row["id"],)).fetchone())
+            self._last_activity = time.monotonic()
+            self.dashboard()
+
+        actions = tk.Frame(left, bg=CARD_BG)
+        actions.pack(fill="x", pady=(4, 0), side="bottom" )
+        # Separate, compact columns prevent the primary login action from
+        # stretching over the database/restore action on narrower screens.
+        actions.grid_columnconfigure(0, weight=1, uniform="login_actions")
+        actions.grid_columnconfigure(1, weight=1, uniform="login_actions")
+        login_text = "Login" if APP_LANGUAGE == "en" else "داخل ہوں"
+        login_button = ttk.Button(actions, text=login_text, style="Accent.TButton", command=login)
+        login_button.grid(row=0, column=0, sticky="ew", padx=(0, 5), ipady=3)
+        def switch_database():
+            selected = filedialog.askopenfilename(
+                parent=self.root, title="Open existing Institute Ledger database or backup / پرانی ڈیٹابیس یا بیک اپ کھولیں",
+                filetypes=[("SQLite database and backups", "*.db *.sqlite *.sqlite3 *.bak"), ("All files", "*.*")])
+            if not selected:
+                return
+            selected = os.path.abspath(selected)
+            try:
+                _validate_existing_database(selected)
+                probe = sqlite3.connect("file:" + quote(selected.replace("\\", "/"), safe="/:") + "?mode=ro", uri=True)
+                try:
+                    tables = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if "users" not in tables or not {r[1] for r in probe.execute('PRAGMA table_info("users")')}.issuperset({"username", "password_hash", "role", "active"}):
+                        raise sqlite3.DatabaseError("The selected file has no compatible user account table.")
+                    has_admin = probe.execute("SELECT COUNT(*) FROM users WHERE lower(role)='admin'").fetchone()[0] > 0
+                finally:
+                    probe.close()
+                if not has_admin:
+                    raise sqlite3.DatabaseError("No Admin account was found in this database. Existing records will not be replaced or reset.")
+            except Exception as exc:
+                messagebox.showerror("Cannot use database / ڈیٹابیس استعمال نہیں ہو سکتی",
+                                     f"The selected file was not changed.\n\n{exc}", parent=self.root)
+                return
+            if selected.lower().endswith((".bak", ".sqlite3", ".sqlite")):
+                target_folder = filedialog.askdirectory(parent=self.root, title="Choose permanent data folder for restored copy / بحال شدہ ڈیٹا کے لیے مستقل فولڈر منتخب کریں", mustexist=False)
+                if not target_folder:
+                    return
+                target_folder = os.path.abspath(target_folder)
+                os.makedirs(target_folder, exist_ok=True)
+                target_path = os.path.join(target_folder, "institute_ledger.db")
+                if os.path.exists(target_path):
+                    messagebox.showerror("Target already exists / منزل پر ڈیٹا بیس موجود ہے",
+                                         f"The existing file will not be overwritten. Choose another empty data folder.\n\n{target_path}", parent=self.root)
+                    return
+                source = destination = None
+                try:
+                    source_uri = "file:" + quote(selected.replace("\\", "/"), safe="/:") + "?mode=ro"
+                    source = sqlite3.connect(source_uri, uri=True, timeout=10.0)
+                    destination = sqlite3.connect(target_path, timeout=10.0)
+                    source.backup(destination)
+                    if str(destination.execute("PRAGMA integrity_check").fetchone()[0]).lower() != "ok":
+                        raise sqlite3.DatabaseError("The copied backup failed SQLite integrity_check.")
+                    destination.close(); destination = None
+                    source.close(); source = None
+                    _validate_existing_database(target_path)
+                    selected = target_path
+                except Exception as exc:
+                    for connection in (destination, source):
+                        if connection is not None:
+                            try: connection.close()
+                            except Exception: pass
+                    try:
+                        if os.path.exists(target_path): os.remove(target_path)
+                    except OSError: pass
+                    messagebox.showerror("Restore copy failed / بحالی ناکام",
+                                         f"The source backup was left unchanged.\n\n{exc}", parent=self.root)
+                    return
+            if not messagebox.askyesno("Switch database? / ڈیٹابیس تبدیل کریں؟",
+                    f"Use this database on next launch?\n\n{selected}\n\nThe current database will not be merged or overwritten.", parent=self.root):
+                return
+            _save_database_path(selected)
+            messagebox.showinfo("Database saved / ڈیٹابیس محفوظ",
+                                "Close and reopen Institute Ledger to use this database. / اس ڈیٹابیس کو استعمال کرنے کے لیے پروگرام بند کرکے دوبارہ کھولیں۔", parent=self.root)
+        ttk.Button(actions, text=("Open existing data / Restore" if APP_LANGUAGE == "en" else "پرانا ڈیٹا / بیک اپ کھولیں"),
+                    command=switch_database).grid(row=0, column=1, sticky="ew", padx=(5, 0), ipady=3)
+
+        # Clean logo area: no "Institution Identity" heading and no added circular frame.
+        logo_area = tk.Frame(right, bg=PALE, width=200, height=200, bd=0,
+                             highlightthickness=0, relief="flat")
+        logo_area.pack(pady=(8, 3))
+        logo_area.pack_propagate(False)
+        self._login_logo_image = None
+        configured_logo = self.logo_path if self.logo_path and os.path.isfile(self.logo_path) else DEFAULT_LOGIN_LOGO
+        if configured_logo and os.path.isfile(configured_logo) and Image is not None and ImageTk is not None:
+            try:
+                with Image.open(configured_logo) as _opened_logo:
+                    _logo = _opened_logo.convert("RGBA")
+                    # If the chosen file is a tall logo poster, keep the upper emblem area
+                    # rather than shrinking its slogan/arrows into the login logo.
+                    w, h = _logo.size
+                    if h > w * 1.18:
+                        side = min(w, int(h * 0.58))
+                        left_crop = max(0, (w - side) // 2)
+                        top_crop = max(0, int(h * 0.04))
+                        if top_crop + side > h:
+                            top_crop = max(0, h - side)
+                        _logo = _logo.crop((left_crop, top_crop, left_crop + side, top_crop + side))
+                    _logo.thumbnail((174, 174), Image.Resampling.LANCZOS)
+                    self._login_logo_image = ImageTk.PhotoImage(_logo.copy())
+                tk.Label(logo_area, image=self._login_logo_image, bg=PALE, bd=0,
+                         highlightthickness=0).pack(expand=True)
+            except Exception:
+                self._login_logo_image = None
+        if self._login_logo_image is None:
+            initials = (display_brand[:1] or "I").upper()
+            tk.Label(logo_area, text=initials, bg=PALE, fg=GREEN,
+                     font=(brand_font, 40, "bold"), bd=0, highlightthickness=0).pack(expand=True)
+        # Restore the requested tagline beneath the logo; no arrows, stars, or guide lines.
+        tagline = "Your school, your identity" if APP_LANGUAGE == "en" else "آپ کا ادارہ، آپ کی پہچان"
+        tk.Label(right, text=tagline, bg=PALE, fg=MUTED,
+                 font=(brand_font, 11), anchor="center").pack(pady=(2, 0))
+
+        footer = "Your data stays on this computer" if APP_LANGUAGE == "en" else "آپ کا ڈیٹا اسی کمپیوٹر میں محفوظ رہتا ہے"
+        tk.Label(self.root, text=footer, bg=APP_BG, fg=MUTED,
+                 font=(brand_font, 10), padx=14, pady=5).place(relx=0.5, rely=0.99, anchor="s")
+        u.bind("<Return>", lambda event: (p.focus_set(), "break")[1])
+        p.bind("<Return>", login)
+        self.root.after(100, lambda: u.focus_set() if u.winfo_exists() else None)
+
+    def create_account_from_login(self):
+        """Public self-registration is disabled; admins create teacher accounts in-app."""
+        messagebox.showinfo(
+            "Account management / اکاؤنٹ مینجمنٹ",
+            "Please ask the administrator to create or manage your teacher account. / استاد کے اکاؤنٹ کی تخلیق یا انتظام کے لیے منتظم سے رابطہ کریں۔",
+            parent=self.root)
+        return
+        win = tk.Toplevel(self.root)
+        win.title("Create Account / نیا اکاؤنٹ")
+        win.configure(bg=APP_BG)
+        win.transient(self.root)
+        win.grab_set()
+        win.resizable(False, False)
+        body = tk.Frame(win, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=24, pady=22)
+        body.pack(fill="both", expand=True, padx=14, pady=14)
+        smart_label(tk.Label, body, text="Create a new login / نیا لاگ اِن بنائیں",
+                    bg=CARD_BG, fg=DARK, font=(UI_FONT, 18, "bold")).pack(anchor="w", pady=(0, 5))
+        smart_label(tk.Label, body, text="Use an existing student/teacher record. The administrator must approve your request before you can log in.",
+                    bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9), wraplength=440, justify="left").pack(anchor="w", pady=(0, 3))
+        smart_label(tk.Label, body, text="موجودہ طالب علم یا استاد کا ریکارڈ استعمال کریں۔ لاگ اِن کی اجازت سے پہلے ایڈمن کی منظوری ضروری ہے۔",
+                    bg=CARD_BG, fg=MUTED, font=(URDU_FONT, 10), wraplength=440, justify="right").pack(anchor="e", pady=(0, 14))
+
+        form = tk.Frame(body, bg=CARD_BG)
+        form.pack(fill="x")
+        role_var = tk.StringVar(value="Student / طالب علم")
+        role_options = {"Student / طالب علم": "student", "Teacher / استاد": "teacher"}
+        fields = {}
+        def add_text_field(key, label, show=None):
+            smart_label(tk.Label, form, text=label, bg=CARD_BG, fg=DARK, font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(6, 4))
+            entry = ttk.Entry(form, width=42, show=show)
+            entry.pack(fill="x", pady=(0, 5), ipady=3)
+            fields[key] = entry
+        smart_label(tk.Label, form, text="Account type / اکاؤنٹ کی قسم", bg=CARD_BG, fg=DARK,
+                    font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(6, 4))
+        role_box = ttk.Combobox(form, textvariable=role_var, values=list(role_options), state="readonly", width=39)
+        role_box.pack(fill="x", pady=(0, 5), ipady=3)
+        add_text_field("full_name", "Full name exactly as enrolled / رجسٹرڈ پورا نام")
+        add_text_field("contact", "Registered phone or email / رجسٹرڈ فون یا ای میل")
+        add_text_field("username", "New username / نیا صارف نام")
+        add_text_field("password", "Password (12+ characters) / پاس ورڈ", show="*")
+        add_text_field("confirm", "Confirm password / پاس ورڈ دوبارہ", show="*")
+
+        def normalized_contact(value):
+            value = str(value or "").strip()
+            if "@" in value:
+                return value.casefold()
+            digits = "".join(ch for ch in value if ch.isdigit())
+            return normalize_whatsapp_number(value) or digits
+
+        def submit():
+            role = role_options.get(role_var.get(), "")
+            full_name = fields["full_name"].get().strip()
+            contact = fields["contact"].get().strip()
+            username = fields["username"].get().strip()
+            password = fields["password"].get()
+            confirm = fields["confirm"].get()
+            if not role or not full_name or not contact or not username:
+                messagebox.showwarning("Missing details / معلومات نامکمل", "Complete all fields. / تمام خانے پُر کریں۔", parent=win)
+                return
+            if len(password) < 12:
+                messagebox.showwarning("Password too short / پاس ورڈ مختصر ہے", "Use at least 12 characters. / کم از کم 12 حروف استعمال کریں۔", parent=win)
+                return
+            if password != confirm:
+                messagebox.showwarning("Password mismatch / پاس ورڈ مختلف", "The passwords do not match. / دونوں پاس ورڈ ایک جیسے نہیں ہیں۔", parent=win)
+                return
+            table = "teachers" if role == "teacher" else "students"
+            cols = "id, full_name, phone, email" if role == "teacher" else "id, full_name, phone, email"
+            matches = []
+            rows = self.db.conn.execute(f"SELECT {cols} FROM {table} WHERE LOWER(TRIM(COALESCE(full_name,'')))=LOWER(?)", (full_name,)).fetchall()
+            supplied = normalized_contact(contact)
+            for candidate in rows:
+                stored_contacts = [normalized_contact(candidate["phone"]), normalized_contact(candidate["email"])]
+                if supplied and supplied in stored_contacts:
+                    matches.append(candidate)
+            if len(matches) != 1:
+                messagebox.showerror("Record not verified / ریکارڈ کی تصدیق نہیں ہوئی",
+                    "The name and phone/email must match exactly one existing record. If you are not yet enrolled, ask the administrator to add your record first. / نام اور فون یا ای میل کسی ایک موجودہ ریکارڈ سے لازماً ملنے چاہییں۔ اگر آپ کا اندراج نہیں ہوا تو پہلے ایڈمن سے ریکارڈ بنوائیں۔", parent=win)
+                return
+            record_id = int(matches[0]["id"])
+            if role == "teacher":
+                already = self.db.conn.execute("SELECT id FROM users WHERE role='teacher' AND teacher_id=?", (record_id,)).fetchone()
+            else:
+                already = self.db.conn.execute("SELECT id FROM users WHERE role='student' AND student_id=?", (record_id,)).fetchone()
+            if already:
+                messagebox.showwarning("Account already exists / اکاؤنٹ موجود ہے",
+                    "An account or request already exists for this record. Please contact the administrator. / اس ریکارڈ کے لیے اکاؤنٹ یا درخواست پہلے سے موجود ہے۔ ایڈمن سے رابطہ کریں۔", parent=win)
+                return
+            try:
+                self.db.conn.execute(
+                    "INSERT INTO users(username,password_hash,role,teacher_id,student_id,active,created_at) VALUES(?,?,?,?,?,0,?)",
+                    (username, password_hash(password), role, record_id if role == "teacher" else None,
+                     record_id if role == "student" else None, timestamp()))
+                self.db.conn.commit()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Username unavailable / صارف نام دستیاب نہیں",
+                                     "That username is already in use. Please choose another. / یہ صارف نام پہلے سے استعمال ہو رہا ہے۔", parent=win)
+                return
+            messagebox.showinfo("Request submitted / درخواست بھیج دی گئی",
+                "Your request is saved, but the account is inactive until the administrator verifies and activates it. / درخواست محفوظ ہو گئی ہے، لیکن ایڈمن کی تصدیق اور منظوری تک اکاؤنٹ فعال نہیں ہوگا۔", parent=win)
+            win.destroy()
+
+        buttons = tk.Frame(body, bg=CARD_BG)
+        buttons.pack(fill="x", pady=(15, 0))
+        ttk.Button(buttons, text="Submit request / درخواست جمع کریں", style="Accent.TButton", command=submit).pack(side="left", fill="x", expand=True)
+        ttk.Button(buttons, text="Cancel / منسوخ", command=win.destroy).pack(side="left", padx=(8, 0))
+        # The Return key advances through the account fields in order. The final
+        # confirmation field submits; Tab remains available as the standard alternative.
+        ordered_fields = [role_box, fields["full_name"], fields["contact"], fields["username"], fields["password"], fields["confirm"]]
+        for field_index, entry_widget in enumerate(ordered_fields):
+            if field_index < len(ordered_fields) - 1:
+                entry_widget.bind("<Return>", lambda _e, nxt=ordered_fields[field_index + 1]: (nxt.focus_set(), "break")[1])
+            else:
+                entry_widget.bind("<Return>", lambda _e: (submit(), "break")[1])
+        win.update_idletasks()
+        screen_w, screen_h = win.winfo_screenwidth(), win.winfo_screenheight()
+        ww, wh = min(540, screen_w - 40), min(max(620, win.winfo_reqheight()), screen_h - 60)
+        win.geometry(f"{ww}x{wh}+{max(0,(screen_w-ww)//2)}+{max(0,(screen_h-wh)//2)}")
+        fields["full_name"].focus_set()
+
+    def dashboard(self):
+        self._active_page_key = "dashboard"
+        self.clear_root()
+        role = self.user["role"]
+        if role == "admin":
+            # Create this month's invoices once per month; INSERT OR IGNORE prevents duplicates.
+            try:
+                self._auto_generate_monthly_invoices()
+            except (sqlite3.Error, OSError, ValueError):
+                # A failed automatic run is retried at the next admin login; manual generation remains available.
+                pass
+        self._start_idle_logout()
+        role_label = {"admin": "Administrator", "teacher": "Teacher", "student": "Student"}.get(role, role)
+        self._animate_header_collapse(False)
+        self.header("Learn • Practice • Grow in Quranic Knowledge", user_info=(self.user["username"], role_label))
+        nav = self._build_nav_shell()
+        nav_container = nav
+        while getattr(nav_container, "master", None) is not None and nav_container.master is not self.root:
+            nav_container = nav_container.master
+        self._header_restore_before = nav_container
+        # Main workspace is vertically scrollable so every module remains usable
+        # on smaller screens and at Windows display scaling above 100%.
+        workspace = ttk.Frame(self.root, style="Workspace.TFrame")
+        workspace.pack(fill="both", expand=True)
+        page_canvas = tk.Canvas(workspace, bg=APP_BG, highlightthickness=0, bd=0, yscrollincrement=18)
+        self._main_page_canvas = page_canvas
+        self._last_main_scroll_fraction = 0.0
+        self._header_collapse_target = False
+        self._header_nested_scrolled = False
+        self._header_nested_scroll_positions = {}
+        def page_view_changed(first, last):
+            page_scrollbar.set(first, last)
+            self._last_main_scroll_fraction = float(first)
+        page_scrollbar = ttk.Scrollbar(workspace, orient="vertical", command=page_canvas.yview)
+        page_canvas.configure(yscrollcommand=page_view_changed)
+        page_scrollbar.pack(side="right", fill="y")
+        page_canvas.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(page_canvas, padding=(22, 20, 22, 22), style="Workspace.TFrame")
+        self._active_page_parent = content
+        self._install_page_wallpaper(content)
+        content_window = page_canvas.create_window((0, 0), window=content, anchor="nw")
+        def _update_page_scrollregion(_e=None):
+            bbox = page_canvas.bbox("all")
+            if bbox:
+                cur = str(page_canvas.cget("scrollregion") or "")
+                new_sr = f"{bbox[0]} {bbox[1]} {bbox[2]} {bbox[3]}"
+                if cur != new_sr:
+                    page_canvas.configure(scrollregion=new_sr)
+        content.bind("<Configure>", _update_page_scrollregion)
+        page_canvas.bind("<Configure>", lambda e: page_canvas.itemconfigure(content_window, width=e.width))
+
+        # Route wheel events globally to the scrollable widget under the pointer.
+        # Binding only the outer canvas/frame misses events over child labels,
+        # buttons and nested frames, which is why wheel scrolling previously failed.
+        def _scroll_target(widget):
+            """Pick the nearest genuinely scrollable widget under the pointer.
+
+            This includes embedded canvases (cards, profiles and custom dialogs),
+            not just Treeviews. If the pointer is in a Toplevel without a scroll
+            container, return None rather than scrolling the page behind it.
+            """
+            if widget is None:
+                return page_canvas
+            try:
+                top = widget.winfo_toplevel()
+            except (tk.TclError, AttributeError):
+                top = self.root
+            current = widget
+            while current is not None:
+                try:
+                    if isinstance(current, (tk.Canvas, ttk.Treeview, tk.Listbox, tk.Text)):
+                        first, last = current.yview()
+                        # A partially visible range means the widget owns vertical scrolling.
+                        if float(first) > 0.001 or float(last) < 0.999:
+                            return current
+                        # Canvas yview may initially report (0, 1) before Configure;
+                        # inspect its real content bounds as a fallback.
+                        if isinstance(current, tk.Canvas):
+                            # Only treat canvases with an explicit scrollregion as
+                            # nested scroll areas; chart and banner canvases must not drift.
+                            try:
+                                region = str(current.cget("scrollregion") or "").strip()
+                            except tk.TclError:
+                                region = ""
+                            if region:
+                                bbox = current.bbox("all")
+                                height = max(1, current.winfo_height())
+                                if bbox and (bbox[3] - bbox[1]) > height + 2:
+                                    return current
+                    if current is top:
+                        break
+                    current = current.master
+                except (tk.TclError, AttributeError, TypeError):
+                    break
+            return page_canvas if str(top) == str(self.root) else None
+
+        def _wheel_scroll(event, direction=None):
+            try:
+                # Use the actual event widget and walk up its parents. winfo_containing()
+                # can return the wrong widget on Windows when themed controls overlap
+                # or a transient dialog is present, which made wheel events appear dead.
+                event_widget = getattr(event, "widget", None)
+                target = _scroll_target(event_widget)
+                if target is None:
+                    # Never scroll the dashboard behind a transient dialog.
+                    return "break"
+                if direction is None:
+                    delta = int(getattr(event, "delta", 0) or 0)
+                    if not delta:
+                        return "break"
+                    # Keep high-resolution touchpad deltas fractional until a full wheel step exists.
+                    wheel_state = getattr(self, '_il_wheel_remainders', None)
+                    if wheel_state is None:
+                        wheel_state = self._il_wheel_remainders = {}
+                    key = str(target)
+                    total = wheel_state.get(key, 0) - delta
+                    units = int(total / 120)
+                    wheel_state[key] = total - units * 120
+                    if units == 0:
+                        return "break"
+                else:
+                    units = int(direction)
+
+                first, last = target.yview()
+                at_top = float(first) <= 0.001
+                at_bottom = float(last) >= 0.999
+                if (units < 0 and at_top) or (units > 0 and at_bottom):
+                    # At a nested scroll area's edge, let the main page continue,
+                    # but never scroll behind a separate Toplevel dialog.
+                    try:
+                        event_top = event_widget.winfo_toplevel() if event_widget is not None else self.root
+                    except tk.TclError:
+                        event_top = self.root
+                    if target is not page_canvas and str(event_top) == str(self.root):
+                        target = page_canvas
+                        first, last = target.yview()
+                        if (units < 0 and float(first) <= 0.001) or (units > 0 and float(last) >= 0.999):
+                            return "break"
+                    else:
+                        return "break"
+                target.yview_scroll(units, "units")
+                if target is not page_canvas:
+                    self._sync_header_to_scroll_position(target)
+                return "break"
+            except (tk.TclError, AttributeError, TypeError, ValueError):
+                return "break"
+
+        # Keyboard navigation for the main page: Up/Down, PageUp/PageDown,
+        # Home/End. Do not steal keys while the user is typing or navigating a table.
+        def _keyboard_scroll(event):
+            try:
+                focus = self.root.focus_get()
+                if focus is not None and isinstance(
+                    focus, (tk.Entry, ttk.Entry, tk.Text, ttk.Treeview, tk.Listbox, tk.Spinbox)
+                ):
+                    return None
+                target = _scroll_target(focus)
+                if target is None:
+                    return None
+                key = getattr(event, "keysym", "")
+                units = {"Up": -3, "Down": 3, "Prior": -1, "Next": 1}
+                if key in units:
+                    direction = units[key]
+                    if key in ("Prior", "Next"):
+                        target.yview_scroll(direction, "pages")
+                    else:
+                        target.yview_scroll(direction, "units")
+                elif key == "Home":
+                    target.yview_moveto(0)
+                elif key == "End":
+                    target.yview_moveto(1)
+                else:
+                    return None
+                return "break"
+            except (tk.TclError, AttributeError, TypeError, ValueError):
+                return None
+
+        # Remove the previous dashboard's global bindings before installing new ones.
+        old_bindings = getattr(self, "_wheel_binding_ids", [])
+        for sequence, binding_id in old_bindings:
+            try:
+                if binding_id:
+                    self.root._unbind(('bind', 'all'), binding_id)
+            except (tk.TclError, AttributeError):
+                pass
+        self._wheel_binding_ids = []
+        for sequence, callback in (
+            ("<MouseWheel>", lambda event: _wheel_scroll(event)),
+            ("<Button-4>", lambda event: _wheel_scroll(event, -1)),
+            ("<Button-5>", lambda event: _wheel_scroll(event, 1)),
+            ("<Up>", _keyboard_scroll),
+            ("<Down>", _keyboard_scroll),
+            ("<Prior>", _keyboard_scroll),
+            ("<Next>", _keyboard_scroll),
+            ("<Home>", _keyboard_scroll),
+            ("<End>", _keyboard_scroll),
+        ):
+            binding_id = self.root.bind_all(sequence, callback, add="+")
+            self._wheel_binding_ids.append((sequence, binding_id))
+        if role == "admin":
+            buttons = [
+                ("🏠 Dashboard", lambda: self.admin_home(content)),
+                ("👨‍🎓 Students", lambda: self.students_page(content)),
+                ("👩‍🏫 Teachers", lambda: self.teachers_page(content)),
+                ("💳 Fees & Payments", lambda: self.fees_page(content)),
+                ("📅 Timetable", lambda: self.timetable_page(content)),
+                ("✅ Attendance", lambda: self.attendance_page(content)),
+                ("📈 Progress", lambda: self.progress_page(content)),
+                ("🔐 Accounts", lambda: self.accounts_page(content)),
+                ("📊 Graphs", lambda: self.graphs_page(content)),
+                ("📁 Reports / Export", lambda: self.reports_page(content)),
+                ("\u2699\ufe0f Settings", lambda: self.settings_page(content)),
+            ]
+        elif role == "teacher":
+            buttons = [
+                ("👨‍🎓 My Students", lambda: self.teacher_students(content)),
+                ("✅ Attendance", lambda: self.teacher_attendance(content)),
+                ("📈 Progress", lambda: self.teacher_progress(content)),
+            ]
+        else:
+            buttons = [("📚 My Learning", lambda: self.student_home(content)),
+                       ]
+        self.nav_button_refs = {}
+        self.nav_underline_refs = {}
+        group_headers = {
+            "🏠 Dashboard": "📊 OVERVIEW / عمومی جائزہ",
+            "👨‍🎓 Students": "📖 ACADEMICS / تعلیمی امور",
+            "💳 Fees & Payments": "💰 FINANCE / مالیات",
+            "👩‍🏫 Teachers": "👥 STAFF & ANALYTICS / عملہ و تجزیہ",
+            "\u2699\ufe0f Settings": "⚙️ SYSTEM / ترتیبات",
+            "👨‍🎓 My Students": "📖 ACADEMICS / تعلیمی امور",
+        }
+        for label, callback in buttons:
+            if self._nav_orientation == "column" and label in group_headers:
+                hdr = tk.Frame(nav, bg=PALE, pady=3, padx=8)
+                hdr.pack(fill="x", padx=6, pady=(10, 2))
+                smart_label(tk.Label, hdr, text=group_headers[label], font=(UI_FONT, 8, "bold"), fg=MUTED, bg=PALE, anchor="w").pack(side="left")
+            holder = ttk.Frame(nav, style="Workspace.TFrame")
+            if self._nav_orientation == "column":
+                holder.pack(fill="x", padx=5, pady=2)
+            else:
+                holder.pack(side="left", padx=3, pady=(6, 0))
+            btn = ttk.Button(
+                holder, text=_language_text(label), style="Nav.TButton",
+                command=lambda cb=callback, lab=label: self.navigate_page(content, cb, lab)
+            )
+            btn.pack(fill="x" if self._nav_orientation == "column" else None, expand=self._nav_orientation == "column")
+            try:
+                btn.bind("<MouseWheel>", self._nav_wheel_handler, add="+")
+                btn.bind("<Shift-MouseWheel>", self._nav_wheel_handler, add="+")
+                holder.bind("<MouseWheel>", self._nav_wheel_handler, add="+")
+                holder.bind("<Shift-MouseWheel>", self._nav_wheel_handler, add="+")
+            except (tk.TclError, AttributeError):
+                pass
+            if self._nav_orientation == "column":
+                line = tk.Frame(holder, bg=GREEN, width=4)
+                line.pack(side="right", fill="y")
+            else:
+                line = tk.Frame(holder, bg=GREEN, height=3)
+                line.pack(fill="x")
+            self.nav_button_refs[label] = btn
+            self.nav_underline_refs[label] = line
+        initial_label = "🏠 Dashboard" if role == "admin" else ("👨‍🎓 My Students" if role == "teacher" else "📚 My Learning")
+        self.set_active_nav(initial_label)
+
+        # Explicit Shift+Arrow bindings: bind the modified sequences directly rather
+        # than relying on the Windows Tk event.state bitmask (which varies by focus).
+        def _shift_nav(event, direction):
+            try:
+                focus = self.root.focus_get()
+                if self._has_open_dialog():
+                    return None
+                if focus is not None and (
+                    isinstance(focus, (tk.Entry, ttk.Entry, tk.Text, ttk.Treeview, tk.Listbox,
+                                        tk.Spinbox, ttk.Spinbox, ttk.Combobox))
+                    or str(focus.winfo_class()) in ("Entry", "TEntry", "Text", "TCombobox",
+                                                    "Combobox", "Spinbox", "TSpinbox")
+                ):
+                    return None
+                self._nav_scroll(direction)
+                return "break"
+            except (tk.TclError, AttributeError, TypeError, ValueError):
+                return None
+
+        for sequence, direction in (("<Shift-Right>", 1), ("<Shift-Left>", -1)):
+            callback = lambda event, d=direction: _shift_nav(event, d)
+            binding_id = self.root.bind_all(sequence, callback, add="+")
+            self._wheel_binding_ids.append((sequence, binding_id))
+            # Bind on the navigation widgets too, so the tab/button class bindings
+            # cannot swallow the shortcut before it reaches bind_all.
+            for widget in (nav, self._nav_canvas, self._nav_inner):
+                try:
+                    widget.bind(sequence, callback, add="+")
+                except (tk.TclError, AttributeError):
+                    pass
+            for widget in getattr(self, "nav_button_refs", {}).values():
+                try:
+                    widget.bind(sequence, callback, add="+")
+                    widget.master.bind(sequence, callback, add="+")
+                except (tk.TclError, AttributeError):
+                    pass
+
+        self.admin_home(content) if role == "admin" else (self.teacher_students(content) if role == "teacher" else self.student_home(content))
+        # Apply the same default button palette to the first page after login.
+        self._apply_button_palette(self.root)
+        # A floating bell is a direct child of the main window, not a navigation tab.
+        # It stays above the page workspace while users switch between modules.
+        self._create_floating_notification_bell()
+
+    def _notification_key(self, category, context=""):
+        """Stable, local-only identity for an alert, changing when its underlying issue changes."""
+        payload = f"{category}\x1f{context}".encode("utf-8", errors="replace")
+        return f"{category}:{hashlib.sha256(payload).hexdigest()[:20]}"
+
+    def _dismissed_notification_keys(self):
+        """Read individually dismissed alerts from this institution's local settings."""
+        try:
+            value = json.loads(self.settings.get("notification_dismissed", "[]"))
+            if isinstance(value, list):
+                return {str(item) for item in value if isinstance(item, str)}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        return set()
+
+    def _prune_notification_dismissals(self, active_keys):
+        """Forget dismissals only after the underlying alert is no longer active."""
+        dismissed = self._dismissed_notification_keys()
+        retained = sorted(dismissed.intersection(active_keys))
+        if set(retained) != dismissed:
+            self._save_setting("notification_dismissed", json.dumps(retained, ensure_ascii=False))
+
+    def _dismiss_notification(self, key, window):
+        """Dismiss one alert without affecting other alerts; the dismissal is saved locally."""
+        if not key:
+            return
+        dismissed = self._dismissed_notification_keys()
+        dismissed.add(str(key))
+        try:
+            self._save_setting("notification_dismissed", json.dumps(sorted(dismissed), ensure_ascii=False))
+        except (sqlite3.Error, tk.TclError) as exc:
+            messagebox.showerror("Could not dismiss notification", str(exc), parent=self.root)
+            return
+        self._refresh_notification_panel(window)
+
+    def _notification_items(self):
+        """Build role-aware notifications from local database records without changing data."""
+        items = []
+        role = str((self.user or {}).get("role", ""))
+        today = date.today()
+        today_s = today.isoformat()
+
+        # Only administrators are allowed to see fee balances or backup configuration.
+        if role == "admin":
+            try:
+                rows = self.db.conn.execute("""SELECT i.id, i.month, i.amount_due, i.currency,
+                        s.full_name,
+                        COALESCE(SUM(CASE WHEN lower(COALESCE(p.status,''))
+                            NOT IN ('unpaid','void','cancelled') THEN p.amount ELSE 0 END),0) AS paid
+                    FROM fee_invoices i
+                    JOIN students s ON s.id=i.student_id
+                    LEFT JOIN payments p ON p.student_id=i.student_id
+                        AND p.month=i.month AND p.currency=i.currency
+                    GROUP BY i.id, i.month, i.amount_due, i.currency, s.full_name
+                    ORDER BY i.month, s.full_name""").fetchall()
+                overdue = []
+                overdue_refs = []
+                by_currency = {}
+                for row in rows:
+                    due = float(row["amount_due"] or 0)
+                    paid = float(row["paid"] or 0)
+                    balance = max(0.0, due - paid)
+                    if balance > 0.000001 and self._invoice_status(row["month"], due, paid, today) == "Overdue":
+                        overdue.append(str(row["full_name"] or "Student"))
+                        overdue_refs.append((int(row["id"]), round(balance, 2)))
+                        cur = str(row["currency"] or "PKR")
+                        by_currency[cur] = by_currency.get(cur, 0.0) + balance
+                if overdue:
+                    currency_text = "  •  ".join(f"{cur} {amount:,.0f}" for cur, amount in sorted(by_currency.items()))
+                    names = ", ".join(overdue[:3])
+                    if len(overdue) > 3:
+                        names += f" and {len(overdue) - 3} more"
+                    items.append({
+                        "title": f"Overdue fee invoices / واجب الادا فیس ({len(overdue)})",
+                        "detail": f"Previous-month fee balances remain unpaid. {currency_text}. Students: {names}.",
+                        "severity": "danger", "action": "Fees",
+                        "dismiss_key": self._notification_key("overdue_fee", repr(sorted(overdue_refs)))
+                    })
+            except (sqlite3.Error, TypeError, ValueError, KeyError):
+                pass
+
+        # The same schedule source is used by the timetable. Teachers see only their
+        # assigned students; students see only their own classes.
+        try:
+            classes = self._classes_for_date(today)
+        except Exception:
+            classes = []
+        if role == "teacher":
+            tid = (self.user or {}).get("teacher_id")
+            if not tid:
+                classes = []
+            else:
+                try:
+                    assigned = {int(r[0]) for r in self.db.conn.execute(
+                        "SELECT student_id FROM teacher_students WHERE teacher_id=?", (tid,)).fetchall()}
+                    classes = [c for c in classes if int(c.get("student_id") or 0) in assigned]
+                except (sqlite3.Error, TypeError, ValueError):
+                    classes = []
+        elif role == "student":
+            sid = (self.user or {}).get("student_id")
+            classes = [c for c in classes if sid and int(c.get("student_id") or 0) == int(sid)]
+        elif role != "admin":
+            classes = []
+
+        if role in ("admin", "teacher") and classes:
+            try:
+                pending = [c for c in classes if self._class_attendance_status(c) == "Not marked"]
+            except Exception:
+                pending = []
+            if pending:
+                examples = "; ".join(
+                    f"{c.get('start') or 'Time not set'} — {c.get('student') or 'Student'}"
+                    for c in pending[:3]
+                )
+                if len(pending) > 3:
+                    examples += f"; and {len(pending) - 3} more"
+                items.append({
+                    "title": f"Today's attendance not marked / حاضری باقی ({len(pending)})",
+                    "detail": f"Mark or review today's scheduled classes. {examples}.",
+                    "severity": "warning", "action": "Attendance",
+                    "dismiss_key": self._notification_key(
+                        "attendance_pending", today_s + "|" + "|".join(sorted(
+                            f"{c.get('student_id', '')}:{c.get('start', '')}:{c.get('student', '')}" for c in pending)))
+                })
+            elif role == "teacher":
+                items.append({
+                    "title": f"Today's classes / آج کی کلاسیں ({len(classes)})",
+                    "detail": "Your assigned classes are on today's timetable. Attendance appears complete for these listed classes.",
+                    "severity": "info", "action": "Attendance",
+                    "dismiss_key": self._notification_key(
+                        "teacher_classes_today", today_s + "|" + "|".join(sorted(
+                            f"{c.get('student_id', '')}:{c.get('start', '')}:{c.get('student', '')}" for c in classes)))
+                })
+        elif role == "student" and classes:
+            examples = "; ".join(
+                f"{c.get('start') or 'Time not set'} — {c.get('course') or 'Quran class'}"
+                for c in classes[:3]
+            )
+            if len(classes) > 3:
+                examples += f"; and {len(classes) - 3} more"
+            items.append({
+                "title": f"Your classes today / آج کی کلاسیں ({len(classes)})",
+                "detail": examples + ".",
+                "severity": "info", "action": "My Learning",
+                "dismiss_key": self._notification_key(
+                    "student_classes_today", today_s + "|" + "|".join(sorted(
+                        f"{c.get('student_id', '')}:{c.get('start', '')}:{c.get('course', '')}" for c in classes)))
+            })
+
+        if role == "admin":
+            backup_folder = str(self.settings.get("backup_second_folder", "") or "").strip()
+            if not backup_folder:
+                items.append({
+                    "title": "Second backup location not set / دوسری جگہ بیک اپ مقرر نہیں",
+                    "detail": "Choose a USB drive or another drive in Settings so a separate verified backup can be made.",
+                    "severity": "warning", "action": "Settings",
+                    "dismiss_key": self._notification_key("backup_location_missing")
+                })
+            elif not os.path.isdir(backup_folder):
+                items.append({
+                    "title": "Backup drive unavailable / بیک اپ ڈرائیو دستیاب نہیں",
+                    "detail": "The configured backup folder cannot be reached. Connect the drive or select another folder in Settings.",
+                    "severity": "danger", "action": "Settings",
+                    "dismiss_key": self._notification_key("backup_location_unavailable", os.path.normcase(os.path.abspath(backup_folder)))
+                })
+
+        return items
+
+    def _load_notification_icon_frames(self):
+        """Load the user's bundled ringing-bell animation without network access."""
+        cached = getattr(self, "_notification_icon_frames", None)
+        if cached:
+            return cached
+        frames = []
+        try:
+            raw = base64.b64decode(_NOTIFICATION_ANIMATION_GIF_BASE64.encode("ascii"))
+            # Pillow is optional in this app. Prefer it when available for reliable RGBA frames.
+            if Image is not None and ImageTk is not None:
+                try:
+                    from PIL import ImageSequence
+                    source = Image.open(io.BytesIO(raw))
+                    for frame in ImageSequence.Iterator(source):
+                        rgba = frame.convert("RGBA")
+                        if rgba.size != (48, 48):
+                            resampling = getattr(Image, "Resampling", Image)
+                            rgba = rgba.resize((48, 48), getattr(resampling, "LANCZOS", Image.LANCZOS))
+                        frames.append(ImageTk.PhotoImage(rgba, master=self.root))
+                except Exception:
+                    frames = []
+            # Tk's built-in GIF reader is a fallback when Pillow isn't installed.
+            if not frames:
+                encoded = _NOTIFICATION_ANIMATION_GIF_BASE64
+                for index in range(_NOTIFICATION_GIF_FRAME_COUNT):
+                    frames.append(tk.PhotoImage(
+                        master=self.root, data=encoded, format=f"gif -index {index}"
+                    ))
+        except Exception:
+            frames = []
+        self._notification_icon_frames = frames
+        return frames
+
+    def _create_floating_notification_bell(self):
+        """Create the user's animated bell on a transparent, floating Windows overlay."""
+        if not self.user:
+            return
+        previous_animation = getattr(self, "_notification_animation_after_id", None)
+        if previous_animation:
+            try:
+                self.root.after_cancel(previous_animation)
+            except tk.TclError:
+                pass
+            self._notification_animation_after_id = None
+
+        # Remove an older instance and its root-position binding if the user logs out/in.
+        old_binding = getattr(self, "_notification_overlay_binding", None)
+        if old_binding:
+            try:
+                self.root.unbind("<Configure>", old_binding)
+            except (tk.TclError, AttributeError):
+                pass
+            self._notification_overlay_binding = None
+        old_map_binding = getattr(self, "_notification_overlay_map_binding", None)
+        if old_map_binding:
+            try:
+                self.root.unbind("<Map>", old_map_binding)
+            except (tk.TclError, AttributeError):
+                pass
+            self._notification_overlay_map_binding = None
+        old_window = getattr(self, "notification_bell_window", None)
+        if old_window is not None:
+            try:
+                old_window.destroy()
+            except tk.TclError:
+                pass
+            self.notification_bell_window = None
+        old = getattr(self, "notification_bell", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except tk.TclError:
+                pass
+
+        icon_frames = self._load_notification_icon_frames()
+        # Tk child widgets cannot have an alpha channel. On Windows, a color-keyed
+        # borderless Toplevel makes this exact background color transparent, so the
+        # animation sits directly over the page instead of on a green or square tile.
+        transparent_key = "#FF00FE"  # unlikely to occur in the yellow bell animation
+        overlay = None
+        use_transparent_overlay = False
+        if sys.platform == "win32":
+            try:
+                overlay = tk.Toplevel(self.root)
+                overlay.withdraw()
+                overlay.overrideredirect(True)
+                overlay.configure(bg=transparent_key)
+                overlay.wm_attributes("-transparentcolor", transparent_key)
+                overlay.transient(self.root)
+                use_transparent_overlay = True
+            except (tk.TclError, RuntimeError):
+                if overlay is not None:
+                    try:
+                        overlay.destroy()
+                    except tk.TclError:
+                        pass
+                overlay = None
+
+        if use_transparent_overlay and overlay is not None:
+            canvas_parent = overlay
+            canvas_bg = transparent_key
+        else:
+            # Non-Windows fallback: still remove the green disc and preserve the
+            # transparent pixels in the icon; Tk cannot make child-window pixels alpha.
+            canvas_parent = self.root
+            canvas_bg = APP_BG
+
+        bell = tk.Canvas(canvas_parent, width=62, height=62, bg=canvas_bg,
+                         highlightthickness=0, bd=0, cursor="hand2")
+        self.notification_bell = bell
+        self.notification_bell_window = overlay
+        if overlay is not None:
+            bell.pack(fill="both", expand=True)
+
+            def place_overlay(_event=None):
+                try:
+                    if not self.root.winfo_exists() or not overlay.winfo_exists():
+                        return
+                    if self.root.state() == "iconic" or not self.root.winfo_viewable():
+                        overlay.withdraw()
+                        return
+                    x = self.root.winfo_rootx() + self.root.winfo_width() - 84
+                    y = self.root.winfo_rooty() + self.root.winfo_height() - 86
+                    overlay.geometry(f"62x62+{x}+{y}")
+                    if not overlay.winfo_viewable():
+                        overlay.deiconify()
+                    overlay.lift()
+                except tk.TclError:
+                    pass
+
+            self._notification_overlay_positioner = place_overlay
+            position_state = {"after": None}
+            def schedule_overlay_position(_event=None):
+                pending = position_state.get("after")
+                if pending is not None:
+                    try:
+                        self.root.after_cancel(pending)
+                    except tk.TclError:
+                        pass
+                try:
+                    position_state["after"] = self.root.after(35, place_overlay)
+                except tk.TclError:
+                    position_state["after"] = None
+            self._notification_overlay_binding = self.root.bind("<Configure>", schedule_overlay_position, add="+")
+            self._notification_overlay_map_binding = self.root.bind("<Map>", schedule_overlay_position, add="+")
+            self.root.after_idle(place_overlay)
+        else:
+            bell.place(relx=1.0, rely=1.0, x=-22, y=-24, anchor="se")
+
+        def draw_bell(count=0):
+            """Draw only the animated bell and its count badge; keep the icon background transparent."""
+            try:
+                bell.delete("all")
+                if icon_frames:
+                    frame_index = getattr(self, "_notification_animation_index", 0) % len(icon_frames)
+                    bell.create_image(31, 29, image=icon_frames[frame_index],
+                                      anchor="center", tags="notification_icon")
+                else:
+                    # Minimal fallback icon if the local GIF cannot be decoded.
+                    points = [31, 13, 26, 15, 22, 20, 20, 26, 20, 33, 17, 37, 15, 40,
+                              15, 42, 47, 42, 47, 40, 45, 37, 42, 33, 42, 26, 40, 20, 36, 15]
+                    shadow = [v + 1 for v in points]
+                    bell.create_polygon(shadow, smooth=True, splinesteps=18,
+                                        fill="#9A6B00", outline="#9A6B00")
+                    bell.create_polygon(points, smooth=True, splinesteps=18,
+                                        fill="#FFC400", outline="#D49A00", width=1.2)
+                    bell.create_oval(27, 40, 35, 47, fill="#D9A42D", outline="#8E6721", width=1)
+
+                if count > 0:
+                    label = str(count) if count < 100 else "99+"
+                    # The red badge gets a tiny shadow; no background is drawn behind the icon.
+                    bell.create_oval(39, 3, 62, 26, fill="#7E1717", outline="", tags="notification_badge")
+                    bell.create_oval(37, 0, 60, 23, fill="#B91C1C", outline="#FDECEC", width=1.5,
+                                     tags="notification_badge")
+                    bell.create_arc(39, 2, 58, 20, start=35, extent=110, style="arc",
+                                    outline="#FFAAAA", width=1.4, tags="notification_badge")
+                    bell.create_text(48.5, 11.3, text=label, fill=WHITE,
+                                     font=(UI_FONT, 7 if len(label) > 2 else 8, "bold"),
+                                     tags="notification_badge")
+            except tk.TclError:
+                pass
+
+        self._draw_notification_bell = draw_bell
+        bell.bind("<Button-1>", lambda _event: self.toggle_notifications())
+        bell.bind("<Enter>", lambda _event: bell.configure(cursor="hand2"))
+        self.refresh_notification_bell()
+
+        # Play the supplied transparent GIF frames on a lightweight Tk timer.
+        if icon_frames:
+            self._notification_animation_index = getattr(self, "_notification_animation_index", 0) % len(icon_frames)
+            def animate_notification_icon():
+                try:
+                    if not bell.winfo_exists():
+                        self._notification_animation_after_id = None
+                        return
+                    # Do not spend CPU animating a hidden/minimized window. Poll slowly until visible again.
+                    visible = self.root.state() != "iconic" and bool(self.root.winfo_viewable())
+                    if overlay is not None:
+                        visible = visible and bool(overlay.winfo_viewable())
+                    if not visible:
+                        self._notification_animation_after_id = self.root.after(800, animate_notification_icon)
+                        return
+                    self._notification_animation_index = (self._notification_animation_index + 1) % len(icon_frames)
+                    current = icon_frames[self._notification_animation_index]
+                    if bell.find_withtag("notification_icon"):
+                        bell.itemconfigure("notification_icon", image=current)
+                    self._notification_animation_after_id = self.root.after(100, animate_notification_icon)
+                except tk.TclError:
+                    self._notification_animation_after_id = None
+            self._notification_animation_after_id = self.root.after(100, animate_notification_icon)
+
+        # Recalculate live alerts every minute, without rescanning UI fonts or the whole page.
+        old_after = getattr(self, "_notification_refresh_after_id", None)
+        if old_after:
+            try:
+                self.root.after_cancel(old_after)
+            except tk.TclError:
+                pass
+        self._notification_refresh_after_id = self.root.after(60000, self._schedule_notification_refresh)
+
+    def _schedule_notification_refresh(self):
+        try:
+            if not self.root.winfo_exists() or not getattr(self, "notification_bell", None):
+                return
+            self.refresh_notification_bell()
+            self._notification_refresh_after_id = self.root.after(60000, self._schedule_notification_refresh)
+        except tk.TclError:
+            return
+
+    def refresh_notification_bell(self):
+        try:
+            all_items = self._notification_items()
+            active_keys = {str(item.get("dismiss_key")) for item in all_items if item.get("dismiss_key")}
+            self._prune_notification_dismissals(active_keys)
+            dismissed = self._dismissed_notification_keys()
+            items = [item for item in all_items if str(item.get("dismiss_key", "")) not in dismissed]
+            self._active_notification_count = len(items)
+            draw = getattr(self, "_draw_notification_bell", None)
+            if draw:
+                draw(self._active_notification_count)
+            return items
+        except Exception:
+            self._active_notification_count = 0
+            draw = getattr(self, "_draw_notification_bell", None)
+            if draw:
+                draw(0)
+            return []
+
+    def toggle_notifications(self):
+        current = getattr(self, "notification_window", None)
+        if current is not None:
+            try:
+                if current.winfo_exists():
+                    current.destroy()
+                    self.notification_window = None
+                    return
+            except tk.TclError:
+                pass
+        self.open_notifications()
+
+    def _notification_group(self, item):
+        """Map a school alert to the visual filter group used by the notification center."""
+        action = str(item.get("action", "")).casefold()
+        title = str(item.get("title", "")).casefold()
+        detail = str(item.get("detail", "")).casefold()
+        if action == "fees" or "fee" in title or "فیس" in title or "payment" in title:
+            return "Fees"
+        if action in ("attendance", "timetable", "my learning") or any(
+            token in title for token in ("attendance", "class", "حاضری", "کلاس")
+        ):
+            return "Classes"
+        if action in ("settings", "reports / export") or any(
+            token in title + " " + detail for token in ("backup", "restore", "system", "بیک اپ")
+        ):
+            return "System"
+        return "System"
+
+    def _notification_visual(self, item):
+        """Return a consistent icon, foreground and pale background for an alert card."""
+        group = self._notification_group(item)
+        severity = str(item.get("severity", "info"))
+        if group == "Fees":
+            return "₹", "#B42318", "#FDECEB", "FEES"
+        if group == "Classes":
+            if severity == "warning":
+                return "✓", "#9A6700", "#FFF4D6", "CLASS"
+            return "✓", "#087E63", "#E2F5EE", "CLASS"
+        if severity == "danger":
+            return "!", "#B42318", "#FDECEB", "IMPORTANT"
+        if severity == "warning":
+            return "!", "#9A6700", "#FFF4D6", "ACTION"
+        return "i", "#3159A8", "#EAF0FF", "UPDATE"
+
+    def open_notifications(self, query="", category="All"):
+        """Open a polished notification center, inspired by the supplied modern notification UI."""
+        items = self.refresh_notification_bell()
+        old = getattr(self, "notification_window", None)
+        if old is not None:
+            try:
+                if old.winfo_exists():
+                    old.destroy()
+            except tk.TclError:
+                pass
+
+        win = tk.Toplevel(self.root)
+        self.notification_window = win
+        win.title("Notifications / نوٹیفیکیشنز")
+        win.transient(self.root)
+        win.configure(bg="#DCE8E2")
+        # A frameless drawer feels like an in-app notification center rather than a separate dialog.
+        try:
+            win.overrideredirect(True)
+        except tk.TclError:
+            pass
+        width, height = 468, 620
+        try:
+            self.root.update_idletasks()
+            x = self.root.winfo_rootx() + self.root.winfo_width() - width - 14
+            y = self.root.winfo_rooty() + self.root.winfo_height() - height - 88
+            x = max(8, min(x, win.winfo_screenwidth() - width - 8))
+            y = max(8, min(y, win.winfo_screenheight() - height - 8))
+            win.geometry(f"{width}x{height}+{x}+{y}")
+        except tk.TclError:
+            win.geometry(f"{width}x{height}")
+        win.minsize(420, 500)
+        win._taha_notif_query = str(query or "")
+        win._taha_notif_filter = str(category or "All")
+
+        def close_panel(_event=None):
+            try:
+                if win.winfo_exists():
+                    win.destroy()
+            except tk.TclError:
+                pass
+            if getattr(self, "notification_window", None) is win:
+                self.notification_window = None
+
+        win.protocol("WM_DELETE_WINDOW", close_panel)
+        win.bind("<Escape>", close_panel)
+
+        outer = tk.Frame(win, bg="#DCE8E2", padx=1, pady=1)
+        outer.pack(fill="both", expand=True)
+        panel = tk.Frame(outer, bg=CARD_BG)
+        panel.pack(fill="both", expand=True)
+
+        # Header: clean title, live count, and a clear close control.
+        header = tk.Frame(panel, bg=CARD_BG, padx=19, pady=15)
+        header.pack(fill="x")
+        header_row = tk.Frame(header, bg=CARD_BG)
+        header_row.pack(fill="x")
+        icon_wrap = tk.Frame(header_row, bg="#EAF4F0", width=42, height=42)
+        icon_wrap.pack(side="left", padx=(0, 11))
+        icon_wrap.pack_propagate(False)
+        tk.Label(icon_wrap, text="🔔", bg="#EAF4F0", fg=GREEN,
+                 font=("Segoe UI Emoji", 20, "bold")).pack(expand=True)
+        title_box = tk.Frame(header_row, bg=CARD_BG)
+        title_box.pack(side="left", fill="x", expand=True)
+        smart_label(tk.Label, title_box, text="Notifications / نوٹیفیکیشنز", bg=CARD_BG,
+                    fg="#173D32", font=(UI_FONT, 13, "bold")).pack(anchor="w")
+        count_text = tk.Label(title_box, text="", bg=CARD_BG, fg=MUTED,
+                              font=(UI_FONT, 9))
+        count_text.pack(anchor="w", pady=(3, 0))
+        close_btn = tk.Button(header_row, text="×", command=close_panel, width=3,
+                              bg=CARD_BG, fg="#66756D", activebackground="#F3F7F4",
+                              activeforeground=DARK, relief="flat", bd=0,
+                              font=(UI_FONT, 19), cursor="hand2")
+        close_btn.pack(side="right", anchor="n", padx=(0, 0))
+        tk.Frame(panel, bg="#DCE8E2", height=1).pack(fill="x")
+
+        # Search field styled as a soft inset control.
+        search_area = tk.Frame(panel, bg=CARD_BG, padx=18, pady=12)
+        search_area.pack(fill="x")
+        search_shell = tk.Frame(search_area, bg="#F3F6F8",
+                                highlightbackground="#E2E8EC", highlightthickness=1)
+        search_shell.pack(fill="x")
+        tk.Label(search_shell, text="⌕", bg="#F3F6F8", fg="#66756D",
+                 font=("Segoe UI Symbol", 19)).pack(side="left", padx=(11, 7))
+        search_var = tk.StringVar(value=str(query or ""))
+        search_entry = tk.Entry(search_shell, textvariable=search_var, relief="flat", bd=0,
+                                bg="#F3F6F8", fg="#173D32", insertbackground=GREEN,
+                                font=(UI_FONT, 10))
+        search_entry.pack(side="left", fill="x", expand=True, ipady=10, padx=(0, 10))
+        if not str(query or ""):
+            search_entry.insert(0, "Search alerts...")
+            search_entry.configure(fg="#819087")
+        def search_focus_in(_event=None):
+            if search_entry.get() == "Search alerts...":
+                search_entry.delete(0, "end")
+                search_entry.configure(fg="#173D32")
+        def search_focus_out(_event=None):
+            if not search_entry.get().strip():
+                search_entry.insert(0, "Search alerts...")
+                search_entry.configure(fg="#819087")
+        search_entry.bind("<FocusIn>", search_focus_in)
+        search_entry.bind("<FocusOut>", search_focus_out)
+
+        # Category chips make fees, classes and system alerts easy to scan.
+        filters = tk.Frame(panel, bg=CARD_BG, padx=18, pady=0)
+        filters.pack(fill="x", pady=(0, 12))
+        list_holder = tk.Frame(panel, bg="#EAF4F0")
+        list_holder.pack(fill="both", expand=True)
+        chip_buttons = {}
+        category_var = {"value": str(category or "All")}
+        counts = {name: 0 for name in ("All", "Fees", "Classes", "System")}
+        for item in items:
+            group = self._notification_group(item)
+            counts["All"] += 1
+            counts[group] += 1
+
+        def select_filter(name):
+            category_var["value"] = name
+            win._taha_notif_filter = name
+            for filter_name, button in chip_buttons.items():
+                chosen = filter_name == name
+                button.configure(bg=GREEN if chosen else WHITE,
+                                 fg=WHITE if chosen else "#506159",
+                                 activebackground=GREEN if chosen else "#EAF4F0",
+                                 activeforeground=WHITE if chosen else DARK)
+            render_items()
+
+        for filter_name in ("All", "Fees", "Classes", "System"):
+            chosen = filter_name == category_var["value"]
+            chip = tk.Button(filters,
+                text=f"{filter_name}  {counts[filter_name]}",
+                command=lambda n=filter_name: select_filter(n),
+                bg=GREEN if chosen else WHITE,
+                fg=WHITE if chosen else "#506159",
+                activebackground=GREEN if chosen else "#EAF4F0",
+                activeforeground=WHITE, relief="flat", bd=0,
+                font=(UI_FONT, 9, "bold" if chosen else "normal"),
+                padx=10, pady=7, cursor="hand2")
+            chip.pack(side="left", padx=(0, 6))
+            chip_buttons[filter_name] = chip
+
+        body_shell = tk.Frame(list_holder, bg="#EAF4F0", padx=12, pady=10)
+        body_shell.pack(fill="both", expand=True)
+        scroll_canvas = tk.Canvas(body_shell, bg="#EAF4F0", highlightthickness=0, bd=0)
+        scroll = ttk.Scrollbar(body_shell, orient="vertical", command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=scroll.set)
+        scroll.pack(side="right", fill="y")
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(scroll_canvas, bg="#EAF4F0")
+        inner_window = scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda _e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")))
+        scroll_canvas.bind("<Configure>", lambda e: scroll_canvas.itemconfigure(inner_window, width=e.width))
+        def mousewheel(event):
+            try:
+                scroll_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except (tk.TclError, AttributeError, ZeroDivisionError):
+                pass
+        scroll_canvas.bind("<MouseWheel>", mousewheel)
+
+        def render_items(*_args):
+            for child in inner.winfo_children():
+                child.destroy()
+            term = search_var.get().strip()
+            if term == "Search alerts...":
+                term = ""
+            term = term.casefold()
+            selected_group = category_var["value"]
+            visible = []
+            for item in self.refresh_notification_bell():
+                group = self._notification_group(item)
+                haystack = (str(item.get("title", "")) + " " + str(item.get("detail", ""))).casefold()
+                if selected_group != "All" and group != selected_group:
+                    continue
+                if term and term not in haystack:
+                    continue
+                visible.append(item)
+            count_text.configure(text=f"{len(visible)} active alert(s)  •  Updates automatically")
+            win._taha_notif_query = term
+            if not visible:
+                empty = tk.Frame(inner, bg=CARD_BG, padx=20, pady=26,
+                                 highlightbackground="#E3EBE6", highlightthickness=1)
+                empty.pack(fill="x", pady=(5, 0))
+                empty_icon = tk.Label(empty, text="✓", bg="#E2F5EE", fg="#087E63",
+                                      width=3, height=1, font=(UI_FONT, 18, "bold"))
+                empty_icon.pack(pady=(1, 10))
+                title = "You're all caught up" if not term and selected_group == "All" else "No matching notifications"
+                smart_label(tk.Label, empty, text=title + " / فی الحال کوئی الرٹ نہیں",
+                            bg=CARD_BG, fg="#173D32", font=(UI_FONT, 11, "bold"),
+                            wraplength=340, justify="center").pack(fill="x")
+                smart_label(tk.Label, empty,
+                            text="Important fee, class and system alerts will appear here.",
+                            bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9), wraplength=340,
+                            justify="center").pack(fill="x", pady=(7, 0))
+                return
+
+            for item in visible:
+                glyph, accent, pale, chip_label = self._notification_visual(item)
+                card = tk.Frame(inner, bg=CARD_BG, highlightbackground="#E1E9E4", highlightthickness=1)
+                card.pack(fill="x", pady=(0, 9))
+                accent_line = tk.Frame(card, bg=accent, height=3)
+                accent_line.pack(fill="x")
+                content = tk.Frame(card, bg=CARD_BG, padx=11, pady=10)
+                content.pack(fill="x")
+                icon = tk.Frame(content, bg=pale, width=42, height=42)
+                icon.pack(side="left", anchor="n", padx=(0, 10))
+                icon.pack_propagate(False)
+                tk.Label(icon, text=glyph, bg=pale, fg=accent,
+                         font=("Segoe UI Symbol", 18, "bold")).pack(expand=True)
+                main = tk.Frame(content, bg=CARD_BG)
+                main.pack(side="left", fill="both", expand=True)
+                top_line = tk.Frame(main, bg=CARD_BG)
+                top_line.pack(fill="x")
+                title = str(item.get("title", "Notification"))
+                smart_label(tk.Label, top_line, text=title, bg=CARD_BG, fg="#173D32",
+                            font=(UI_FONT, 10, "bold"), wraplength=265,
+                            justify="left").pack(side="left", fill="x", expand=True, anchor="w")
+                dismiss_key = str(item.get("dismiss_key", ""))
+                tk.Button(top_line, text="×", width=2,
+                          command=lambda k=dismiss_key, w=win: self._dismiss_notification(k, w),
+                          bg=CARD_BG, fg="#78877F", activebackground="#FDECEB",
+                          activeforeground="#A61B1B", relief="flat", bd=0,
+                          font=(UI_FONT, 13, "bold"), cursor="hand2").pack(side="right", anchor="n", padx=(0, 0))
+                meta = tk.Frame(main, bg=CARD_BG)
+                meta.pack(fill="x", pady=(4, 5))
+                tk.Label(meta, text=chip_label, bg=pale, fg=accent,
+                         font=(UI_FONT, 7, "bold"), padx=6, pady=2).pack(side="left")
+                tk.Label(meta, text="ACTIVE", bg=CARD_BG, fg="#87958D",
+                         font=(UI_FONT, 7, "bold")).pack(side="left", padx=(7, 0))
+                smart_label(tk.Label, main, text=str(item.get("detail", "")), bg=CARD_BG,
+                            fg="#526159", font=(UI_FONT, 9), wraplength=320,
+                            justify="left").pack(anchor="w", fill="x", pady=(0, 8))
+                action = item.get("action")
+                target_label = next((name for name in self.nav_button_refs
+                                     if action and action.casefold() in name.casefold()), None)
+                if target_label:
+                    button_text = {
+                        "Fees": "View fee details  →  / فیس دیکھیں",
+                        "Attendance": "Open attendance  →  / حاضری کھولیں",
+                        "Settings": "Open settings  →  / سیٹنگز کھولیں",
+                        "My Learning": "View my classes  →  / کلاسیں دیکھیں",
+                    }.get(action, "View details  →")
+                    tk.Button(main, text=button_text,
+                              command=lambda lab=target_label, w=win: self._open_notification_target(lab, w),
+                              bg=CARD_BG, fg=GREEN, activebackground="#EAF4F0",
+                              activeforeground=GREEN, relief="flat", bd=0,
+                              font=(UI_FONT, 9, "bold"), cursor="hand2",
+                              anchor="w", padx=0, pady=2).pack(anchor="w")
+
+        search_var.trace_add("write", render_items)
+        render_items()
+
+        # Footer stays visible while the list scrolls.
+        tk.Frame(panel, bg="#DCE8E2", height=1).pack(fill="x")
+        footer = tk.Frame(panel, bg=CARD_BG, padx=16, pady=10)
+        footer.pack(fill="x")
+        tk.Label(footer, text="Saved locally  •  Refreshes every minute", bg=CARD_BG,
+                 fg="#819087", font=(UI_FONT, 8)).pack(side="left")
+        tk.Button(footer, text="↻ Refresh", command=lambda w=win: self._refresh_notification_panel(w),
+                  bg="#EAF4F0", fg=GREEN, activebackground="#DCE8E2",
+                  activeforeground=GREEN, relief="flat", bd=0,
+                  font=(UI_FONT, 9, "bold"), cursor="hand2", padx=12, pady=6).pack(side="right")
+        try:
+            win.lift()
+            win.focus_force()
+            search_entry.focus_set()
+        except tk.TclError:
+            pass
+
+    def _refresh_notification_panel(self, win):
+        query = ""
+        category = "All"
+        try:
+            query = str(getattr(win, "_taha_notif_query", "") or "")
+            category = str(getattr(win, "_taha_notif_filter", "All") or "All")
+            if win.winfo_exists():
+                win.destroy()
+        except tk.TclError:
+            pass
+        self.notification_window = None
+        self.open_notifications(query=query, category=category)
+
+    def _open_notification_target(self, label, win):
+        try:
+            if win.winfo_exists():
+                win.destroy()
+        except tk.TclError:
+            pass
+        self.notification_window = None
+        button = getattr(self, "nav_button_refs", {}).get(label)
+        if button is not None:
+            try:
+                button.invoke()
+            except tk.TclError:
+                pass
+
+    def _make_language_toggle(self, parent):
+        """A single compact, modern language toggle with no unnecessary animation."""
+        width, height = 122, 38
+        try:
+            parent_bg = parent.cget("background") or parent.cget("bg")
+        except (tk.TclError, AttributeError):
+            parent_bg = WHITE
+
+        canvas = tk.Canvas(
+            parent, width=width, height=height, highlightthickness=0,
+            bd=0, bg=parent_bg, cursor="hand2", takefocus=1
+        )
+
+        def rounded_rect(x1, y1, x2, y2, radius, fill, outline="", outline_width=1):
+            radius = max(1, min(radius, int((x2 - x1) / 2), int((y2 - y1) / 2)))
+            points = [
+                x1 + radius, y1, x2 - radius, y1, x2, y1,
+                x2, y1 + radius, x2, y2 - radius, x2, y2,
+                x2 - radius, y2, x1 + radius, y2, x1, y2,
+                x1, y2 - radius, x1, y1 + radius, x1, y1,
+            ]
+            return canvas.create_polygon(
+                points, smooth=True, splinesteps=18, fill=fill,
+                outline=outline, width=outline_width
+            )
+
+        is_urdu = APP_LANGUAGE == "ur"
+        left_center, right_center = 30, width - 30
+        active_center = right_center if is_urdu else left_center
+        inactive_center = left_center if is_urdu else right_center
+        radius = 22
+
+        # One continuous pill track, with only a restrained lower shadow.
+        rounded_rect(3, 4, width - 3, height - 1, 17, mix(GREEN, "#FFFFFF", 0.72), "")
+        rounded_rect(1, 1, width - 2, height - 5, 16, GREEN, shade(GREEN, 0.2), 1)
+
+        inactive_text = "EN" if is_urdu else "اردو"
+        inactive_font = (UI_FONT, 9, "bold") if inactive_text == "EN" else (URDU_FONT, 10, "bold")
+        canvas.create_text(
+            inactive_center, height / 2 - 1, text=inactive_text,
+            fill=on_color(GREEN, "#FFFFFF", "#000000"), font=inactive_font
+        )
+
+        # The selected language sits on one raised white thumb. No sliding animation.
+        rounded_rect(
+            active_center - radius + 1, 3,
+            active_center + radius + 1, height - 7,
+            14, shade(GREEN, 0.4), ""
+        )
+        rounded_rect(
+            active_center - radius, 2,
+            active_center + radius, height - 8,
+            13, "#FFFFFF", mix(GREEN, "#FFFFFF", 0.8), 1
+        )
+        active_text = "اردو" if is_urdu else "EN"
+        active_font = (URDU_FONT, 10, "bold") if is_urdu else (UI_FONT, 9, "bold")
+        canvas.create_text(
+            active_center, height / 2 - 2, text=active_text,
+            fill=(GREEN if contrast_ratio(GREEN, "#FFFFFF") >= 3 else "#000000"), font=active_font
+        )
+
+        def click(_event=None):
+            try:
+                if canvas.winfo_exists():
+                    self.toggle_language()
+            except tk.TclError:
+                pass
+            return "break"
+
+        canvas.bind("<Button-1>", click)
+        canvas.bind("<Return>", click)
+        canvas.bind("<space>", click)
+        canvas.bind("<Enter>", lambda _event: canvas.configure(highlightthickness=1, highlightbackground=mix(GREEN, "#FFFFFF", 0.6)))
+        canvas.bind("<Leave>", lambda _event: canvas.configure(highlightthickness=0))
+        return canvas
+
+    def toggle_language(self):
+        """Switch the entire active UI mode and persist it locally without touching school records."""
+        global APP_LANGUAGE
+        APP_LANGUAGE = "ur" if APP_LANGUAGE == "en" else "en"
+        self.language = APP_LANGUAGE
+        self._save_setting("language", APP_LANGUAGE)
+        self.root.title(self._brand_display_name())
+        self.style()
+        # Rebuild the UI in the selected language, then restore the previously open module.
+        if self.user:
+            previous_page = getattr(self, "active_nav_label", None)
+            self.dashboard()
+            if previous_page and previous_page in getattr(self, "nav_button_refs", {}):
+                initial = "🏠 Dashboard" if self.user.get("role") == "admin" else (
+                    "👨‍🎓 My Students" if self.user.get("role") == "teacher" else "📚 My Learning")
+                if previous_page != initial:
+                    self.root.after_idle(lambda lab=previous_page: self.nav_button_refs.get(lab).invoke()
+                                         if self.nav_button_refs.get(lab) is not None else None)
+        else:
+            self.login_screen()
+
+    def _build_nav_shell(self):
+        """Navigation tabs support a horizontal row or a vertical column, stored per database."""
+        orientation = str(getattr(self, "settings", {}).get("nav_orientation", "row") or "row").strip().lower()
+        if orientation not in ("row", "column"):
+            orientation = "row"
+        self._nav_orientation = orientation
+        shell = tk.Frame(self.root, bg=CARD_BG)
+        if orientation == "row":
+            shell.pack(fill="x")
+            toggle = self._make_language_toggle(shell)
+            toggle.pack(side="right", padx=8, pady=5)
+            self._language_toggle_button = toggle
+            tk.Frame(shell, bg=BORDER, height=1).pack(side="bottom", fill="x")
+            canvas = tk.Canvas(shell, bg=CARD_BG, highlightthickness=0, bd=0, height=56)
+            canvas.pack(side="left", fill="x", expand=True)
+            inner = tk.Frame(canvas, bg=CARD_BG)
+            canvas.create_window((0, 0), window=inner, anchor="nw")
+            def make_arrow(text, direction):
+                return tk.Button(shell, text=text, command=lambda: self._nav_scroll(direction), bg=GREEN, fg=WHITE,
+                                 activebackground=GREEN_HOVER, activeforeground=WHITE,
+                                 relief="flat", bd=0, cursor="hand2", takefocus=0, font=(UI_FONT, 16, "bold"), padx=10)
+            left, right = make_arrow("‹", -1), make_arrow("›", 1)
+            self._nav_canvas, self._nav_inner = canvas, inner
+            shown = {"on": False}
+            def refresh(_event=None):
+                try:
+                    canvas.configure(scrollregion=(0, 0, inner.winfo_reqwidth(), inner.winfo_reqheight()), height=inner.winfo_reqheight())
+                    first, last = canvas.xview()
+                    fits = first <= 0.0 and last >= 0.999
+                    if fits and shown["on"]:
+                        left.pack_forget(); right.pack_forget(); shown["on"] = False
+                    elif not fits and not shown["on"]:
+                        left.pack(side="left", fill="y", before=canvas); right.pack(side="right", fill="y", before=canvas); shown["on"] = True
+                    if shown["on"]:
+                        left.configure(state="disabled" if first <= 0.001 else "normal")
+                        right.configure(state="disabled" if last >= 0.999 else "normal")
+                except tk.TclError:
+                    pass
+            def nav_wheel(event):
+                try:
+                    delta = int(getattr(event, "delta", 0) or 0)
+                    if not delta: return "break"
+                    total = max(1, inner.winfo_reqwidth())
+                    amount = max(24, min(120, abs(delta)))
+                    canvas.xview_moveto(max(0.0, min(1.0, canvas.xview()[0] + (-1 if delta > 0 else 1) * amount / total)))
+                    refresh(); return "break"
+                except (tk.TclError, AttributeError, TypeError, ValueError): return "break"
+            for widget in (shell, canvas, inner):
+                widget.bind("<MouseWheel>", nav_wheel, add="+")
+                widget.bind("<Shift-MouseWheel>", nav_wheel, add="+")
+                widget.bind("<Shift-Button-4>", lambda _e: (self._nav_scroll(-1), "break")[1], add="+")
+                widget.bind("<Shift-Button-5>", lambda _e: (self._nav_scroll(1), "break")[1], add="+")
+            inner.bind("<Configure>", refresh)
+            canvas.bind("<Configure>", refresh)
+            self._nav_refresh = refresh
+            self._nav_wheel_handler = nav_wheel
+        else:
+            shell.configure(width=190)
+            shell.pack(side="left", fill="y")
+            shell.pack_propagate(False)
+            toggle = self._make_language_toggle(shell)
+            toggle.pack(side="top", fill="x", padx=7, pady=7)
+            self._language_toggle_button = toggle
+            tk.Frame(shell, bg=BORDER, width=1).pack(side="right", fill="y")
+            body = tk.Frame(shell, bg=CARD_BG)
+            body.pack(side="top", fill="both", expand=True)
+            canvas = tk.Canvas(body, bg=CARD_BG, highlightthickness=0, bd=0, width=184)
+            scroll = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+            inner = tk.Frame(canvas, bg=CARD_BG)
+            window_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+            self._nav_canvas, self._nav_inner = canvas, inner
+            def refresh(_event=None):
+                try:
+                    canvas.configure(scrollregion=canvas.bbox("all"))
+                    canvas.itemconfigure(window_id, width=max(1, canvas.winfo_width()))
+                except tk.TclError:
+                    pass
+            def nav_wheel(event):
+                try:
+                    delta = int(getattr(event, "delta", 0) or 0)
+                    units = (-1 if delta > 0 else 1) * max(1, abs(delta) // 120)
+                    if delta and units == 0: units = -1 if delta > 0 else 1
+                    if delta: canvas.yview_scroll(units, "units")
+                    return "break"
+                except (tk.TclError, AttributeError, TypeError, ValueError): return "break"
+            inner.bind("<Configure>", refresh)
+            canvas.bind("<Configure>", refresh)
+            for widget in (shell, body, canvas, inner):
+                widget.bind("<MouseWheel>", nav_wheel, add="+")
+            self._nav_refresh = refresh
+            self._nav_wheel_handler = nav_wheel
+        return inner
+
+    def _nav_scroll(self, direction):
+        try:
+            canvas = self._nav_canvas
+            if self._nav_orientation == "column":
+                canvas.yview_scroll(int(direction) * 3, "units")
+            else:
+                total = max(1, self._nav_inner.winfo_reqwidth())
+                view_width = max(1, canvas.winfo_width())
+                current = canvas.xview()[0]
+                target = current + direction * min(320, max(120, view_width * 0.45)) / total
+                canvas.xview_moveto(max(0.0, min(1.0, target)))
+            self._nav_refresh()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _nav_ensure_visible(self, label):
+        """Scroll the selected tab into view for horizontal and vertical navigation."""
+        try:
+            holder = self.nav_button_refs[label].master
+            canvas, inner = self._nav_canvas, self._nav_inner
+            canvas.update_idletasks()
+            if self._nav_orientation == "column":
+                total = max(1, inner.winfo_reqheight())
+                view_top = canvas.canvasy(0)
+                view_h = max(1, canvas.winfo_height())
+                top_edge = holder.winfo_y()
+                bottom_edge = top_edge + holder.winfo_height()
+                if top_edge < view_top:
+                    canvas.yview_moveto(max(0.0, (top_edge - 6) / total))
+                elif bottom_edge > view_top + view_h:
+                    canvas.yview_moveto(min(1.0, (bottom_edge - view_h + 6) / total))
+            else:
+                total = max(1, inner.winfo_reqwidth())
+                view_left = canvas.canvasx(0)
+                view_w = canvas.winfo_width()
+                left_edge = holder.winfo_x()
+                right_edge = left_edge + holder.winfo_width()
+                if left_edge < view_left:
+                    canvas.xview_moveto(max(0.0, (left_edge - 8) / total))
+                elif right_edge > view_left + view_w:
+                    canvas.xview_moveto(min(1.0, (right_edge - view_w + 8) / total))
+            self._nav_refresh()
+        except (tk.TclError, AttributeError, KeyError):
+            pass
+
+    def set_active_nav(self, label):
+        self.active_nav_label = label
+        underlines = getattr(self, "nav_underline_refs", {})
+        for name, button in getattr(self, "nav_button_refs", {}).items():
+            active = name == label
+            try:
+                button.configure(style=("NavActive.TButton" if active else "Nav.TButton"))
+            except tk.TclError:
+                pass
+            line = underlines.get(name)
+            if line is not None:
+                line.configure(bg=GOLD if active else GREEN)
+        self.root.after_idle(lambda lab=label: self._nav_ensure_visible(lab))
+
+    def _page_key_from_label(self, label=None):
+        raw = str(label or getattr(self, "active_nav_label", "") or "").casefold()
+        mapping = (
+            ("my students", "teacher_students"), ("dashboard", "dashboard"), ("students", "students"),
+            ("teachers", "teachers"), ("fees", "fees"), ("timetable", "timetable"),
+            ("attendance", "attendance"), ("progress", "progress"), ("accounts", "accounts"),
+            ("graphs", "graphs"), ("reports", "reports"), ("settings", "settings"),
+            ("my learning", "student_learning"), ("login", "login"),
+            ("first setup", "first_setup"), ("create admin", "first_setup"),
+        )
+        role = str((getattr(self, "user", None) or {}).get("role", "") or "").lower()
+        if role == "teacher" and "attendance" in raw:
+            return "teacher_attendance"
+        if role == "teacher" and "progress" in raw:
+            return "teacher_progress"
+        for token, key in mapping:
+            if token in raw:
+                return key
+        return getattr(self, "_active_page_key", "dashboard") or "dashboard"
+
+    def _page_wallpaper_map(self):
+        try:
+            value = json.loads(str(self.settings.get("page_backgrounds", "{}") or "{}"))
+            return value if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            return {}
+
+    def _refresh_active_header_wallpaper(self):
+        """Repaint the identity header with the wallpaper belonging to the active page."""
+        banner = getattr(self, "_active_header_canvas", None)
+        if banner is None:
+            return
+        try:
+            if not banner.winfo_exists():
+                return
+            width = max(1, banner.winfo_width())
+            height = max(1, int(getattr(self, "_active_header_full_height", banner.winfo_height())) - 3)
+            self._paint_shared_wallpaper(banner, width, height)
+        except (tk.TclError, TypeError, ValueError):
+            pass
+
+    def _refresh_page_button_styles(self, force=False):
+        """Re-apply the flat button styles only when a color token actually changed."""
+        try:
+            signature = (GREEN, GREEN_HOVER, CARD_BG, APP_BG, SEM_BLUE,
+                         str(self.settings.get("theme_mode", "light")))
+            if not force and signature == getattr(self, "_il_active_button_style_signature", None):
+                return
+            style = ttk.Style(self.root)
+            style_font = URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT
+            def fs(value):
+                return max(9, int(round(value * max(0.8, min(1.8, FONT_SCALE)))))
+            self._install_wallpaper_button_styles(style, style_font, fs)
+        except (tk.TclError, AttributeError, TypeError, ValueError):
+            pass
+
+    def navigate_page(self, parent, callback, label):
+        new_page_key = self._page_key_from_label(label)
+        old_page_key = getattr(self, "_active_page_key", None)
+        self._active_page_key = new_page_key
+        if old_page_key != new_page_key:
+            self._refresh_page_button_styles()
+            try:
+                self.root.after_idle(self._refresh_active_header_wallpaper)
+            except tk.TclError:
+                pass
+        wallpaper_canvas = getattr(parent, "_il_wallpaper_canvas", None)
+        if wallpaper_canvas is not None and wallpaper_canvas.winfo_exists():
+            wallpaper_canvas._il_path_override = None
+            wallpaper_canvas._il_transparency_override = None
+        self._animate_header_collapse(False)
+        canvas = getattr(self, "_main_page_canvas", None)
+        if canvas is not None:
+            try:
+                self._last_main_scroll_fraction = 0.0
+                self._header_collapse_target = False
+                canvas.yview_moveto(0)
+            except tk.TclError:
+                pass
+        self.show_page(parent, lambda _parent: callback())
+        self.set_active_nav(label)
+        self._active_page_parent = parent
+
+    def show_page(self, parent, callback):
+        if not getattr(self, "_active_page_key", None):
+            self._active_page_key = "dashboard"
+        self._header_nested_scrolled = False
+        self._header_nested_scroll_positions = {}
+        self._header_collapse_target = False
+        for child in parent.winfo_children():
+            child.destroy()
+        self._install_page_wallpaper(parent)
+        callback(parent)
+        self._apply_button_palette(parent)
+        try:
+            parent.after_idle(lambda target=parent: self._observe_scrollable_tree(target))
+        except tk.TclError:
+            pass
+
+    def _wallpaper_source_path(self, path_override=None, page_key=None):
+        """Resolve a page-specific image, falling back to the shared application wallpaper."""
+        if path_override is None:
+            preview = getattr(self, "_wallpaper_preview_path", None)
+            if preview is not None:
+                path_override = preview
+            else:
+                key = page_key or getattr(self, "_active_page_key", "dashboard")
+                entry = self._page_wallpaper_map().get(key, {})
+                if isinstance(entry, dict):
+                    candidate = str(entry.get("path", "") or "").strip()
+                    if candidate and os.path.isfile(candidate):
+                        return candidate
+                path_override = self.settings.get("background_image_path", "") or ""
+        candidate = str(path_override or "").strip()
+        if candidate and os.path.isfile(candidate):
+            return candidate
+        return DEFAULT_WALLPAPER_IMAGE if os.path.isfile(DEFAULT_WALLPAPER_IMAGE) else ""
+
+    def _wallpaper_transparency_for_page(self, page_key=None):
+        key = page_key or getattr(self, "_active_page_key", "dashboard")
+        entry = self._page_wallpaper_map().get(key, {})
+        try:
+            if isinstance(entry, dict) and entry.get("transparency") not in (None, ""):
+                return max(0, min(100, int(entry.get("transparency"))))
+        except (TypeError, ValueError):
+            pass
+        try:
+            return max(0, min(100, int(self.settings.get("background_transparency", "68"))))
+        except (TypeError, ValueError):
+            return 68
+
+    def _install_page_wallpaper(self, parent):
+        """Tile a cached viewport-sized wallpaper behind content without allocating a full-page bitmap."""
+        if Image is None or ImageTk is None:
+            return None
+        if str(self.settings.get("wallpaper_enabled", "0")) != "1":
+            # Plain solid background: smooth, flicker-free scrolling.
+            return None
+        try:
+            canvas = getattr(parent, '_il_wallpaper_canvas', None)
+            # A prior build could leave a partially initialized Canvas behind because
+            # Canvas.lower() is an item-tag method, not the widget stacking method.
+            if canvas is not None and canvas.winfo_exists() and not hasattr(canvas, '_il_wallpaper_state'):
+                canvas.destroy()
+                canvas = None
+            if canvas is None or not canvas.winfo_exists():
+                canvas = tk.Canvas(parent, bg=APP_BG, bd=0, highlightthickness=0,
+                                   takefocus=0, relief='flat')
+                canvas.place(x=0, y=0, relwidth=1, relheight=1)
+                # Lower the widget itself. tk.Canvas.lower() is overridden by tag_lower().
+                canvas.tk.call('lower', canvas._w)
+                canvas._il_wallpaper_state = {
+                    'path': None, 'transparency': None, 'tile_key': None,
+                    'photo': None, 'items': [], 'job': None,
+                }
+                parent._il_wallpaper_canvas = canvas
+                def schedule(_event=None):
+                    if getattr(self, '_header_animation_active', False):
+                        return
+                    state = canvas._il_wallpaper_state
+                    job = state.get('job')
+                    if job:
+                        try: canvas.after_cancel(job)
+                        except tk.TclError: pass
+                    try: state['job'] = canvas.after(120, redraw)
+                    except tk.TclError: state['job'] = None
+                def redraw():
+                    state = canvas._il_wallpaper_state
+                    state['job'] = None
+                    try:
+                        if getattr(self, '_header_animation_active', False):
+                            return
+                        width = max(1, canvas.winfo_width())
+                        height = max(1, canvas.winfo_height())
+                        if width < 40 or height < 40:
+                            return
+                        last_dim = state.get('last_dim')
+                        if last_dim and abs(last_dim[0] - width) < 6 and abs(last_dim[1] - height) < 6 and state.get('photo') is not None:
+                            return
+                        state['last_dim'] = (width, height)
+                        path = self._wallpaper_source_path(state.get('path'))
+                        raw = state.get('transparency')
+                        if raw is None:
+                            raw = self.settings.get('background_transparency', '68')
+                        try: transparency = max(0, min(100, int(raw)))
+                        except (TypeError, ValueError): transparency = 68
+                        tile_h = max(360, min(760, self.root.winfo_height() - 150))
+                        key = (path, transparency, width, tile_h, APP_BG)
+                        if state.get('tile_key') != key or state.get('photo') is None:
+                            # One resized wallpaper tile is shared by every page. Reopening a
+                            # module no longer decodes/resamples the 2 MB source image again.
+                            shared_tiles = getattr(self, '_il_workspace_wallpaper_cache', None)
+                            if shared_tiles is None:
+                                shared_tiles = self._il_workspace_wallpaper_cache = LRUCache(8)
+                            photo = shared_tiles.get(key)
+                            if photo is None:
+                                base_rgb = tuple(v // 257 for v in self.root.winfo_rgb(APP_BG))
+                                base = Image.new('RGB', (width, tile_h), base_rgb)
+                                if transparency < 100 and path and os.path.isfile(path):
+                                    from PIL import ImageOps
+                                    with Image.open(path) as opened:
+                                        source = opened.convert('RGB')
+                                    # BICUBIC is visually smooth while substantially cheaper than LANCZOS.
+                                    fitted = ImageOps.fit(source, (width, tile_h), method=Image.Resampling.BICUBIC,
+                                                          centering=(0.5, 0.42))
+                                    base = Image.blend(base, fitted,
+                                                       ((100 - transparency) / 100.0) * WALLPAPER_MAX_STRENGTH)
+                                photo = ImageTk.PhotoImage(base, master=self.root)
+                                shared_tiles.put(key, photo)
+                            state['photo'] = photo
+                            state['tile_key'] = key
+                            canvas._il_wallpaper_photo = photo
+                            canvas.delete('wallpaper-tile')
+                            state['items'] = []
+                        # Reuse one small PhotoImage at regular y positions; no huge full-content image.
+                        needed = (height + tile_h - 1) // tile_h
+                        while len(state['items']) > needed:
+                            item = state['items'].pop()
+                            canvas.delete(item)
+                        while len(state['items']) < needed:
+                            y = len(state['items']) * tile_h
+                            item = canvas.create_image(0, y, image=state['photo'], anchor='nw',
+                                                       tags=('wallpaper-tile',))
+                            state['items'].append(item)
+                        for index, item in enumerate(state['items']):
+                            canvas.coords(item, 0, index * tile_h)
+                        canvas.tag_lower('wallpaper-tile')
+                    except Exception:
+                        try:
+                            canvas.delete('wallpaper-tile')
+                            canvas.configure(bg=APP_BG)
+                        except tk.TclError: pass
+                canvas._il_wallpaper_redraw = redraw
+                parent.bind('<Configure>', schedule, add='+')
+            state = canvas._il_wallpaper_state
+            page_key = getattr(self, "_active_page_key", "dashboard")
+            state['page_key'] = page_key
+            path_override = getattr(canvas, '_il_path_override', None)
+            transparency_override = getattr(canvas, '_il_transparency_override', None)
+            state['path'] = path_override if path_override is not None else self._wallpaper_source_path(page_key=page_key)
+            state['transparency'] = transparency_override if transparency_override is not None else self._wallpaper_transparency_for_page(page_key)
+            state['tile_key'] = None if state.get('page_key') != page_key else state.get('tile_key')
+            canvas._il_wallpaper_redraw()
+            return canvas
+        except (tk.TclError, AttributeError):
+            return None
+
+    def _refresh_page_wallpaper(self, parent, path=None, transparency=None):
+        """Update the current wallpaper preview and redraw only a small reusable tile."""
+        canvas = getattr(parent, '_il_wallpaper_canvas', None)
+        if canvas is None or not canvas.winfo_exists():
+            self._install_page_wallpaper(parent)
+            canvas = getattr(parent, '_il_wallpaper_canvas', None)
+        if canvas is None:
+            return
+        canvas._il_path_override = path
+        canvas._il_transparency_override = transparency
+        try:
+            state = canvas._il_wallpaper_state
+            state['path'] = path
+            state['transparency'] = transparency
+            state['tile_key'] = None
+            canvas._il_wallpaper_redraw()
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _apply_button_palette(self, parent):
+        """Keep ordinary application buttons consistent without recoloring semantic status controls."""
+        if parent is None:
+            return
+        semantic_words = ("present", "absent", "leave", "delete", "remove", "reject", "clear", "overdue", "unpaid", "restore from backup")
+        def visit(widget):
+            try:
+                if isinstance(widget, tk.Button):
+                    self._apply_tk_button_texture(widget)
+                elif isinstance(widget, ttk.Button):
+                    self._apply_ttk_button_role(widget)
+                for child in widget.winfo_children():
+                    visit(child)
+            except (tk.TclError, AttributeError):
+                pass
+        visit(parent)
+
+    def page_title(self, parent, title, subtitle=""):
+        # A consistent white title card separates the page heading from the work area.
+        card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1,
+                        padx=18, pady=13)
+        card.pack(fill="x", pady=(0, 13))
+        tk.Frame(card, bg=GOLD, width=4).pack(side="left", fill="y", padx=(0, 14))
+        text_area = tk.Frame(card, bg=CARD_BG)
+        text_area.pack(side="left", fill="x", expand=True)
+        smart_label(tk.Label, text_area, text=title, bg=CARD_BG, fg=GREEN,
+                 font=(UI_FONT, 19, "bold"), anchor="w").pack(anchor="w")
+        if subtitle:
+            smart_label(tk.Label, text_area, text=subtitle, bg=CARD_BG, fg=MUTED,
+                     font=(UI_FONT, 10), anchor="w", wraplength=1150,
+                     justify="left").pack(anchor="w", pady=(4, 0))
+
+    def metric_card(self, parent, title, value, column):
+        card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1,
+                        padx=18, pady=16)
+        card.grid(row=0, column=column, sticky="nsew", padx=6, pady=6)
+        tk.Frame(card, bg=GOLD if column == 0 else GREEN, height=3).pack(fill="x", pady=(0, 12))
+        smart_label(tk.Label, card, text=title.upper(), bg=CARD_BG, fg=MUTED,
+                 font=(UI_FONT, 9, "bold")).pack(anchor="w")
+        smart_label(tk.Label, card, text=str(value), bg=CARD_BG, fg=GREEN,
+                 font=(UI_FONT, 25, "bold")).pack(anchor="w", pady=(5, 0))
+        parent.grid_columnconfigure(column, weight=1)
+
+    def _invoice_status(self, month, amount_due, amount_paid, as_of=None):
+        """Compute invoice status from balance and month; payments themselves keep Paid/Partial/Unpaid."""
+        due = float(amount_due or 0)
+        paid = float(amount_paid or 0)
+        balance = max(0.0, due - paid)
+        if balance <= 0.000001:
+            return "Paid"
+        try:
+            invoice_month = datetime.strptime(str(month or ""), "%Y-%m").date()
+        except (TypeError, ValueError):
+            # Malformed/legacy month values must not be classified as overdue by guesswork.
+            return "Partial" if paid > 0 else "Unpaid"
+        today = as_of or date.today()
+        if (invoice_month.year, invoice_month.month) < (today.year, today.month):
+            return "Overdue"
+        return "Partial" if paid > 0 else "Unpaid"
+
+    def _safe(self, fn, default):
+        try:
+            return fn()
+        except Exception:
+            return default
+
+    def _go(self, parent, builder, keyword):
+        """Open a page from the dashboard and highlight the matching tab."""
+        self._active_page_key = self._page_key_from_label(keyword)
+        self._refresh_page_button_styles()
+        self.show_page(parent, builder)
+        self._refresh_active_header_wallpaper()
+        for name in getattr(self, "nav_button_refs", {}):
+            if keyword.lower() in name.lower():
+                self.set_active_nav(name)
+                break
+
+    def _dash_data(self):
+        """Collect every number shown on the dashboard from the real database. Never raises."""
+        db = self.db
+        today = datetime.now().date()
+        month = today.strftime("%Y-%m")
+        ok = "lower(COALESCE(p.status,'')) NOT IN ('unpaid','void','cancelled')"
+        data = {"month": month}
+        data["students_total"] = self._safe(lambda: db.scalar("SELECT COUNT(*) FROM students") or 0, 0)
+        data["students_active"] = self._safe(lambda: db.scalar("SELECT COUNT(*) FROM students WHERE lower(trim(COALESCE(status,'Active')))='active'") or 0, 0)
+        data["teachers_total"] = self._safe(lambda: db.scalar("SELECT COUNT(*) FROM teachers") or 0, 0)
+        data["teachers_active"] = self._safe(lambda: db.scalar("SELECT COUNT(*) FROM teachers WHERE lower(trim(COALESCE(status,'Active')))='active'") or 0, 0)
+        def live(items):
+            return [c for c in items if str(c.get("status", "")).lower() not in ("cancelled", "canceled")]
+        def todays():
+            classes = live(self._classes_for_date(today))
+            for c in classes:
+                c["att"] = self._class_attendance_status(c)
+            return classes
+        data["classes"] = self._safe(todays, [])
+        data["tomorrow"] = self._safe(lambda: len(live(self._classes_for_date(today + timedelta(days=1)))), 0)
+        data["collected"] = self._safe(lambda: [(r["currency"], float(r["amt"] or 0)) for r in db.conn.execute(
+            f"SELECT p.currency, SUM(p.amount) AS amt FROM payments p WHERE p.month=? AND {ok} GROUP BY p.currency ORDER BY amt DESC", (month,))], [])
+        def outstanding():
+            rows = db.conn.execute(
+                f"SELECT i.id, i.month, i.amount_due, i.currency, COALESCE(SUM(CASE WHEN {ok} THEN p.amount ELSE 0 END),0) AS paid "
+                "FROM fee_invoices i LEFT JOIN payments p ON p.student_id=i.student_id AND p.month=i.month AND p.currency=i.currency GROUP BY i.id").fetchall()
+            by_cur, open_n, overdue_n = {}, 0, 0
+            for r in rows:
+                balance = max(0.0, float(r["amount_due"] or 0) - float(r["paid"] or 0))
+                if balance > 0.000001:
+                    by_cur[r["currency"]] = by_cur.get(r["currency"], 0.0) + balance
+                    open_n += 1
+                    if str(r["month"] or "") < month:
+                        overdue_n += 1
+            return {"by_cur": sorted(by_cur.items(), key=lambda kv: -kv[1]), "open": open_n, "overdue": overdue_n, "invoices": len(rows)}
+        data["out"] = self._safe(outstanding, {"by_cur": [], "open": 0, "overdue": 0, "invoices": 0})
+        data["absent_today"] = self._safe(lambda: db.scalar(
+            "SELECT COUNT(*) FROM attendance WHERE class_date=? AND lower(COALESCE(status,'')) LIKE 'absent%'",
+            (today.isoformat(),)) or 0, 0)
+        data["recent"] = self._safe(lambda: [dict(r) for r in db.conn.execute(
+            "SELECT p.payment_date, COALESCE(s.full_name,'—') AS student, p.month, p.amount, p.currency, p.status "
+            "FROM payments p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.payment_date DESC, p.id DESC LIMIT 5")], [])
+        return data
+
+    def _dash_card(self, parent, column, icon, tint, title, value, sub, sub_color=None):
+        card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=14, pady=12)
+        card.grid(row=0, column=column, sticky="nsew", padx=6, pady=6)
+        parent.grid_columnconfigure(column, weight=1, uniform="dashcards")
+        # Distinct top colored accent strip
+        top_strip = tk.Frame(card, bg=tint, height=4)
+        top_strip.pack(side="top", fill="x", pady=(0, 8))
+        inner_box = tk.Frame(card, bg=CARD_BG)
+        inner_box.pack(fill="both", expand=True)
+        mode = getattr(self, "theme_mode", "light")
+        tile_bg = self._mix_color(tint, "#FFFFFF", 0.88) if mode == "light" else self._mix_color(tint, "#000000", 0.60)
+        tile = tk.Frame(inner_box, bg=tile_bg, width=48, height=48, highlightbackground=tint, highlightthickness=1)
+        tile.pack(side="left", padx=(0, 12))
+        tile.pack_propagate(False)
+        tk.Label(tile, text=icon, bg=tile_bg, fg=tint, font=("Segoe UI Emoji", 17)).pack(expand=True)
+        body = tk.Frame(inner_box, bg=CARD_BG)
+        body.pack(side="left", fill="x", expand=True)
+        smart_label(tk.Label, body, text=title, bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9, "bold"), anchor="w",
+                    wraplength=180, justify="left").pack(anchor="w")
+        smart_label(tk.Label, body, text=str(value), bg=CARD_BG, fg=DARK, font=(UI_FONT, 20, "bold"), anchor="w").pack(anchor="w")
+        smart_label(tk.Label, body, text=sub, bg=CARD_BG, fg=sub_color or MUTED, font=(UI_FONT, 9), anchor="w",
+                    wraplength=180, justify="left").pack(anchor="w")
+        def on_enter(_e):
+            try: card.configure(highlightbackground=tint, highlightthickness=2)
+            except Exception: pass
+        def on_leave(_e):
+            try: card.configure(highlightbackground=BORDER, highlightthickness=1)
+            except Exception: pass
+        for w in (card, inner_box, body, tile):
+            w.bind("<Enter>", on_enter, add="+")
+            w.bind("<Leave>", on_leave, add="+")
+
+    def _dash_panel(self, parent, title, link_text=None, link_cmd=None):
+        panel = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=14, pady=12)
+        head = tk.Frame(panel, bg=CARD_BG)
+        head.pack(fill="x", pady=(0, 8))
+        smart_label(tk.Label, head, text=title, bg=CARD_BG, fg=DARK, font=(UI_FONT, 11, "bold"), anchor="w").pack(side="left")
+        if link_text and link_cmd:
+            link_btn = tk.Button(head, text=link_text, command=link_cmd, bg=SEM_BLUE, fg=on_color(SEM_BLUE),
+                                 activebackground=shade(SEM_BLUE, 0.12), activeforeground=on_color(SEM_BLUE),
+                                 relief="flat", bd=0, cursor="hand2", padx=12, pady=4,
+                                 font=(UI_FONT, 9, "bold"))
+            link_btn._il_role = "info"   # information / open / view = BLUE
+            link_btn.pack(side="right")
+        return panel
+
+    def _dash_canvas(self, panel, height, draw):
+        """A chart canvas that redraws itself to the panel width, debounced to avoid flicker."""
+        canvas = tk.Canvas(panel, bg=CARD_BG, height=height, highlightthickness=0, bd=0)
+        canvas.pack(fill="x")
+        state = {"last_width": 0, "job": None}
+        def _execute_draw():
+            state["job"] = None
+            try:
+                if not canvas.winfo_exists():
+                    return
+                width = canvas.winfo_width()
+                if width < 60:
+                    return
+                state["last_width"] = width
+                canvas.delete("all")
+                draw(canvas, width, height)
+            except tk.TclError:
+                pass
+        def on_configure(_event=None):
+            width = canvas.winfo_width()
+            if width < 60 or abs(width - state["last_width"]) < 4:
+                return
+            if state["job"]:
+                try:
+                    canvas.after_cancel(state["job"])
+                except tk.TclError:
+                    pass
+            state["job"] = canvas.after(70, _execute_draw)
+        canvas.bind("<Configure>", on_configure)
+        canvas.after_idle(_execute_draw)
+        return canvas, _execute_draw
+
+    def _draw_donut(self, canvas, cx, cy, radius, thickness, parts):
+        """parts = [(value, color)]. Draws a ring clockwise from the top."""
+        box = (cx - radius, cy - radius, cx + radius, cy + radius)
+        shown = [(v, c) for v, c in parts if v > 0]
+        total = sum(v for v, _c in shown)
+        if total <= 0:
+            canvas.create_oval(*box, outline=BORDER, width=thickness)
+            return
+        if len(shown) == 1:
+            canvas.create_oval(*box, outline=shown[0][1], width=thickness)
+            return
+        angle = 90.0
+        for value, color in shown:
+            extent = 360.0 * value / total
+            canvas.create_arc(*box, start=angle, extent=-extent, style="arc", outline=color, width=thickness)
+            angle -= extent
+
+    def admin_home(self, parent):
+        data = self._dash_data()
+        now = datetime.now()
+        # --- Prominent Hero Banner with Live Branding & Logo ---
+        hero = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=16, pady=12)
+        hero.pack(fill="x", pady=(0, 8))
+        configured_logo = self.logo_path if self.logo_path and os.path.isfile(self.logo_path) else None
+        logo_photo = None
+        if configured_logo and Image is not None and ImageTk is not None:
+            try:
+                logo_photo = self._circular_logo_photo(configured_logo, 64, GREEN, 2)
+            except Exception:
+                logo_photo = None
+        if logo_photo is not None:
+            self._dash_hero_logo_ref = logo_photo
+            tk.Label(hero, image=logo_photo, bg=CARD_BG).pack(side="left", padx=(0, 14))
+        else:
+            logo_frame = tk.Frame(hero, bg=PALE, width=64, height=64, highlightbackground=BORDER, highlightthickness=1)
+            logo_frame.pack(side="left", padx=(0, 14))
+            logo_frame.pack_propagate(False)
+            tk.Label(logo_frame, text="📖", font=("Segoe UI Emoji", 24), bg=PALE, fg=GREEN).pack(expand=True)
+        hero_info = tk.Frame(hero, bg=CARD_BG)
+        hero_info.pack(side="left", fill="both", expand=True)
+        smart_label(tk.Label, hero_info, text=f"{self.brand_name} • {self.brand_name_ur}",
+                    bg=CARD_BG, fg=DARK, font=(UI_FONT, 14, "bold"), anchor="w").pack(anchor="w")
+        slogan_text = self._brand_slogan()
+        if slogan_text:
+            smart_label(tk.Label, hero_info, text=slogan_text, bg=CARD_BG, fg=MUTED,
+                        font=(UI_FONT, 9, "italic"), anchor="w").pack(anchor="w", pady=(1, 2))
+        smart_label(tk.Label, hero_info, text=f"📅 {now.strftime('%A, %d %B %Y')}  •  Dashboard Overview",
+                    bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9), anchor="w").pack(anchor="w")
+        hero_actions = ttk.Frame(hero)
+        hero_actions.pack(side="right", padx=(8, 0))
+        refresh_btn = ttk.Button(hero_actions, text="↻ Refresh / تازہ کریں",
+                                 command=lambda: self._go(parent, lambda p: self.admin_home(p), "Dashboard"))
+        refresh_btn._il_role = "info"      # refresh = BLUE in every language
+        refresh_btn.pack(side="top", pady=2)
+        cert_btn = ttk.Button(hero_actions, text="📜 Certificates / اسناد",
+                              command=lambda: self.certificate_generator_dialog())
+        cert_btn._il_role = "export"       # certificates = ORANGE in every language
+        cert_btn.pack(side="top", pady=2)
+
+        # --- Summary cards -------------------------------------------------
+        cards = tk.Frame(parent, bg=APP_BG)
+        cards.pack(fill="x", pady=(0, 4))
+        classes = data["classes"]
+        unmarked = sum(1 for c in classes if c.get("att") == "Not marked")
+        collected = data["collected"]
+        out = data["out"]
+        def money(rows, empty):
+            if not rows:
+                return empty, ""
+            return f"{rows[0][0]} {rows[0][1]:,.0f}", "  •  ".join(f"{c} {a:,.0f}" for c, a in rows[1:])
+        coll_value, coll_rest = money(collected, "0")
+        out_value, out_rest = money(out["by_cur"], "0" if out["invoices"] else "—")
+        self._dash_card(cards, 0, "🎓", "#2563EB", "Total Students / کل طلبہ", data["students_total"], f"Active: {data['students_active']}")
+        self._dash_card(cards, 1, "👩‍🏫", "#0D9488", "Active Teachers / اساتذہ", data["teachers_active"], f"Total: {data['teachers_total']}")
+        self._dash_card(cards, 2, "📅", "#D97706", "Today’s Classes / آج کی کلاسیں", len(classes),
+                        f"Attendance not marked: {unmarked}", "#B45309" if unmarked else None)
+        self._dash_card(cards, 3, "💰", "#16A34A", "Monthly Collection / ماہانہ وصولی", coll_value,
+                        coll_rest or f"Per currency • {data['month']}")
+        out_sub = (f"Open {out['open']} • Overdue {out['overdue']}" if out["invoices"] else "No fee invoices yet")
+        if out_rest:
+            out_sub = out_rest + "\n" + out_sub
+        self._dash_card(cards, 4, "⚠", "#DC2626", "Outstanding Fees / واجب الادا", out_value, out_sub,
+                        "#DC2626" if out["overdue"] else None)
+
+        # --- Today's classes and recent payments ---------------------------
+        lower = tk.Frame(parent, bg=APP_BG)
+        lower.pack(fill="x", pady=4)
+        lower.grid_columnconfigure(0, weight=3)
+        lower.grid_columnconfigure(1, weight=2)
+        class_panel = self._dash_panel(lower, "Today’s Classes / آج کی کلاسیں", "Open Timetable →",
+                                       lambda: self._go(parent, lambda p: self.timetable_page(p), "Timetable"))
+        class_panel.grid(row=0, column=0, sticky="nsew", padx=6, pady=6)
+        if not classes:
+            smart_label(tk.Label, class_panel, text="No classes scheduled today / آج کوئی کلاس مقرر نہیں", bg=CARD_BG, fg=MUTED,
+                        font=(UI_FONT, 10)).pack(anchor="w", pady=14)
+        else:
+            cols = ("time", "student", "course", "level", "teacher", "status")
+            tree = ttk.Treeview(class_panel, columns=cols, show="headings", height=max(3, min(7, len(classes))))
+            for key, text, width in (("time", "Time", 90), ("student", "Student", 160), ("course", "Course", 120),
+                                     ("level", "Level", 90), ("teacher", "Teacher", 120), ("status", "Attendance", 110)):
+                tree.heading(key, text=text)
+                tree.column(key, width=width, minwidth=60, anchor="w", stretch=True)
+            tree.tag_configure("present", **row_tag_opts("present"))
+            tree.tag_configure("absent", **row_tag_opts("absent"))
+            tree.tag_configure("leave", **row_tag_opts("leave"))
+            tree.tag_configure("pending", **row_tag_opts("pending"))
+            labels = {"Present": ("● Present", "present"), "Absent": ("● Absent", "absent")}
+            by_iid = {}
+            for index, item in enumerate(classes):
+                shown, tag = labels.get(item["att"], ("● Leave", "leave") if str(item["att"]).lower().startswith("leave") else ("○ Not marked", "pending"))
+                name = item["student"] if item.get("type", "Regular class") == "Regular class" else f"{item['student']}  [{item['type']}]"
+                iid = str(index)
+                by_iid[iid] = item
+                tree.insert("", "end", iid=iid, values=(item["start"] or "—", name, item["course"], item["level"], item["teacher"], shown), tags=(tag,))
+            tree.pack(fill="x")
+            def open_class(_event=None):
+                selected = tree.selection()
+                if selected and selected[0] in by_iid:
+                    self.show_class_details(by_iid[selected[0]])
+            tree.bind("<Double-1>", open_class)
+            smart_label(tk.Label, class_panel, text="Double-click a class to see details and mark attendance. Press Refresh afterwards. / تفصیل کے لیے کلاس پر ڈبل کلک کریں۔",
+                        bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9)).pack(anchor="w", pady=(6, 0))
+
+        pay_panel = self._dash_panel(lower, "Recent Payments / حالیہ ادائیگیاں", "View All →",
+                                     lambda: self._go(parent, lambda p: self.fees_page(p), "Fees"))
+        pay_panel.grid(row=0, column=1, sticky="nsew", padx=6, pady=6)
+        if not data["recent"]:
+            smart_label(tk.Label, pay_panel, text="No payments recorded yet / ابھی کوئی ادائیگی درج نہیں", bg=CARD_BG, fg=MUTED,
+                        font=(UI_FONT, 10)).pack(anchor="w", pady=14)
+        else:
+            ptree = ttk.Treeview(pay_panel, columns=("date", "student", "month", "amount", "status"), show="headings",
+                                 height=max(3, len(data["recent"])))
+            for key, text, width in (("date", "Date", 90), ("student", "Student", 140), ("month", "Month", 70),
+                                     ("amount", "Amount", 100), ("status", "Status", 80)):
+                ptree.heading(key, text=text)
+                ptree.column(key, width=width, minwidth=50, anchor="w", stretch=True)
+            ptree.tag_configure("paid", **row_tag_opts("paid"))
+            ptree.tag_configure("partial", **row_tag_opts("partial"))
+            ptree.tag_configure("unpaid", **row_tag_opts("unpaid"))
+            for row in data["recent"]:
+                status = str(row["status"] or "")
+                tag = status.lower() if status.lower() in ("paid", "partial", "unpaid") else "paid"
+                ptree.insert("", "end", values=(row["payment_date"], row["student"], row["month"] or "—",
+                                                f"{float(row['amount'] or 0):,.0f} {row['currency']}", f"● {status}"), tags=(tag,))
+            ptree.pack(fill="x")
+
+        # --- Alerts --------------------------------------------------------
+        alerts = self._dash_panel(parent, "Alerts / اہم اطلاعات")
+        alerts.pack(fill="x", padx=6, pady=6)
+        tiles = tk.Frame(alerts, bg=CARD_BG)
+        tiles.pack(fill="x")
+        folder = self.settings.get("backup_second_folder", "").strip()
+        last_backup = self.settings.get("backup_last_auto", "")
+        if not folder:
+            backup_text, backup_color = "Not set up", "#8A4B08"
+        elif not last_backup:
+            backup_text, backup_color = "Not done yet", "#9B1C1C"
+        else:
+            hours = self._hours_since_auto_backup() if hasattr(self, "_hours_since_auto_backup") else 0
+            backup_text, backup_color = (last_backup[:16], "#0B5A44") if hours < 48 else (last_backup[:16] + " (old)", "#9B1C1C")
+        tile_data = [
+            ("Today’s absences / آج کی غیر حاضریاں", str(data["absent_today"]), "#9B1C1C" if data["absent_today"] else DARK, None),
+            ("Classes without attendance today / آج بغیر حاضری", str(unmarked), "#8A4B08" if unmarked else DARK, None),
+            ("Overdue invoices (earlier months) / پرانی واجب الادا", str(out["overdue"]), "#9B1C1C" if out["overdue"] else DARK,
+             lambda: self._go(parent, lambda p: self.fees_page(p), "Fees")),
+            ("Classes tomorrow / کل کی کلاسیں", str(data["tomorrow"]), DARK, None),
+            ("Second-folder backup / دوسرا بیک اپ", backup_text, backup_color,
+             lambda: self._go(parent, lambda p: self.reports_page(p), "Reports")),
+        ]
+        for i, (title, value, color, action) in enumerate(tile_data):
+            tile = tk.Frame(tiles, bg=PALE, padx=12, pady=10, cursor="hand2" if action else "")
+            tile.grid(row=0, column=i, sticky="nsew", padx=5, pady=2)
+            tiles.grid_columnconfigure(i, weight=1, uniform="alerttiles")
+            smart_label(tk.Label, tile, text=title, bg=PALE, fg=MUTED, font=(UI_FONT, 9, "bold"), anchor="w",
+                        wraplength=170, justify="left").pack(anchor="w")
+            tk.Label(tile, text=value, bg=PALE, fg=color, font=(UI_FONT, 15 if len(value) < 8 else 11, "bold"), anchor="w").pack(anchor="w", pady=(4, 0))
+            if action:
+                for widget in (tile,) + tuple(tile.winfo_children()):
+                    widget.bind("<Button-1>", lambda _e, a=action: a())
+
+        # --- Quick actions -------------------------------------------------
+        quick = ttk.LabelFrame(parent, text="Quick actions / فوری کام", padding=14)
+        quick.pack(fill="x", expand=False, pady=12)
+        ttk.Button(quick, text="👨‍🎓 Add Student / طالب علم شامل کریں", command=lambda: self._go(parent, lambda p: self.students_page(p), "Students")).pack(side="left", padx=5, pady=5)
+        ttk.Button(quick, text="👩‍🏫 Add Teacher / استاد شامل کریں", command=lambda: self._go(parent, lambda p: self.teachers_page(p), "Teachers")).pack(side="left", padx=5, pady=5)
+        ttk.Button(quick, text="💳 Record Payment / فیس وصول کریں", command=lambda: self._go(parent, lambda p: self.fees_page(p), "Fees")).pack(side="left", padx=5, pady=5)
+        ttk.Button(quick, text="📅 Review Timetable / ٹائم ٹیبل", command=lambda: self._go(parent, lambda p: self.timetable_page(p), "Timetable")).pack(side="left", padx=5, pady=5)
+
+    def _read_settings(self):
+        try:
+            return {r["setting_key"]: r["setting_value"] for r in self.db.conn.execute("SELECT setting_key, setting_value FROM app_settings")}
+        except sqlite3.Error:
+            return {}
+
+    def _prepare_circular_logo(self, path, size, ring_color=None, ring_width=0):
+        """Create an antialiased circular crop with no decorative image border."""
+        if Image is None or ImageDraw is None:
+            raise RuntimeError("Pillow is required for circular logo cropping.")
+        with Image.open(path) as opened:
+            source = opened.convert("RGBA")
+        width, height = source.size
+        side = min(width, height)
+        left = (width - side) // 2
+        top = (height - side) // 2
+        source = source.crop((left, top, left + side, top + side))
+        # Draw the mask at 4x size then downsample with LANCZOS. This removes the
+        # rough stair-step edge from tiny circular images without adding a white ring.
+        scale = 4
+        high_size = max(4, int(size) * scale)
+        resampling = getattr(Image, "Resampling", Image)
+        source = source.resize((high_size, high_size), resampling.LANCZOS)
+        circle_mask = Image.new("L", (high_size, high_size), 0)
+        mask_draw = ImageDraw.Draw(circle_mask)
+        inset = scale // 2
+        mask_draw.ellipse((inset, inset, high_size - inset - 1, high_size - inset - 1), fill=255)
+        import PIL.ImageChops as _imagechops
+        source.putalpha(_imagechops.multiply(source.getchannel("A"), circle_mask))
+        return source.resize((int(size), int(size)), resampling.LANCZOS)
+
+    def _profile_image_target(self, kind, record_id):
+        """Keep cropped profile photos alongside the local database, not in a temporary folder."""
+        folder = os.path.join(os.path.dirname(os.path.abspath(self.db.path)), "profile_images")
+        os.makedirs(folder, exist_ok=True)
+        return os.path.join(folder, f"{kind}_{int(record_id)}.png")
+
+    def _make_profile_photo(self, parent, display_name, path="", size=96, background=None):
+        """Draw a circular photo/initials badge and expose a safe image-update callback."""
+        bg = background or APP_BG
+        canvas = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0, bd=0)
+        pad = 2
+        # Keep a clean circular avatar, without the unwanted white outline around profile photos.
+        # The soft mint fill is used only as a backdrop/fallback; the image itself remains borderless.
+        canvas.create_oval(pad, pad, size-pad, size-pad, fill="#DDF3E5", outline="", width=0, tags="frame")
+        initials = "".join(part[:1] for part in str(display_name or "I").split()[:2]).upper() or "I"
+        text_item = canvas.create_text(size/2, size/2, text=initials, fill=GREEN,
+                                       font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_BOLD_FONT,
+                                             max(15, size//3), "bold"), tags="initials")
+        image_item = canvas.create_image(size/2, size/2, image="", tags="profile_image")
+        def set_image(image_path):
+            photo = self._circular_logo_photo(image_path, size, None, 0) if image_path else None
+            if photo is not None:
+                canvas.itemconfigure(image_item, image=photo)
+                canvas.itemconfigure(text_item, state="hidden")
+                canvas._taha_profile_photo = photo
+            else:
+                canvas.itemconfigure(image_item, image="")
+                canvas.itemconfigure(text_item, state="normal")
+                canvas._taha_profile_photo = None
+        canvas._taha_set_profile_image = set_image
+        set_image(path)
+        return canvas
+
+    def _circular_logo_photo(self, path, size, ring_color="#FFFFFF", ring_width=3):
+        if Image is None or ImageTk is None or not path or not os.path.isfile(path):
+            return None
+        try:
+            absolute = os.path.realpath(path)
+            stat = os.stat(absolute)
+            key = (absolute, stat.st_mtime_ns, stat.st_size, int(size), ring_color, int(ring_width))
+            cache = getattr(self, "_il_logo_photo_cache", None)
+            if cache is None:
+                cache = self._il_logo_photo_cache = LRUCache(48)
+            cached = cache.get(key)
+            if cached is not None:
+                return cached
+            photo = ImageTk.PhotoImage(self._prepare_circular_logo(absolute, size, ring_color, ring_width), master=self.root)
+            cache.put(key, photo)
+            return photo
+        except (OSError, tk.TclError, TypeError, ValueError):
+            return None
+        except Exception:
+            return None
+
+    def _show_logo_cropper(self, source_path, target_path):
+        """WhatsApp-like circular crop editor: drag to reposition, zoom, then save PNG."""
+        if Image is None or ImageTk is None or ImageDraw is None:
+            messagebox.showerror(
+                "Photo editor unavailable / فوٹو ایڈیٹر دستیاب نہیں",
+                "Photo crop/zoom needs Pillow. Install it with: py -m pip install Pillow",
+                parent=self.root)
+            return False
+        try:
+            with Image.open(source_path) as opened:
+                source = opened.convert("RGBA")
+        except Exception as exc:
+            messagebox.showerror("Cannot open image / تصویر نہیں کھل سکی", str(exc), parent=self.root)
+            return False
+
+        canvas_size = 360
+        diameter = 300
+        origin = (canvas_size - diameter) // 2
+        center = origin + diameter / 2
+        base_scale = max(diameter / source.width, diameter / source.height)
+        state = {"zoom": 1.0, "scale": base_scale}
+        scaled_w = round(source.width * base_scale)
+        scaled_h = round(source.height * base_scale)
+        state["x"] = (canvas_size - scaled_w) / 2
+        state["y"] = (canvas_size - scaled_h) / 2
+        result = {"saved": False}
+
+        win = tk.Toplevel(self.root)
+        win.title("Adjust photo or logo / تصویر یا لوگو ایڈجسٹ کریں")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.configure(bg="#EAF4F0")
+        outer = tk.Frame(win, bg="#EAF4F0", padx=18, pady=16)
+        outer.pack(fill="both", expand=True)
+        tk.Label(outer, text="Adjust photo or logo / تصویر یا لوگو ایڈجسٹ کریں",
+                 bg="#EAF4F0", fg="#173D32", font=(UI_FONT, 15, "bold")).pack(anchor="w")
+        tk.Label(outer, text="Drag the photo inside the circle. Use the zoom slider to fit it your way.\nتصویر کو دائرے کے اندر گھسیٹیں اور زوم سلائیڈر سے سائز اپنی پسند کے مطابق کریں۔",
+                 bg="#EAF4F0", fg="#475569", font=(UI_FONT, 9), justify="left").pack(anchor="w", pady=(4, 12))
+        canvas = tk.Canvas(outer, width=canvas_size, height=canvas_size,
+                           bg="#0F172A", bd=0, highlightthickness=0)
+        canvas.pack()
+        photo_ref = {"photo": None}
+
+        def clamp_position():
+            scale = state["scale"]
+            sw = round(source.width * scale)
+            sh = round(source.height * scale)
+            if sw <= diameter:
+                state["x"] = origin + (diameter - sw) / 2
+            else:
+                state["x"] = min(origin, max(origin + diameter - sw, state["x"]))
+            if sh <= diameter:
+                state["y"] = origin + (diameter - sh) / 2
+            else:
+                state["y"] = min(origin, max(origin + diameter - sh, state["y"]))
+
+        def render_preview():
+            clamp_position()
+            scale = state["scale"]
+            sw = max(1, round(source.width * scale))
+            sh = max(1, round(source.height * scale))
+            resampling = getattr(Image, "Resampling", Image)
+            resized = source.resize((sw, sh), resampling.LANCZOS)
+            preview = Image.new("RGBA", (canvas_size, canvas_size), (15, 23, 42, 255))
+            preview.alpha_composite(resized, (int(round(state["x"])), int(round(state["y"]))))
+            shade = Image.new("RGBA", (canvas_size, canvas_size), (7, 12, 25, 190))
+            shade_draw = ImageDraw.Draw(shade)
+            shade_draw.ellipse((origin, origin, origin + diameter, origin + diameter), fill=(0, 0, 0, 0))
+            preview = Image.alpha_composite(preview, shade)
+            frame_draw = ImageDraw.Draw(preview)
+            frame_draw.ellipse((origin + 1, origin + 1, origin + diameter - 1, origin + diameter - 1),
+                               outline=(255, 255, 255, 255), width=4)
+            frame_draw.ellipse((origin + 4, origin + 4, origin + diameter - 4, origin + diameter - 4),
+                               outline=(229, 27, 42, 255), width=2)
+            photo_ref["photo"] = ImageTk.PhotoImage(preview)
+            canvas.delete("all")
+            canvas.create_image(0, 0, image=photo_ref["photo"], anchor="nw")
+
+        drag = {"x": 0, "y": 0, "img_x": 0, "img_y": 0}
+        def drag_start(event):
+            drag.update(x=event.x, y=event.y, img_x=state["x"], img_y=state["y"])
+        def drag_move(event):
+            state["x"] = drag["img_x"] + event.x - drag["x"]
+            state["y"] = drag["img_y"] + event.y - drag["y"]
+            render_preview()
+        canvas.bind("<ButtonPress-1>", drag_start)
+        canvas.bind("<B1-Motion>", drag_move)
+
+        zoom_var = tk.DoubleVar(value=1.0)
+        tk.Label(outer, text="Zoom / زوم", bg="#EAF4F0", fg="#173D32",
+                 font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(12, 2))
+        def change_zoom(value):
+            try:
+                new_zoom = max(0.60, min(3.5, float(value)))
+            except (TypeError, ValueError):
+                return
+            old_scale = state["scale"]
+            focus_x = (center - state["x"]) / old_scale
+            focus_y = (center - state["y"]) / old_scale
+            state["zoom"] = new_zoom
+            state["scale"] = base_scale * new_zoom
+            state["x"] = center - focus_x * state["scale"]
+            state["y"] = center - focus_y * state["scale"]
+            render_preview()
+        ttk.Scale(outer, from_=0.60, to=3.5, variable=zoom_var, command=change_zoom).pack(fill="x")
+
+        button_row = tk.Frame(outer, bg="#EAF4F0")
+        button_row.pack(fill="x", pady=(14, 0))
+        def save_crop():
+            try:
+                scale = state["scale"]
+                sw = max(1, round(source.width * scale))
+                sh = max(1, round(source.height * scale))
+                resampling = getattr(Image, "Resampling", Image)
+                resized = source.resize((sw, sh), resampling.LANCZOS)
+                # Crop the same square region that the user sees, including transparent space on zoom-out.
+                viewport = Image.new("RGBA", (diameter, diameter), (255, 255, 255, 0))
+                viewport.alpha_composite(resized, (int(round(state["x"] - origin)), int(round(state["y"] - origin))))
+                crop = viewport.resize((512, 512), resampling.LANCZOS).convert("RGBA")
+                # Antialiased circular transparency; the display frame is drawn by the app.
+                mask_large = Image.new("L", (2048, 2048), 0)
+                ImageDraw.Draw(mask_large).ellipse((2, 2, 2046, 2046), fill=255)
+                mask = mask_large.resize((512, 512), resampling.LANCZOS)
+                import PIL.ImageChops as _imagechops
+                crop.putalpha(_imagechops.multiply(crop.getchannel("A"), mask))
+                os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+                crop.save(target_path, "PNG")
+                result["saved"] = True
+                win.destroy()
+            except Exception as exc:
+                messagebox.showerror("Logo could not be saved / لوگو محفوظ نہیں ہوا", str(exc), parent=win)
+        tk.Button(button_row, text="Cancel / منسوخ", command=win.destroy,
+                  bg="#E2E8F0", fg="#173D32", relief="flat", padx=14, pady=7).pack(side="right", padx=(8, 0))
+        tk.Button(button_row, text="Use this crop / یہ فریم محفوظ کریں", command=save_crop,
+                  bg=GREEN, fg=on_color(GREEN, "#FFFFFF", "#000000"), activebackground=GREEN_HOVER, activeforeground=on_color(GREEN_HOVER, "#FFFFFF", "#000000"),
+                  relief="flat", padx=14, pady=7, font=(UI_FONT, 10, "bold")).pack(side="right")
+        render_preview()
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(20, (self.root.winfo_width() - win.winfo_width()) // 2)
+            y = self.root.winfo_rooty() + max(20, (self.root.winfo_height() - win.winfo_height()) // 2)
+            win.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+        self.root.wait_window(win)
+        return result["saved"]
+
+    def _curriculum_lang(self, key):
+        return COURSE_CATALOG[key].get("ur" if APP_LANGUAGE == "ur" else "en", COURSE_CATALOG[key]["en"])
+
+    def _curriculum_table_ready(self):
+        """Prepare local curriculum PDF and image-library metadata tables."""
+        self.db.conn.execute("""CREATE TABLE IF NOT EXISTS course_curriculum (
+            course_key TEXT PRIMARY KEY, pdf_name TEXT NOT NULL DEFAULT '', pdf_data BLOB,
+            uploaded_at TEXT NOT NULL DEFAULT '', uploaded_by TEXT NOT NULL DEFAULT '')""")
+        self.db.conn.execute("""CREATE TABLE IF NOT EXISTS curriculum_image_assets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            course_key TEXT NOT NULL,
+            collection_name TEXT NOT NULL DEFAULT '',
+            source_folder TEXT NOT NULL DEFAULT '',
+            source_relpath TEXT NOT NULL DEFAULT '',
+            original_name TEXT NOT NULL DEFAULT '',
+            stored_relpath TEXT NOT NULL,
+            topic_index INTEGER,
+            page_order INTEGER NOT NULL DEFAULT 0,
+            imported_at TEXT NOT NULL DEFAULT '',
+            imported_by TEXT NOT NULL DEFAULT '',
+            UNIQUE(course_key, source_folder, source_relpath)
+        )""")
+        self.db.conn.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_images_course_collection ON curriculum_image_assets(course_key, collection_name, page_order)")
+        self.db.conn.execute("CREATE INDEX IF NOT EXISTS idx_curriculum_images_topic ON curriculum_image_assets(course_key, topic_index)")
+        self.db.conn.commit()
+
+    @staticmethod
+    def _curriculum_image_extensions():
+        return {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif', '.tif', '.tiff'}
+
+    @staticmethod
+    def _curriculum_natural_key(value):
+        return [(1, int(part)) if part.isdigit() else (0, part.casefold())
+                for part in re.split(r'(\d+)', str(value or ''))]
+
+    @staticmethod
+    def _curriculum_safe_slug(value):
+        text = re.sub(r'[^A-Za-z0-9_-]+', '_', str(value or '')).strip('_')[:34] or 'collection'
+        digest = hashlib.sha1(str(value or '').encode('utf-8', errors='ignore')).hexdigest()[:8]
+        return f'{text}_{digest}'
+
+    def _curriculum_suggest_course(self, folder_name, default_course=None):
+        """Best-effort suggestions based only on obvious source-folder wording."""
+        norm = re.sub(r'[^a-z0-9]+', '', str(folder_name or '').casefold())
+        if 'colorquran' in norm or 'tajweed' in norm:
+            return 'Tajweed'
+        if any(token in norm for token in ('nooraniqaida', 'noraniqaida', 'madaniqaida', 'madniqaida')):
+            return 'Noorani Qaida'
+        if 'basicquran' in norm or 'nazraquran' in norm:
+            return 'Qaida & Nazra Quran'
+        if 'dua' in norm or 'namaz' in norm or 'salah' in norm:
+            return 'Duas & Salah'
+        if 'kalma' in norm or 'fundamental' in norm or 'teachingofislam' in norm:
+            return 'Islamiat'
+        return default_course if default_course in COURSES else COURSES[0]
+
+    def _curriculum_image_storage_root(self):
+        """Keep copied curriculum pictures beside the currently selected local DB."""
+        db_path = os.path.abspath(getattr(self.db, 'path', PROJECT_DB))
+        return os.path.join(os.path.dirname(db_path), 'curriculum_assets')
+
+    def _curriculum_import_image_tree(self, default_course=None, after_import=None):
+        """Import image folders locally, map each collection to a course, and copy originals.
+
+        The selected source folder is never modified. Images are copied byte-for-byte to a
+        sibling ``curriculum_assets`` folder next to the active database, while only metadata
+        and relative asset paths are stored in SQLite.
+        """
+        if not (self.user and self.user.get('role') == 'admin'):
+            messagebox.showerror('Permission denied' if APP_LANGUAGE == 'en' else 'اجازت نہیں',
+                'Only an administrator can import curriculum images.' if APP_LANGUAGE == 'en' else 'نصاب کی تصاویر صرف ایڈمن درآمد کر سکتا ہے۔', parent=self.root)
+            return
+        self._curriculum_table_ready()
+        source_root = filedialog.askdirectory(parent=self.root,
+            title=('Select the extracted curriculum image folder' if APP_LANGUAGE == 'en' else 'نصاب کی نکالی ہوئی تصویریں والا فولڈر منتخب کریں'))
+        if not source_root:
+            return
+        source_root = os.path.abspath(source_root)
+        extensions = self._curriculum_image_extensions()
+
+        def image_files(folder, recursive=True):
+            found = []
+            if recursive:
+                for base, dirs, files in os.walk(folder):
+                    dirs[:] = sorted(dirs, key=self._curriculum_natural_key)
+                    for name in files:
+                        if os.path.splitext(name)[1].casefold() in extensions:
+                            found.append(os.path.join(base, name))
+            else:
+                try:
+                    found = [os.path.join(folder, name) for name in os.listdir(folder)
+                             if os.path.isfile(os.path.join(folder, name)) and os.path.splitext(name)[1].casefold() in extensions]
+                except OSError:
+                    found = []
+            return sorted(found, key=lambda f: self._curriculum_natural_key(os.path.relpath(f, folder)))
+
+        collections = []
+        # Treat each direct child folder as one book/album collection. Nested folders
+        # stay inside that collection so chapter/page order and source names survive.
+        try:
+            child_dirs = sorted([os.path.join(source_root, name) for name in os.listdir(source_root)
+                                 if os.path.isdir(os.path.join(source_root, name))],
+                                key=lambda f: self._curriculum_natural_key(os.path.basename(f)))
+        except OSError as exc:
+            messagebox.showerror('Folder could not be read' if APP_LANGUAGE == 'en' else 'فولڈر نہیں پڑھا جا سکا', str(exc), parent=self.root)
+            return
+        for folder in child_dirs:
+            found = image_files(folder, recursive=True)
+            if found:
+                collections.append({'name': os.path.basename(folder), 'folder': folder, 'files': found})
+        # Also support a folder containing images directly, with no child book folders.
+        direct = image_files(source_root, recursive=False)
+        if direct:
+            collections.insert(0, {'name': os.path.basename(source_root) or source_root,
+                                    'folder': source_root, 'files': direct, 'direct_only': True})
+        if not collections:
+            messagebox.showwarning('No images found' if APP_LANGUAGE == 'en' else 'تصاویر نہیں ملیں',
+                'No supported image files were found. Supported: JPG, PNG, WEBP, BMP, GIF, TIF.' if APP_LANGUAGE == 'en'
+                else 'اس فولڈر میں معاون تصویری فائلیں نہیں ملیں۔ JPG، PNG، WEBP، BMP، GIF اور TIF استعمال کریں۔', parent=self.root)
+            return
+
+        # If a very large folder was selected, warn before the copy operation begins.
+        total_count = sum(len(c['files']) for c in collections)
+        total_bytes = 0
+        for collection in collections:
+            for path in collection['files']:
+                try: total_bytes += os.path.getsize(path)
+                except OSError: pass
+        total_mb = total_bytes / (1024 * 1024)
+
+        mapping = tk.Toplevel(self.root)
+        mapping.title('Map image folders to courses' if APP_LANGUAGE == 'en' else 'تصویری فولڈرز کو کورسز سے منسلک کریں')
+        mapping.configure(bg=APP_BG)
+        mapping.transient(self.root)
+        mapping.grab_set()
+        mapping.geometry('850x' + str(min(680, max(400, 160 + 58 * len(collections)))))
+        mapping.minsize(700, 380)
+        heading = 'Choose which course each image folder belongs to' if APP_LANGUAGE == 'en' else 'منتخب کریں کہ ہر تصویری فولڈر کس کورس کا ہے'
+        tk.Label(mapping, text=heading, bg=APP_BG, fg=GREEN, font=(UI_FONT, 14, 'bold')).pack(anchor='w', padx=18, pady=(16, 6))
+        summary = (f'{len(collections)} folders · {total_count:,} images · about {total_mb:,.1f} MB. Original files will not be changed.' if APP_LANGUAGE == 'en'
+                   else f'{len(collections)} فولڈرز · {total_count:,} تصاویر · تقریباً {total_mb:,.1f} MB۔ اصل فائلیں تبدیل نہیں ہوں گی۔')
+        tk.Label(mapping, text=summary, bg=APP_BG, fg=MUTED, font=(UI_FONT, 10), wraplength=800, justify='left').pack(anchor='w', padx=18, pady=(0, 10))
+        table_shell = tk.Frame(mapping, bg=APP_BG)
+        table_shell.pack(fill='both', expand=True, padx=14, pady=4)
+        map_canvas = tk.Canvas(table_shell, bg=APP_BG, highlightthickness=0)
+        map_scroll = ttk.Scrollbar(table_shell, orient='vertical', command=map_canvas.yview)
+        map_canvas.configure(yscrollcommand=map_scroll.set)
+        map_scroll.pack(side='right', fill='y')
+        map_canvas.pack(side='left', fill='both', expand=True)
+        rows_frame = tk.Frame(map_canvas, bg=APP_BG)
+        map_window = map_canvas.create_window((0, 0), window=rows_frame, anchor='nw')
+        rows_frame.bind('<Configure>', lambda _e: map_canvas.configure(scrollregion=map_canvas.bbox('all')))
+        map_canvas.bind('<Configure>', lambda e: map_canvas.itemconfigure(map_window, width=e.width))
+        course_labels = [COURSE_CATALOG.get(k, {}).get('ur' if APP_LANGUAGE == 'ur' else 'en', {}).get('title', k) for k in COURSES]
+        label_to_key = dict(zip(course_labels, COURSES))
+        entries = []
+
+        def course_label_for(key):
+            return next((lab for lab, item_key in label_to_key.items() if item_key == key), key)
+
+        for idx, collection in enumerate(collections):
+            row = tk.Frame(rows_frame, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=10, pady=8)
+            row.pack(fill='x', pady=3)
+            left = tk.Frame(row, bg=CARD_BG)
+            left.pack(side='left', fill='x', expand=True, padx=(0, 10))
+            label = f"{collection['name']}  ({len(collection['files']):,})"
+            tk.Label(left, text=label, bg=CARD_BG, fg=DARK, anchor='w',
+                     font=(UI_FONT, 10, 'bold'), wraplength=430, justify='left').pack(anchor='w', fill='x')
+
+            # A collection may belong to more than one course, so use a checklist
+            # dialog instead of a single-choice Combobox. Preserve one sensible
+            # initial suggestion while allowing the admin to add several courses.
+            suggested_key = self._curriculum_suggest_course(collection['name'], default_course)
+            selected_keys = {suggested_key} if suggested_key in COURSES else set()
+            summary_var = tk.StringVar()
+            button_var = tk.StringVar()
+
+            def refresh_selection(selected=selected_keys, summary=summary_var, button_text=button_var):
+                labels = [course_label_for(key) for key in COURSES if key in selected]
+                if labels:
+                    summary.set(('Selected: ' if APP_LANGUAGE == 'en' else 'منتخب: ') +
+                                (', '.join(labels) if APP_LANGUAGE == 'en' else '، '.join(labels)))
+                else:
+                    summary.set('No courses selected' if APP_LANGUAGE == 'en' else 'کوئی کورس منتخب نہیں')
+                button_text.set((f'Choose courses ({len(selected)})' if APP_LANGUAGE == 'en'
+                                 else f'کورس منتخب کریں ({len(selected)})'))
+
+            tk.Label(left, textvariable=summary_var, bg=CARD_BG, fg=MUTED, anchor='w',
+                     font=(UI_FONT, 9), wraplength=500, justify='left').pack(anchor='w', fill='x', pady=(4, 0))
+
+            def choose_courses(selected=selected_keys, summary=summary_var, button_text=button_var,
+                               collection_name=collection['name']):
+                picker = tk.Toplevel(mapping)
+                picker.title('Select one or more courses' if APP_LANGUAGE == 'en' else 'ایک یا زیادہ کورس منتخب کریں')
+                picker.configure(bg=APP_BG)
+                picker.transient(mapping)
+                picker.resizable(True, True)
+                picker.geometry('480x520')
+                picker.minsize(380, 400)
+                tk.Label(picker,
+                         text=('Select every course where this image collection should appear' if APP_LANGUAGE == 'en'
+                               else 'وہ تمام کورس منتخب کریں جہاں یہ تصویری مجموعہ دکھانا ہے'),
+                         bg=APP_BG, fg=GREEN, font=(UI_FONT, 11, 'bold'),
+                         wraplength=430, justify='left').pack(fill='x', padx=16, pady=(15, 8))
+                tk.Label(picker, text=collection_name, bg=APP_BG, fg=MUTED,
+                         font=(UI_FONT, 10, 'bold'), wraplength=430, justify='left').pack(anchor='w', padx=16, pady=(0, 8))
+                list_shell = tk.Frame(picker, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
+                list_shell.pack(fill='both', expand=True, padx=14, pady=4)
+                check_area = tk.Frame(list_shell, bg=CARD_BG)
+                check_area.pack(fill='both', expand=True, padx=10, pady=8)
+                check_vars = {}
+                for col in range(2):
+                    check_area.grid_columnconfigure(col, weight=1, uniform='course_checks')
+                for course_index, (course_key, display_label) in enumerate(zip(COURSES, course_labels)):
+                    value = tk.BooleanVar(value=course_key in selected)
+                    check_vars[course_key] = value
+                    check = tk.Checkbutton(check_area, text=display_label, variable=value,
+                                           onvalue=True, offvalue=False, anchor='w', justify='left',
+                                           bg=CARD_BG, fg=DARK, activebackground=CARD_BG,
+                                           activeforeground=GREEN, selectcolor=PALE,
+                                           font=(UI_FONT, 10), padx=6, pady=7, wraplength=185)
+                    check.grid(row=course_index // 2, column=course_index % 2, sticky='ew', padx=4, pady=3)
+                action_row = tk.Frame(picker, bg=APP_BG)
+                action_row.pack(fill='x', padx=14, pady=(8, 14))
+
+                def select_all():
+                    for variable in check_vars.values():
+                        variable.set(True)
+
+                def clear_all():
+                    for variable in check_vars.values():
+                        variable.set(False)
+
+                tk.Button(action_row, text=('Select all' if APP_LANGUAGE == 'en' else 'سب منتخب کریں'),
+                          command=select_all, bg=SOFT_GREEN, fg=GREEN, relief='flat',
+                          padx=10, pady=6, cursor='hand2').pack(side='left')
+                tk.Button(action_row, text=('Clear all' if APP_LANGUAGE == 'en' else 'سب ختم کریں'),
+                          command=clear_all, bg='#EEF2EF', fg=DARK, relief='flat',
+                          padx=10, pady=6, cursor='hand2').pack(side='left', padx=(6, 0))
+
+                def apply_selection():
+                    selected.clear()
+                    selected.update(key for key, variable in check_vars.items() if variable.get())
+                    refresh_selection(selected, summary, button_text)
+                    picker.destroy()
+
+                tk.Button(action_row, text=('Apply selection' if APP_LANGUAGE == 'en' else 'انتخاب لاگو کریں'),
+                          command=apply_selection, bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER,
+                          relief='flat', padx=13, pady=7, cursor='hand2',
+                          font=(UI_FONT, 10, 'bold')).pack(side='right')
+                picker.protocol('WM_DELETE_WINDOW', picker.destroy)
+                picker.grab_set()
+                picker.wait_window()
+
+            tk.Button(row, textvariable=button_var, command=choose_courses, bg=SOFT_GREEN, fg=GREEN,
+                      activebackground=PALE, relief='flat', padx=12, pady=8,
+                      cursor='hand2', font=(UI_FONT, 9, 'bold')).pack(side='right', anchor='center')
+            refresh_selection()
+            entries.append((collection, selected_keys))
+        actions = tk.Frame(mapping, bg=CARD_BG, padx=14, pady=10)
+        actions.pack(fill='x', side='bottom')
+        def cancel_mapping():
+            try: mapping.grab_release()
+            except tk.TclError: pass
+            mapping.destroy()
+        tk.Button(actions, text=('Cancel' if APP_LANGUAGE == 'en' else 'منسوخ'), command=cancel_mapping,
+                  bg='#EEF2EF', fg=DARK, relief='flat', padx=16, pady=7).pack(side='right', padx=(6, 0))
+        def start_import():
+            chosen = []
+            for collection, selected_keys in entries:
+                # One source collection can be registered under multiple courses.
+                for key in COURSES:
+                    if key in selected_keys:
+                        chosen.append((collection, key))
+            if not chosen:
+                messagebox.showwarning('Select a course',
+                    'Choose at least one course for at least one folder.' if APP_LANGUAGE == 'en'
+                    else 'کم از کم ایک فولڈر کے لیے ایک کورس منتخب کریں۔', parent=mapping)
+                return
+            try: mapping.grab_release()
+            except tk.TclError: pass
+            mapping.destroy()
+            self._curriculum_copy_image_collections(chosen, source_root, after_import=after_import)
+        tk.Button(actions, text=('Import selected folders' if APP_LANGUAGE == 'en' else 'منتخب فولڈرز درآمد کریں'),
+                  command=start_import, bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER,
+                  relief='flat', padx=16, pady=8, cursor='hand2', font=(UI_FONT, 10, 'bold')).pack(side='right')
+        mapping.wait_window()
+
+    def _curriculum_copy_image_collections(self, chosen, source_root, after_import=None):
+        """Copy selected images losslessly and register page order/collection metadata."""
+        if Image is None:
+            messagebox.showerror('Image support unavailable' if APP_LANGUAGE == 'en' else 'تصویری سہولت دستیاب نہیں',
+                'Install Pillow first: py -m pip install pillow. No source files have been changed.' if APP_LANGUAGE == 'en'
+                else 'پہلے Pillow انسٹال کریں۔ اصل تصاویر تبدیل نہیں کی گئیں۔', parent=self.root)
+            return
+        db_root = os.path.dirname(os.path.abspath(getattr(self.db, 'path', PROJECT_DB)))
+        asset_root = self._curriculum_image_storage_root()
+        try:
+            os.makedirs(asset_root, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror('Cannot create image library' if APP_LANGUAGE == 'en' else 'تصویری لائبریری نہیں بن سکی', str(exc), parent=self.root)
+            return
+        total = sum(len(coll['files']) for coll, _course in chosen)
+        progress = tk.Toplevel(self.root)
+        progress.title('Importing curriculum images' if APP_LANGUAGE == 'en' else 'نصاب کی تصاویر درآمد ہو رہی ہیں')
+        progress.configure(bg=APP_BG)
+        progress.transient(self.root)
+        progress.geometry('520x150')
+        progress.resizable(False, False)
+        info_var = tk.StringVar(value='Preparing image folders…' if APP_LANGUAGE == 'en' else 'تصویری فولڈرز تیار ہو رہے ہیں…')
+        tk.Label(progress, textvariable=info_var, bg=APP_BG, fg=DARK, wraplength=480, justify='left').pack(fill='x', padx=16, pady=(18, 8))
+        bar = ttk.Progressbar(progress, maximum=max(1, total), mode='determinate')
+        bar.pack(fill='x', padx=16, pady=8)
+        progress.update_idletasks()
+        copied = skipped = failed = 0
+        copied_paths = []
+        stamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+        imported_by = (self.user or {}).get('username', 'admin')
+        ext_set = self._curriculum_image_extensions()
+        try:
+            self.db.conn.execute('SAVEPOINT curriculum_image_import')
+            position = 0
+            for collection, course_key in chosen:
+                name = collection['name']
+                source_folder = os.path.abspath(collection['folder'])
+                files = list(collection['files'])
+                for i, source_path in enumerate(files):
+                    position += 1
+                    bar['value'] = position
+                    if position == 1 or position % 8 == 0 or position == total:
+                        info_var.set(f"{name}: {position:,}/{total:,}" if APP_LANGUAGE == 'en' else f"{name}: {position:,}/{total:,}")
+                        progress.update_idletasks()
+                        progress.update()
+                    if os.path.splitext(source_path)[1].casefold() not in ext_set or not os.path.isfile(source_path):
+                        skipped += 1
+                        continue
+                    rel = os.path.relpath(source_path, source_folder).replace('\\', '/')
+                    exists = self.db.conn.execute("SELECT id FROM curriculum_image_assets WHERE course_key=? AND source_folder=? AND source_relpath=?",
+                        (course_key, source_folder, rel)).fetchone()
+                    if exists:
+                        skipped += 1
+                        continue
+                    try:
+                        # Validate readability but never re-encode the original page.
+                        with Image.open(source_path) as im:
+                            im.verify()
+                    except Exception:
+                        failed += 1
+                        continue
+                    course_slug = self._curriculum_safe_slug(course_key)
+                    coll_slug = self._curriculum_safe_slug(name + '|' + source_folder)
+                    rel_parts = rel.split('/')
+                    dest_dir = os.path.join(asset_root, course_slug, coll_slug, *rel_parts[:-1])
+                    os.makedirs(dest_dir, exist_ok=True)
+                    destination = os.path.join(dest_dir, os.path.basename(source_path))
+                    try:
+                        if os.path.exists(destination):
+                            stem, extension = os.path.splitext(os.path.basename(destination))
+                            destination = os.path.join(dest_dir, f'{stem}_{secrets.token_hex(3)}{extension}')
+                        shutil.copy2(source_path, destination)
+                        copied_paths.append(destination)
+                        stored_rel = os.path.relpath(destination, db_root)
+                        self.db.conn.execute("""INSERT INTO curriculum_image_assets
+                            (course_key,collection_name,source_folder,source_relpath,original_name,stored_relpath,
+                             topic_index,page_order,imported_at,imported_by)
+                            VALUES(?,?,?,?,?,?,NULL,?,?,?)""",
+                            (course_key, name, source_folder, rel, os.path.basename(source_path), stored_rel,
+                             i + 1, stamp, imported_by))
+                        copied += 1
+                    except Exception:
+                        failed += 1
+                        try:
+                            if os.path.exists(destination): os.remove(destination)
+                        except OSError: pass
+            self.db.conn.execute('RELEASE SAVEPOINT curriculum_image_import')
+            self.db.conn.commit()
+        except Exception as exc:
+            try:
+                self.db.conn.execute('ROLLBACK TO SAVEPOINT curriculum_image_import')
+                self.db.conn.execute('RELEASE SAVEPOINT curriculum_image_import')
+                self.db.conn.commit()
+            except Exception: pass
+            for copied_path in copied_paths:
+                try:
+                    if os.path.isfile(copied_path): os.remove(copied_path)
+                except OSError: pass
+            try: progress.destroy()
+            except tk.TclError: pass
+            messagebox.showerror('Image import failed' if APP_LANGUAGE == 'en' else 'تصاویر درآمد نہیں ہو سکیں', str(exc), parent=self.root)
+            return
+        try: progress.destroy()
+        except tk.TclError: pass
+        summary = (f'Imported {copied:,} images. Skipped duplicates/unsupported files: {skipped:,}. Unreadable files: {failed:,}.\n\nImages were copied unchanged to:\n{asset_root}' if APP_LANGUAGE == 'en'
+                   else f'{copied:,} تصاویر درآمد ہوئیں۔ دہرائی گئی/غیر معاون فائلیں چھوڑیں: {skipped:,}۔ ناقابلِ مطالعہ فائلیں: {failed:,}۔\n\nتصاویر بغیر تبدیلی اس فولڈر میں نقل ہوئیں:\n{asset_root}')
+        messagebox.showinfo('Image import complete' if APP_LANGUAGE == 'en' else 'تصاویر درآمد مکمل', summary, parent=self.root)
+        if callable(after_import):
+            try: after_import()
+            except Exception: pass
+
+    def _open_curriculum_images(self, course_key, topic_index=None):
+        """Browse copied original curriculum images; optionally restrict to a linked topic."""
+        self._curriculum_table_ready()
+        if Image is None or ImageTk is None:
+            messagebox.showerror('Image viewer unavailable' if APP_LANGUAGE == 'en' else 'تصویری ناظر دستیاب نہیں',
+                'Pillow is required to view curriculum images. Install it with: py -m pip install pillow' if APP_LANGUAGE == 'en'
+                else 'نصاب کی تصاویر دیکھنے کے لیے Pillow درکار ہے۔', parent=self.root)
+            return
+        lang = self._curriculum_lang(course_key)
+        units = list(lang.get('units', []))
+        db_root = os.path.dirname(os.path.abspath(getattr(self.db, 'path', PROJECT_DB)))
+        selected_topic = topic_index
+        where = ' AND topic_index=?' if topic_index is not None else ''
+        rows = self.db.conn.execute("SELECT * FROM curriculum_image_assets WHERE course_key=?" + where + " ORDER BY collection_name COLLATE NOCASE, page_order, original_name COLLATE NOCASE",
+            (course_key, topic_index) if topic_index is not None else (course_key,)).fetchall()
+        if not rows:
+            if topic_index is not None:
+                messagebox.showinfo('No linked pages' if APP_LANGUAGE == 'en' else 'منسلک صفحات نہیں',
+                    ('No images are linked to this lesson yet. Open the course image library and assign pages to this topic.' if APP_LANGUAGE == 'en'
+                     else 'اس سبق کے ساتھ ابھی تصاویر منسلک نہیں۔ کورس کی تصویری لائبریری کھول کر صفحات اس موضوع سے منسلک کریں۔'), parent=self.root)
+            else:
+                messagebox.showinfo('No images imported' if APP_LANGUAGE == 'en' else 'تصاویر درآمد نہیں',
+                    ('Import the extracted image folder first.' if APP_LANGUAGE == 'en' else 'پہلے نکالا ہوا تصویری فولڈر درآمد کریں۔'), parent=self.root)
+            return
+        rows = [dict(r) for r in rows]
+        viewer = tk.Toplevel(self.root)
+        viewer.title(('Curriculum image library — ' if APP_LANGUAGE == 'en' else 'نصاب کی تصویری لائبریری — ') + lang['title'])
+        viewer.configure(bg=APP_BG)
+        sw, sh = viewer.winfo_screenwidth(), viewer.winfo_screenheight()
+        try: viewer.state('zoomed')
+        except tk.TclError: viewer.geometry(f'{max(900, sw-20)}x{max(650, sh-80)}+0+0')
+        viewer.minsize(min(800, sw), min(560, max(440, sh - 40)))
+
+        toolbar = tk.Frame(viewer, bg=CARD_BG, padx=8, pady=7, highlightbackground=BORDER, highlightthickness=1)
+        toolbar.pack(fill='x')
+        state = {'index': 0, 'zoom': 100, 'fit': True, 'photo': None, 'source_size': (0, 0), 'render_job': None}
+        page_var = tk.StringVar(value='1 / 1')
+        label = tk.Label(toolbar, text='', bg=CARD_BG, fg=DARK, font=(UI_FONT, 9, 'bold'), anchor='w')
+        label.pack(side='left', padx=(4, 8))
+        def tool_button(text, command, primary=False):
+            return tk.Button(toolbar, text=text, command=command, bg=GREEN if primary else '#F1F6F3',
+                fg=WHITE if primary else DARK, activebackground=GREEN_HOVER if primary else PALE,
+                activeforeground=WHITE if primary else GREEN, relief='flat', bd=0, padx=8, pady=5,
+                cursor='hand2', font=(UI_FONT, 9, 'bold'))
+        prev_btn = tool_button('‹' if APP_LANGUAGE == 'ur' else 'Previous', lambda: change_page(-1))
+        prev_btn.pack(side='left', padx=2)
+        next_btn = tool_button('اگلا' if APP_LANGUAGE == 'ur' else 'Next', lambda: change_page(1), primary=True)
+        next_btn.pack(side='left', padx=2)
+        tk.Label(toolbar, textvariable=page_var, bg=CARD_BG, fg=GREEN, font=(UI_FONT, 9, 'bold')).pack(side='left', padx=6)
+        tool_button('−', lambda: adjust_zoom(-10)).pack(side='left', padx=2)
+        zoom_var = tk.StringVar(value='Fit width' if APP_LANGUAGE == 'en' else 'پوری چوڑائی')
+        tk.Label(toolbar, textvariable=zoom_var, bg=CARD_BG, fg=GREEN, font=(UI_FONT, 9, 'bold'), width=10).pack(side='left', padx=3)
+        tool_button('+', lambda: adjust_zoom(10)).pack(side='left', padx=2)
+        tool_button('Fit width' if APP_LANGUAGE == 'en' else 'پوری چوڑائی', lambda: fit_width()).pack(side='left', padx=2)
+        collections = sorted({r['collection_name'] for r in rows}, key=self._curriculum_natural_key)
+        collection_display = [('All collections' if APP_LANGUAGE == 'en' else 'تمام مجموعے')] + collections
+        collection_var = tk.StringVar(value=collection_display[0])
+        if len(collection_display) > 1:
+            tk.Label(toolbar, text=('Collection' if APP_LANGUAGE == 'en' else 'مجموعہ'), bg=CARD_BG, fg=DARK, font=(UI_FONT, 9)).pack(side='left', padx=(5, 2))
+            collection_combo = ttk.Combobox(toolbar, textvariable=collection_var, values=collection_display, width=23, state='readonly')
+            collection_combo.pack(side='left', padx=2)
+        else:
+            collection_combo = None
+
+        body = tk.Frame(viewer, bg=APP_BG)
+        body.pack(fill='both', expand=True, padx=7, pady=7)
+        canvas = tk.Canvas(body, bg='#E7EEEA', highlightthickness=0, bd=0)
+        vbar = ttk.Scrollbar(body, orient='vertical', command=canvas.yview)
+        hbar = ttk.Scrollbar(body, orient='horizontal', command=canvas.xview)
+        canvas.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+        vbar.pack(side='right', fill='y'); hbar.pack(side='bottom', fill='x')
+        canvas.pack(side='left', fill='both', expand=True)
+
+        topic_bar = tk.Frame(viewer, bg=CARD_BG, padx=10, pady=7, highlightbackground=BORDER, highlightthickness=1)
+        topic_bar.pack(fill='x')
+        topic_values = [('-- Not linked to a topic --' if APP_LANGUAGE == 'en' else 'کسی موضوع سے منسلک نہیں')] + [f'{i+1:02d} · {u}' for i, u in enumerate(units)]
+        topic_var = tk.StringVar(value=topic_values[0])
+        tk.Label(topic_bar, text=('Link current page to topic' if APP_LANGUAGE == 'en' else 'موجودہ صفحہ موضوع سے منسلک کریں'), bg=CARD_BG, fg=DARK,
+                 font=(UI_FONT, 9, 'bold')).pack(side='left', padx=(2, 6))
+        can_manage_images = bool(self.user and self.user.get('role') == 'admin')
+        topic_combo = ttk.Combobox(topic_bar, textvariable=topic_var, values=topic_values, state='readonly' if can_manage_images else 'disabled', width=54)
+        topic_combo.pack(side='left', fill='x', expand=True, padx=4)
+        def select_topic_from_row():
+            row = current_row()
+            idx = row.get('topic_index') if row else None
+            topic_var.set(topic_values[0] if idx is None or not (0 <= int(idx) < len(units)) else topic_values[int(idx)+1])
+        def save_topic_link():
+            row = current_row()
+            if not row: return
+            try: idx = topic_values.index(topic_var.get()) - 1
+            except ValueError: idx = -1
+            idx = None if idx < 0 else idx
+            try:
+                self.db.conn.execute('UPDATE curriculum_image_assets SET topic_index=? WHERE id=?', (idx, row['id']))
+                self.db.conn.commit()
+                row['topic_index'] = idx
+                messagebox.showinfo('Saved' if APP_LANGUAGE == 'en' else 'محفوظ',
+                    'Topic link saved.' if APP_LANGUAGE == 'en' else 'صفحہ موضوع سے منسلک ہوگیا۔', parent=viewer)
+            except sqlite3.Error as exc:
+                messagebox.showerror('Could not save topic link' if APP_LANGUAGE == 'en' else 'موضوع محفوظ نہیں ہوا', str(exc), parent=viewer)
+        if can_manage_images:
+            tk.Button(topic_bar, text=('Save link' if APP_LANGUAGE == 'en' else 'منسلک کریں'), command=save_topic_link,
+                      bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER, relief='flat', padx=12, pady=6,
+                      cursor='hand2', font=(UI_FONT, 9, 'bold')).pack(side='left', padx=3)
+        def current_row():
+            return rows[state['index']] if rows and 0 <= state['index'] < len(rows) else None
+        def refresh_label():
+            row = current_row()
+            if not row: return
+            label.configure(text=f"{row['collection_name']}  ·  {row['original_name']}", wraplength=max(160, viewer.winfo_width() // 3))
+            page_var.set(f"{state['index'] + 1} / {len(rows)}")
+            select_topic_from_row()
+            prev_btn.configure(state='normal' if state['index'] > 0 else 'disabled')
+            next_btn.configure(state='normal' if state['index'] < len(rows)-1 else 'disabled')
+        def render_current(_event=None):
+            row = current_row()
+            if not row: return
+            try:
+                full_path = os.path.join(db_root, row['stored_relpath'])
+                with Image.open(full_path) as im:
+                    source = im.convert('RGB')
+                state['source_size'] = source.size
+                if state['fit']:
+                    avail = max(300, canvas.winfo_width() - 50)
+                    scale = min(3.0, max(0.15, avail / max(1.0, source.width)))
+                else:
+                    scale = max(0.15, min(3.0, state['zoom'] / 100.0))
+                w = max(1, int(source.width * scale)); h = max(1, int(source.height * scale))
+                if w > 6500 or h > 6500:
+                    cap = min(6500 / w, 6500 / h)
+                    w, h = max(1, int(w*cap)), max(1, int(h*cap))
+                resampling = getattr(getattr(Image, 'Resampling', Image), 'LANCZOS', Image.BICUBIC)
+                rendered = source.resize((w, h), resampling) if (w, h) != source.size else source
+                photo = ImageTk.PhotoImage(rendered)
+                canvas.delete('all')
+                x = max(12, (canvas.winfo_width() - w) // 2)
+                y = 12
+                canvas.create_image(x, y, image=photo, anchor='nw')
+                canvas._curriculum_image_photo = photo
+                state['photo'] = photo
+                canvas.configure(scrollregion=(0, 0, max(canvas.winfo_width(), x+w+12), y+h+12))
+                zoom_var.set(('Fit width' if APP_LANGUAGE == 'en' else 'پوری چوڑائی') if state['fit'] else f"{state['zoom']}%")
+                refresh_label()
+            except Exception as exc:
+                canvas.delete('all')
+                canvas.create_text(max(180, canvas.winfo_width()//2), 50,
+                    text=(f"Image could not be opened: {exc}" if APP_LANGUAGE == 'en' else f"تصویر نہیں کھل سکی: {exc}"),
+                    fill='#B42318', width=max(240, canvas.winfo_width()-30))
+        def change_page(delta):
+            state['index'] = max(0, min(len(rows)-1, state['index'] + int(delta)))
+            canvas.xview_moveto(0); canvas.yview_moveto(0)
+            render_current()
+        def adjust_zoom(delta):
+            if state['fit']:
+                try:
+                    row = current_row()
+                    with Image.open(os.path.join(db_root, row['stored_relpath'])) as im:
+                        width = max(300, canvas.winfo_width()-50)
+                        state['zoom'] = int(round(width / max(1, im.width) * 100))
+                except Exception: state['zoom'] = 100
+                state['fit'] = False
+            state['zoom'] = max(30, min(200, state['zoom'] + int(delta)))
+            render_current()
+        def fit_width():
+            state['fit'] = True
+            render_current()
+        def filter_collection(_event=None):
+            choice = collection_var.get()
+            if choice == collection_display[0]:
+                where = ' AND topic_index=?' if selected_topic is not None else ''
+                new_rows = self.db.conn.execute("SELECT * FROM curriculum_image_assets WHERE course_key=?" + where + " ORDER BY collection_name COLLATE NOCASE, page_order, original_name COLLATE NOCASE",
+                    (course_key, selected_topic) if selected_topic is not None else (course_key,)).fetchall()
+            else:
+                where = ' AND topic_index=?' if selected_topic is not None else ''
+                params = (course_key, choice, selected_topic) if selected_topic is not None else (course_key, choice)
+                new_rows = self.db.conn.execute("SELECT * FROM curriculum_image_assets WHERE course_key=? AND collection_name=?" + where + " ORDER BY page_order, original_name COLLATE NOCASE", params).fetchall()
+            rows[:] = [dict(r) for r in new_rows]
+            state['index'] = 0
+            if not rows:
+                canvas.delete('all')
+                canvas.create_text(max(180, canvas.winfo_width()//2), 50,
+                    text=('No images in this collection.' if APP_LANGUAGE == 'en' else 'اس مجموعے میں کوئی تصویر نہیں۔'), fill=MUTED)
+                page_var.set('0 / 0')
+                label.configure(text='')
+                return
+            render_current()
+        if collection_combo:
+            collection_combo.bind('<<ComboboxSelected>>', filter_collection)
+        def remove_collection():
+            if not (self.user and self.user.get('role') == 'admin'):
+                return
+            row = current_row()
+            if not row: return
+            coll = row['collection_name']
+            if not messagebox.askyesno('Remove collection?' if APP_LANGUAGE == 'en' else 'مجموعہ ہٹائیں؟',
+                (f"Remove all imported metadata and copied files for '{coll}'? Original source files will not be changed." if APP_LANGUAGE == 'en'
+                 else f"کیا '{coll}' کی درآمد شدہ معلومات اور نقل شدہ فائلیں ہٹا دیں؟ اصل فائلیں نہیں بدلیں گی۔"), parent=viewer):
+                return
+            try:
+                coll_rows = self.db.conn.execute('SELECT stored_relpath FROM curriculum_image_assets WHERE course_key=? AND collection_name=?', (course_key, coll)).fetchall()
+                self.db.conn.execute('DELETE FROM curriculum_image_assets WHERE course_key=? AND collection_name=?', (course_key, coll))
+                self.db.conn.commit()
+                for r in coll_rows:
+                    path = os.path.join(db_root, r['stored_relpath'])
+                    try:
+                        if os.path.isfile(path): os.remove(path)
+                    except OSError: pass
+                messagebox.showinfo('Removed' if APP_LANGUAGE == 'en' else 'ہٹا دیا گیا', 'Image collection removed.' if APP_LANGUAGE == 'en' else 'تصویری مجموعہ ہٹا دیا گیا۔', parent=viewer)
+                viewer.destroy()
+                if callable(getattr(self, 'dashboard', None)):
+                    # The course page can be refreshed by its own navigation action.
+                    pass
+            except sqlite3.Error as exc:
+                messagebox.showerror('Could not remove collection' if APP_LANGUAGE == 'en' else 'مجموعہ نہیں ہٹ سکا', str(exc), parent=viewer)
+        if can_manage_images:
+            tk.Button(topic_bar, text=('Remove collection' if APP_LANGUAGE == 'en' else 'مجموعہ حذف کریں'), command=remove_collection,
+                      bg='#FCE8E6', fg='#B42318', relief='flat', padx=10, pady=6, cursor='hand2',
+                      font=(UI_FONT, 9)).pack(side='right', padx=3)
+        tk.Button(topic_bar, text=('Open linked lesson' if APP_LANGUAGE == 'en' else 'منسلک سبق کھولیں'),
+                  command=lambda: self._open_curriculum_lesson(course_key, current_row().get('topic_index'))
+                      if current_row() and current_row().get('topic_index') is not None else messagebox.showinfo('Not linked', 'Link this page to a topic first.', parent=viewer),
+                  bg='#EAF4F0', fg=GREEN, relief='flat', padx=10, pady=6, cursor='hand2', font=(UI_FONT, 9)).pack(side='right', padx=3)
+        def on_resize(event):
+            if state['fit'] and event.widget is canvas:
+                if state['render_job']:
+                    try: viewer.after_cancel(state['render_job'])
+                    except tk.TclError: pass
+                state['render_job'] = viewer.after(100, render_current)
+        canvas.bind('<Configure>', on_resize)
+        render_current()
+        viewer.lift(); viewer.focus_force()
+
+    def _curriculum_import_bundled_noorani_pages(self, after_import=None):
+        """Import the supplied Noorani Qaida pages, retaining original image bytes.
+
+        Suggested links are based on visible section headings and ordered page groups;
+        administrators can change any page's topic from the image viewer.
+        """
+        if not (self.user and self.user.get("role") == "admin"):
+            messagebox.showerror("Permission denied" if APP_LANGUAGE == "en" else "اجازت نہیں",
+                "Only an administrator can import curriculum images." if APP_LANGUAGE == "en" else "نصاب کی تصاویر صرف ایڈمن درآمد کر سکتا ہے۔", parent=self.root)
+            return
+        if Image is None:
+            messagebox.showerror("Image support unavailable" if APP_LANGUAGE == "en" else "تصویری سہولت دستیاب نہیں",
+                "Pillow is required. Install it with: py -m pip install pillow" if APP_LANGUAGE == "en" else "تصاویر کے لیے Pillow درکار ہے۔", parent=self.root)
+            return
+        source_root = app_asset_path("curriculum_images", "Noorani_Qaida")
+        if not os.path.isdir(source_root):
+            messagebox.showerror("Book pages not found" if APP_LANGUAGE == "en" else "قاعدے کے صفحات نہیں ملے",
+                ("Extract the full software package and keep its assets/curriculum_images/Noorani_Qaida folder beside the Python file." if APP_LANGUAGE == "en"
+                 else "سافٹ ویئر کا مکمل پیکج Extract کریں اور assets/curriculum_images/Noorani_Qaida فولڈر Python فائل کے ساتھ برقرار رکھیں۔"), parent=self.root)
+            return
+        self._curriculum_table_ready()
+        files = []
+        for name in os.listdir(source_root):
+            if os.path.isfile(os.path.join(source_root, name)) and os.path.splitext(name)[1].casefold() in self._curriculum_image_extensions():
+                files.append(os.path.join(source_root, name))
+        files.sort(key=lambda p: self._curriculum_natural_key(os.path.basename(p)))
+        if not files:
+            messagebox.showwarning("No pages found" if APP_LANGUAGE == "en" else "صفحات نہیں ملے",
+                "The bundled Noorani Qaida folder is empty." if APP_LANGUAGE == "en" else "نورانی قاعدے کا تصویری فولڈر خالی ہے۔", parent=self.root)
+            return
+
+        # 0-based topic indexes in COURSE_CATALOG["Noorani Qaida"]; cover stays unlinked.
+        # These are suggested groupings; each link can be edited from the image viewer.
+        def suggested_topic(order):
+            if order == 1: return None                       # decorative cover
+            if order == 2: return 0                           # isolated letters / mufradat
+            if 3 <= order <= 5: return 1                      # murakkabat / connected forms
+            if 6 <= order <= 11: return 3                     # harakat introduction and practice
+            if 12 <= order <= 13: return 5                    # madd and leen patterns
+            if order == 14: return 8                           # huruf muqatta'at / revision
+            if order == 15: return 5                           # huroof-e-leen
+            if 16 <= order <= 18: return 3                    # further harakat practice
+            if 19 <= order <= 24: return 4                    # sukoon and connected reading practice
+            if 25 <= order <= 31: return 6                    # tashdeed and its practice
+            return 8                                           # final review / closing page
+
+        db_path = os.path.abspath(getattr(self.db, "path", PROJECT_DB))
+        db_root = os.path.dirname(db_path)
+        asset_root = self._curriculum_image_storage_root()
+        course_key = "Noorani Qaida"
+        collection_name = "Rangin Tajweedi Noorani Qaida"
+        source_tag = "__bundled_noorani_qaida_pages_v1__"
+        dest_dir = os.path.join(asset_root, self._curriculum_safe_slug(course_key), "bundled_noorani_qaida_v1")
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("Cannot create image library" if APP_LANGUAGE == "en" else "تصویری لائبریری نہیں بن سکی", str(exc), parent=self.root)
+            return
+
+        imported = skipped = failed = 0
+        copied_paths = []
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+        imported_by = (self.user or {}).get("username", "admin")
+        try:
+            self.db.conn.execute("SAVEPOINT bundled_noorani_import")
+            for order, source_path in enumerate(files, 1):
+                original_name = os.path.basename(source_path)
+                rel = original_name
+                topic_index = suggested_topic(order)
+                existing = self.db.conn.execute(
+                    "SELECT id FROM curriculum_image_assets WHERE course_key=? AND source_folder=? AND source_relpath=?",
+                    (course_key, source_tag, rel)).fetchone()
+                destination = os.path.join(dest_dir, original_name)
+                if existing:
+                    self.db.conn.execute("UPDATE curriculum_image_assets SET topic_index=?, page_order=? WHERE id=?",
+                                         (topic_index, order, existing["id"]))
+                    skipped += 1
+                    continue
+                try:
+                    with Image.open(source_path) as im:
+                        im.verify()
+                    if os.path.exists(destination):
+                        # Preserve existing file and choose a collision-safe filename.
+                        stem, extension = os.path.splitext(original_name)
+                        destination = os.path.join(dest_dir, f"{stem}_{secrets.token_hex(3)}{extension}")
+                    shutil.copy2(source_path, destination)
+                    copied_paths.append(destination)
+                    stored_rel = os.path.relpath(destination, db_root)
+                    self.db.conn.execute("""INSERT INTO curriculum_image_assets
+                        (course_key,collection_name,source_folder,source_relpath,original_name,stored_relpath,
+                         topic_index,page_order,imported_at,imported_by)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (course_key, collection_name, source_tag, rel, original_name, stored_rel,
+                         topic_index, order, stamp, imported_by))
+                    imported += 1
+                except Exception:
+                    failed += 1
+            self.db.conn.execute("RELEASE SAVEPOINT bundled_noorani_import")
+            self.db.conn.commit()
+        except Exception as exc:
+            try:
+                self.db.conn.execute("ROLLBACK TO SAVEPOINT bundled_noorani_import")
+                self.db.conn.execute("RELEASE SAVEPOINT bundled_noorani_import")
+                self.db.conn.commit()
+            except Exception:
+                pass
+            for path in copied_paths:
+                try:
+                    if os.path.isfile(path): os.remove(path)
+                except OSError:
+                    pass
+            messagebox.showerror("Import failed" if APP_LANGUAGE == "en" else "درآمد ناکام", str(exc), parent=self.root)
+            return
+        summary = (f"Imported {imported} pages; already present/updated {skipped}; unreadable {failed}.\n\nPages are copied unchanged into:\n{asset_root}" if APP_LANGUAGE == "en"
+                   else f"{imported} صفحات درآمد ہوئے؛ پہلے سے موجود/اپ ڈیٹ {skipped}؛ ناقابلِ مطالعہ {failed}۔\n\nتصاویر بغیر تبدیلی یہاں محفوظ ہیں:\n{asset_root}")
+        messagebox.showinfo("Import complete" if APP_LANGUAGE == "en" else "درآمد مکمل", summary, parent=self.root)
+        if callable(after_import):
+            try: after_import()
+            except Exception: pass
+
+    def _curriculum_full_30min_sections(self, course_key, unit_index, lang, topic, selected_hint):
+        """Return a student-facing, read-aloud lesson plus separate teacher-only notes.
+
+        The main lesson is written to be spoken directly to the child. It is not a
+        lesson plan telling the teacher what to say. Qur'anic text, dua wording,
+        translation and fiqh details are intentionally tied to the institution's
+        approved source rather than being invented here.
+        """
+        is_ur = lang == "ur"
+        course_data = CURRICULUM_DETAILED_CORES.get(course_key, [])
+        core_pair = course_data[unit_index] if 0 <= unit_index < len(course_data) else (
+            "This topic becomes easier when we understand its meaning, notice it in a trusted course example, and practise it carefully.",
+            "یہ موضوع تب آسان ہوتا ہے جب ہم اس کا مطلب سمجھیں، منظور شدہ نصابی مثال میں اسے پہچانیں اور احتیاط سے مشق کریں۔")
+        raw_core = core_pair[1 if is_ur else 0]
+
+        # Keep factual explanations from the curriculum notes; remove directions
+        # addressed to teachers so they cannot accidentally appear in the lecture.
+        if is_ur:
+            pieces = re.split(r'(?<=[۔！？؛])\s*', raw_core.strip())
+            instruction_markers = (
+                "سمجھائیں", "دکھائیں", "کروائیں", "بتائیں", "پہچنوائیں", "استاد ",
+                "بچے کو", "طالب علم سے", "منتخب کریں", "استعمال کریں", "پڑھائیں",
+                "نوٹ کریں", "واضح کریں", "پوچھیں", "توجہ دیں", "سکھائیں", "سنیں",
+                "موازنہ کروائیں", "آغاز کریں", "رکھیں", "مدنظر رکھیں", "درج کریں",
+                "تعارف دیں", "تصدیق کریں", "چیک کریں", "دہرائیں", "دکھا کر",
+                "کریں", "لیں", "دیں", "بنائیں", "سنائیں", "پڑھوائیں", "پڑھیں",
+                "کرو", "دیکھیں", "لگائیں", "رہنے دیں", "چاہیے کہ", "سمجھ کر"
+            )
+            facts = []
+            for sentence in pieces:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                # Some curriculum notes combine a teaching instruction and a useful
+                # definition in the same sentence (e.g. "Explain that ..."). Keep the
+                # learner-facing definition, not the teacher's command.
+                if any(m in sentence for m in ("سمجھائیں", "واضح کریں", "بتائیں", "سمجھائیں کہ")) and "کہ " in sentence:
+                    sentence = sentence.split("کہ ", 1)[1].strip()
+                if any(m in sentence for m in instruction_markers):
+                    continue
+                sentence = sentence.rstrip("؛;: ")
+                if sentence and sentence[-1] not in "۔.!؟?":
+                    sentence += "۔"
+                facts.append(sentence)
+            core_facts = "\n\n".join(facts)
+        else:
+            pieces = re.split(r'(?<=[.!?;])\s*', raw_core.strip())
+            instruction_patterns = (
+                r'^(focus|show|keep|teach|use|ask|explain|demonstrate|have the learner|model|compare|introduce|select|check|read|start|invite|state|review|listen|correct|point out|the teacher|let the learner|avoid|try to)\b',
+                r'\blearner should\b', r'\bteacher should\b'
+            )
+            facts = []
+            for sentence in pieces:
+                sentence = sentence.strip()
+                if not sentence:
+                    continue
+                if re.match(r'^(explain|teach|tell the learner)\s+that\s+', sentence, re.I):
+                    sentence = re.sub(r'^(explain|teach|tell the learner)\s+that\s+', '', sentence, flags=re.I)
+                if any(re.search(pat, sentence, re.I) for pat in instruction_patterns):
+                    continue
+                sentence = sentence.rstrip(";: ")
+                if sentence and sentence[-1] not in ".!?":
+                    sentence += "."
+                facts.append(sentence)
+            core_facts = "\n\n".join(facts)
+
+        if not core_facts:
+            core_facts = ("اس مہارت کو دیکھنے، صحیح طور پر پہچاننے اور خود استعمال کرنے سے مضبوطی ملتی ہے۔" if is_ur
+                          else "This skill grows stronger when you observe it, recognise it accurately, and use it independently.")
+
+        # Course-specific spoken explanations: the learner is addressed directly.
+        course_talk = {
+            "Noorani Qaida": {
+                "ur": "بیٹا، قاعدہ پڑھنے میں ہم جلدی نہیں کرتے۔ ہم پہلے دیکھتے ہیں کہ صفحے پر کیا لکھا ہے، پھر اس کی علامت یا حرف کو پہچانتے ہیں، آواز غور سے سنتے ہیں اور درست طور پر دہراتے ہیں۔ جب ایک چھوٹی مثال درست ہو جائے تو اگلی مثال کی طرف بڑھتے ہیں۔ ہر حرف کا نام بولنا اور اسے لفظ میں درست پڑھنا دو الگ مہارتیں ہیں؛ اس لیے ہم دونوں کی مشق کرتے ہیں۔",
+                "en": "In Qaida, we do not rush. First we look carefully at what is printed, identify the letter or sign, listen to its sound, and repeat it accurately. When one short example is secure, we move to the next. Naming a letter and reading it correctly inside a word are related but different skills, so we practise both."
+            },
+            "Qaida & Nazra Quran": {
+                "ur": "ناظرہ پڑھتے ہوئے ہماری کوشش صرف تیز پڑھنا نہیں، بلکہ درست پڑھنا اور لکھی ہوئی ترتیب قائم رکھنا ہے۔ ہم لفظ کو دائیں سے بائیں دیکھتے ہیں، حروف اور علامات کو نہیں چھوڑتے، اور جہاں مناسب وقف کی علامت ہو وہاں اپنے منظور شدہ مصحف کے مطابق پڑھتے ہیں۔ پہلے چھوٹا فقرہ صاف پڑھنا سیکھیں؛ پھر اسی فقرے کو بڑے حصے کے ساتھ ملائیں۔",
+                "en": "When reading the Quran, our goal is not speed alone. We want accuracy, the correct written order, and careful attention to signs. We read from right to left, do not skip letters or marks, and follow the stopping guidance in the Mushaf used by our school. First read a short phrase clearly, then connect it to the larger passage."
+            },
+            "Tajweed": {
+                "ur": "تجوید کا مقصد تلاوت کو درست بنانا ہے۔ ہر قاعدے کو نام سے یاد کرنا کافی نہیں؛ ہمیں یہ بھی پہچاننا ہوتا ہے کہ قاعدہ کہاں لاگو ہوتا ہے اور آواز میں کیا تبدیلی آتی ہے۔ ہم صرف اپنے منظور شدہ تجوید ماخذ اور درست قرأت کی مثال سے مشق کریں گے۔ قرآنی الفاظ اپنی طرف سے نہیں بنائیں گے اور نہ ہی صرف اندازے سے حکم لگائیں گے۔",
+                "en": "Tajweed helps us recite accurately. Memorising a rule's name is not enough: we also need to recognise where it applies and hear what changes in the sound. We will practise only with examples from our approved Tajweed reference and a reliable recitation. We will not invent Quranic wording or guess a rule without checking the example."
+            },
+            "Hifz-e-Quran": {
+                "ur": "حفظ میں صرف نیا حصہ یاد کرنا کافی نہیں۔ جو آج یاد کیا ہے اسے مضبوط کرنا، حالیہ سبق دہرانا اور پرانا محفوظ حصہ برقرار رکھنا بھی ضروری ہے۔ جب ہم چھوٹے حصے درست یاد کرتے ہیں، پھر انہیں مناسب ترتیب سے جوڑتے ہیں اور مختلف جگہوں سے سناتے ہیں تو یادداشت زیادہ پختہ ہوتی ہے۔ غلطی سامنے آئے تو پریشان ہونے کے بجائے اس مقام کی نشاندہی کرکے درست قرأت کے ساتھ دوبارہ مشق کریں۔",
+                "en": "In Hifz, learning a new portion is only one part of the work. We also strengthen today's lesson, revise recent portions, and maintain older memorisation. Small portions are easier to learn accurately; then we connect them in order and practise starting from different places. When a mistake appears, do not panic. Find the exact place, listen to the correct recitation, and practise that connection again."
+            },
+            "Islamiat": {
+                "ur": "اسلامیات میں ہم صرف معلومات یاد نہیں کرتے بلکہ یہ بھی سمجھتے ہیں کہ اچھی بات کو زندگی میں کیسے اپنایا جائے۔ ہم آج کے موضوع کو سادہ الفاظ میں سمجھیں گے، اپنی عمر کے مطابق مثالوں پر غور کریں گے اور دیکھیں گے کہ اس علم سے ہمارے رویّے اور فیصلوں میں کیا بہتری آ سکتی ہے۔ دینی معلومات کے لیے ہم اپنی منظور شدہ کتاب اور قابلِ اعتماد رہنمائی پر قائم رہیں گے۔",
+                "en": "In Islamiat, we do more than memorise facts. We also consider how good knowledge can guide everyday choices. We will explain today's topic in simple language, think about age-appropriate examples, and notice how the lesson can improve our behaviour and decisions. For religious details, we will rely on our approved course book and trusted guidance."
+            },
+            "Duas & Salah": {
+                "ur": "دعاؤں اور نماز میں درست الفاظ، ترتیب اور طریقہ اہم ہیں۔ ہم پہلے متعلقہ عمل یا دعا کا مقصد سمجھیں گے، پھر کتاب میں موجود اصل متن اور ادارے کے منظور شدہ طریقے کے مطابق مشق کریں گے۔ عربی الفاظ کو اپنی طرف سے بدلنا یا اندازے سے لکھنا درست نہیں۔ چھوٹے حصے بار بار صحیح پڑھنے سے پورا سبق آسانی سے یاد ہوتا ہے۔",
+                "en": "In Duas and Salah, the exact wording, order, and method matter. We will understand the purpose of the practice, then learn from the original text and the method approved by our school. We should not change Arabic words or guess their spelling. Repeating short parts accurately helps us learn the complete lesson with confidence."
+            },
+            "Quran Translation": {
+                "ur": "قرآن کا ترجمہ سمجھتے وقت ہم پہلے اصل عربی عبارت اور پھر منظور شدہ ترجمہ دیکھتے ہیں۔ ہر لفظ کا الگ مطلب جاننا مفید ہے، مگر پورا مفہوم الفاظ کے باہمی تعلق اور سیاق سے بھی بنتا ہے۔ اس لیے ہم کسی ایک لفظ سے پوری آیت کا مطلب خود سے طے نہیں کریں گے۔ جہاں وضاحت درکار ہو وہاں مقررہ ترجمے اور نصابی رہنمائی سے مدد لیں گے۔",
+                "en": "When studying Quran translation, we look at the original Arabic passage and then the approved translation. Knowing an individual word is useful, but the meaning of a phrase also depends on how its words relate to one another and on its context. We should not decide the meaning of a whole verse from one word alone. When we need clarification, we use the assigned translation and course guidance."
+            },
+            "Quran Understanding": {
+                "ur": "قرآن فہمی میں ہم آیت کو اس کے سیاق، منظور شدہ ترجمے اور معتبر تفسیری رہنمائی کے ساتھ سمجھتے ہیں۔ پہلے یہ دیکھتے ہیں کہ عبارت میں اصل بات کیا بیان ہوئی ہے؛ اس کے بعد اس سے ملنے والی عملی نصیحت پر غور کرتے ہیں۔ اپنی ذاتی سوچ کو آیت کا قطعی مطلب نہیں کہتے۔ اگر کوئی بات واضح نہ ہو تو سوال لکھ کر مستند رہنمائی حاصل کرتے ہیں۔",
+                "en": "To understand the Quran, we read a passage with its context, approved translation, and reliable explanation. First we identify what the passage actually says; then we reflect on an appropriate lesson for life. We do not present a personal thought as the definitive meaning of a verse. If something is unclear, we write down the question and seek trusted guidance."
+            }
+        }
+        course_intro = course_talk.get(course_key, course_talk["Islamiat"])[lang]
+
+        # Topic-aware spoken prompts add context without inventing scripture or rulings.
+        topic_extra_ur = {
+            "Noorani Qaida": [
+                "جب تم کسی حرف کو دیکھو تو تین باتیں الگ الگ پہچانو: اس کا نام کیا ہے، شکل کیسی ہے، اور اس کی آواز کیسے نکلتی ہے۔ مثال کے طور پر ب، ت اور ث کی بنیادی شکل ملتی جلتی ہے، مگر نقطوں کی تعداد اور جگہ مختلف ہے۔ اسی فرق کو دیکھ کر حرف پہچانو؛ جلدی میں صرف شکل کا اندازہ نہ لگاؤ۔",
+                "جب حرف لفظ کے شروع، درمیان یا آخر میں آئے تو اس کی شکل بدل سکتی ہے۔ اس کا مطلب یہ نہیں کہ وہ نیا حرف بن گیا۔ اصل شکل اور نقطوں کو پہچانو، پھر دیکھو کہ وہ اپنے ساتھ والے حرف سے جڑ رہا ہے یا نہیں۔ ہر حرف ہر طرف نہیں جڑتا، اس لیے اپنی قاعدے کی اصل مثال دیکھنا ضروری ہے۔",
+                "ہر آواز منہ کے ایک ہی حصے سے ادا نہیں ہوتی۔ بعض حروف میں حلق، بعض میں زبان اور بعض میں ہونٹ نمایاں کردار ادا کرتے ہیں۔ تم درست آواز سنو، پھر آہستہ نقل کرو۔ منہ پر زور لگانے یا چیخنے کی ضرورت نہیں؛ صاف سننا اور نرم انداز میں بار بار درست کوشش کرنا زیادہ مفید ہے۔",
+                "زبر، زیر اور پیش مختصر حرکات ہیں۔ اپنے قاعدے میں ایک ہی حرف کو ان تینوں علامتوں کے ساتھ دیکھو اور فرق سنو۔ پہلے علامت پہچانو، پھر مختصر آواز ادا کرو۔ حرکت کو بلاوجہ لمبا نہ کرو، کیونکہ مختصر حرکت اور مد ایک جیسی چیز نہیں۔",
+                "تنوین دوہری حرکت کی صورت میں آتی ہے، جبکہ سکون حرف پر حرکت نہ ہونے کو ظاہر کرتا ہے۔ یہ نشان ایک دوسرے کے متبادل نہیں۔ صفحے پر نشان غور سے دیکھو، پھر منظور شدہ مثال میں سنو کہ پڑھنے کی آواز کیسے بدلتی ہے۔ اضافی حرکت اپنی طرف سے نہ بڑھاؤ۔",
+                "مد وہاں ہوتا ہے جہاں قاعدہ آواز کھینچنے کا تقاضا کرے۔ معروف ابتدائی صورت میں زبر کے بعد الف، زیر کے بعد ساکن یا، اور پیش کے بعد ساکن واو کی مثالیں ملتی ہیں۔ ہر آواز کو لمبا کرنا درست نہیں؛ پہلے مد کی وجہ پہچانو، پھر مقررہ مقدار کے مطابق پڑھو۔",
+                "تشدید ایک اہم علامت ہے۔ اس کے ساتھ حرف کی ادائیگی کو کمزور یا غائب نہیں کرنا چاہیے، اور اس سے پہلے کوئی اضافی حرکت بھی خود سے نہیں لگانی۔ اپنی قاعدے کی اصل مثال دیکھو، درست آواز سنو اور پورا لفظ آہستہ پڑھ کر پھر معمول کی رفتار میں دہراؤ۔",
+                "لفظ پڑھنے کے لیے حروف کو لکھی ہوئی ترتیب میں ملایا جاتا ہے۔ پہلے حصوں کو پہچانو، پھر انہیں آہستہ ملاؤ، پھر پورا لفظ پڑھو۔ ہر حرف کا نام الگ الگ بولتے رہنے سے لفظ کی قرأت مکمل نہیں ہوتی؛ ہمیں اصل تحریر کو آواز میں درست بدلنا ہے۔",
+                "دہرائی سے معلوم ہوتا ہے کہ کون سی چیز تم خود کر سکتے ہو۔ آج پہلے پڑھے گئے حروف، جڑی شکلیں، حرکات، سکون، مد، تشدید اور مختصر الفاظ میں سے مختلف مثالیں دیکھو۔ جس مثال میں غلطی ہو اسے نشان لگا کر درست طریقے سے دوبارہ پڑھو۔ رفتار سے زیادہ درستگی اہم ہے۔"
+            ],
+            "Tajweed": [
+                "مخرج وہ جگہ ہے جہاں سے حرف کی آواز ادا ہوتی ہے، جبکہ صفت حرف کی آواز کی ایک خاص کیفیت بتاتی ہے۔ دونوں باتیں ایک جیسی نہیں۔ کسی حرف کی جگہ درست ہونے کے ساتھ اس کی صفت بھی درست ہونی چاہیے۔ ہم ہر قاعدہ معتبر تلاوت کی مثال سے پہچانیں گے اور ایک وقت میں ایک فرق سنیں گے۔",
+                "نون ساکن اور تنوین کے احکام میں بعد میں آنے والا حرف اہم ہوتا ہے۔ ان کے معروف احکام اظہار، ادغام، اقلاب اور اخفاء ہیں۔ ہر حکم کی پہچان اس کے اصول اور آنے والے حرف سے کی جاتی ہے؛ صرف نام یاد کرنا کافی نہیں۔ اپنی منظور شدہ تجوید کتاب کی مثال میں پہلے علامت دیکھو، پھر قاعدہ بتاؤ، پھر تلاوت سنو۔",
+                "میم ساکن کے احکام میں بعد والے حرف اور ادائیگی کے طریقے کو دیکھنا ہوتا ہے۔ معروف نام اخفاء شفوی، ادغام میمی اور اظہار شفوی ہیں۔ ان کی ادائیگی کو صرف نام سے نہیں سمجھا جا سکتا؛ درست مثال سننا اور اپنے مدرسے کے مقررہ ماخذ کے مطابق دہرانا ضروری ہے۔",
+                "غنہ ناک کی گونج کے ساتھ ادا ہونے والی آواز ہے اور ہر جگہ اپنی مرضی سے شامل نہیں کی جاتی۔ پہلے یہ پہچاننا ہوتا ہے کہ قاعدے کے مطابق غنہ کہاں ہے، پھر اس کی مقدار کو مستقل رکھنا ہوتا ہے۔ ضرورت سے زیادہ کھینچنا بھی درست ادائیگی نہیں۔",
+                "قلقلہ مخصوص حروف کے سکون کی صورت میں سنائی دینے والی قابو میں رہنے والی بازگشت ہے۔ عام ابتدائی مجموعہ ‘قطب جد’ کے نام سے یاد کیا جاتا ہے، لیکن صحیح اطلاق کے لیے اپنی کتاب میں مقررہ مثال اور قاعدہ دیکھنا ضروری ہے۔ آواز کو دھماکے یا اضافی حرکت میں تبدیل نہ کرو۔",
+                "مد کی مختلف اقسام میں مقدار اور سبب مختلف ہو سکتے ہیں۔ پہلے مدِ اصلی کو اپنی نصابی مثال سے سمجھو، پھر وہی قسم پڑھو جو تمہیں سکھائی گئی ہے۔ ہر جگہ ایک جیسی مقدار فرض نہ کرو اور نہ ہی آواز کو اپنی مرضی سے بڑھاؤ۔",
+                "راء اور لفظِ اللہ کے لام کی ادائیگی بعض صورتوں میں موٹی اور بعض صورتوں میں باریک ہوتی ہے۔ اس کا فیصلہ قاعدے اور سیاق سے ہوتا ہے، ذاتی پسند سے نہیں۔ اپنی منظور شدہ مثال میں متعلقہ حرکت اور آس پاس کے حروف پہچانو، پھر درست قرأت سن کر مشق کرو۔",
+                "وقف کا مطلب مناسب جگہ رکنا اور ابتدا کا مطلب درست مقام سے دوبارہ شروع کرنا ہے۔ صرف سانس لینا ہی کافی معیار نہیں؛ رکنے یا شروع کرنے سے مفہوم متاثر ہو سکتا ہے۔ اپنے مصحف کی علامات اور استاد کی منظور شدہ وضاحت کے مطابق جگہ منتخب کرو۔",
+                "عملی جائزے میں صرف روانی نہیں، قاعدے کی پہچان بھی اہم ہے۔ پہلے سے پڑھائے گئے قواعد میں سے کوئی مثال دیکھو، متعلقہ نشان پہچانو، قاعدہ بتاؤ اور پھر تلاوت میں اسے درست ادا کرو۔ اگر غلطی ہو تو اس کی جگہ معلوم کرکے درست نمونہ سنو اور اسی حصے کو دوبارہ پڑھو۔"
+            ],
+            "Hifz-e-Quran": [
+                "ہر طالب علم کی یادداشت، قرأت، روزانہ دستیاب وقت اور دہرائی کی عادت مختلف ہوتی ہے۔ اسی لیے حفظ کا منصوبہ تمہاری موجودہ استعداد کے مطابق ہونا چاہیے۔ دوسروں سے مقابلہ کرنے کے بجائے اپنی درستگی میں بہتری دیکھو۔ جو حصہ پختہ ہے اسے برقرار رکھو اور مشکل حصے کو چھوٹا کرکے مشق کرو۔",
+                "نیا سبق چھوٹے جملوں یا فقروں میں سیکھنا آسان ہوتا ہے۔ پہلے درست تلاوت غور سے سنو، متن پر نظر رکھو، مختصر حصہ دہراؤ، پھر اگلا حصہ سیکھ کر دونوں کو ملاؤ۔ جب تک چھوٹا حصہ درست نہ ہو، اسے جلدی میں بڑے حصے سے نہ جوڑو۔ قرآنی متن ہمیشہ مقررہ مصحف سے دیکھو۔",
+                "سبقی حال ہی میں یاد کیے ہوئے حصے کی دہرائی ہے۔ یہ تمہیں نئے سبق کے ساتھ پچھلے سبق کو بھی محفوظ رکھنے میں مدد دیتی ہے۔ اگر آج نیا سبق یاد ہو مگر پچھلا بھول جائے تو یادداشت کا توازن نہیں رہا۔ اس لیے مقررہ حالیہ حصے کو روزانہ یا طے شدہ معمول کے مطابق سناؤ۔",
+                "منزل پرانے محفوظ حصے کی دہرائی ہے۔ جو حصہ کئی دن پہلے یاد کیا تھا اسے بھی مضبوط رکھنے کے لیے بار بار واپس آنا ضروری ہے۔ ایک حقیقت پسندانہ مقدار مقرر کرو، باقاعدگی سے دہراؤ اور مشکل مقام کا نوٹ رکھو۔ منزل کا مقصد صرف جلد مکمل کرنا نہیں بلکہ پرانے حفظ کو محفوظ رکھنا ہے۔",
+                "حفظ کرتے وقت درست تلفظ بھی ساتھ ضروری ہے۔ اگر کوئی لفظ غلط طریقے سے بار بار یاد ہو جائے تو بعد میں اصلاح مشکل ہو سکتی ہے۔ اس لیے نئے حصے کو مضبوط یاد کرنے سے پہلے حروف، حرکات، مد اور پہلے سے سکھائے گئے قواعد کی تصدیق کرو۔ صحیح نمونہ سنو اور درست آواز کے ساتھ یاد کرو۔",
+                "روزانہ معمول میں نئے سبق، سبقی اور منزل کے لیے الگ وقت مقرر کرو۔ مختصر توجہ والے وقفے، پُرسکون جگہ اور واضح چھوٹا ہدف مدد دیتے ہیں۔ ایک ہی نشست میں بہت زیادہ مواد جمع کرنے کے بجائے تھوڑا مگر درست یاد کرنا بہتر ہے۔ اپنی کارکردگی دیکھ کر استاد کے ساتھ مقدار طے کرو۔",
+                "غلطیوں کا نوٹ تمہارا مددگار ہے، سزا نہیں۔ مثلاً اگر لفظ چھوٹا، ترتیب بدلی، ملتا جلتا لفظ آ گیا یا کسی جگہ رک گئے تو صرف اسی مقام کو درج کرو۔ پھر اسی مقام کو صحیح متن کے ساتھ مشق کرو۔ ہر ہفتے دیکھو کہ کون سی غلطی کم ہوئی اور کس مقام کو مزید دہرائی چاہیے۔",
+                "دورانی سماعت سے معلوم ہوتا ہے کہ حفظ وقت کے ساتھ برقرار ہے یا نہیں۔ صرف ابتدا سے سنانے کے بجائے کبھی مقررہ حصے کے دوسرے مقام سے بھی سنانے کی مشق ہو سکتی ہے، استاد کے طے کردہ طریقے کے مطابق۔ اگر تسلسل ٹوٹے تو گھبراؤ نہیں؛ متعلقہ ربط کو پہچانو، درست تلاوت سنو اور دوبارہ جوڑو۔"
+            ]
+        }
+        specific = topic_extra_ur.get(course_key, [])
+        if is_ur and unit_index < len(specific):
+            specific_text = specific[unit_index]
+        else:
+            specific_text = ""
+
+        # Tailored child-facing examples for the other course families. The lesson's
+        # core facts remain topic-specific, and sacred source wording is never invented.
+        if not specific_text:
+            if course_key == "Qaida & Nazra Quran":
+                specific_text = ("آج ہم اپنی مقررہ عبارت کو چھوٹے حصوں میں سمجھ کر پڑھنے کی مشق کریں گے۔ پہلے نظر سے حروف اور علامات تلاش کرو، پھر پورا لفظ یا فقرہ پڑھو، اور آخر میں اسے پچھلے حصے سے ملاؤ۔ جب کوئی جگہ مشکل لگے تو اندازہ نہ لگاؤ؛ اسی مقام پر واپس جا کر درست نمونہ سنو۔" if is_ur else "Today we will practise reading the assigned passage in small, meaningful parts. First locate the letters and signs, then read the whole word or phrase, and finally connect it to the previous part. When a place feels difficult, do not guess; return to that exact place and listen to a correct model.")
+            elif course_key == "Islamiat":
+                specific_text = ("آج کے موضوع کو روزمرہ زندگی سے جوڑ کر دیکھو۔ سوچو کہ گھر، کلاس یا دوستوں کے ساتھ ایسی کون سی صورت پیدا ہو سکتی ہے جہاں یہ بات کام آئے۔ ہم کسی شخص کا مذاق اڑائے بغیر اس کے عمل پر غور کریں گے اور دیکھیں گے کہ زیادہ درست، دیانت دار اور ذمہ دار انتخاب کون سا ہے۔ دینی تفصیل کے لیے اپنی مقررہ کتاب کی بات کو بنیاد بناؤ۔" if is_ur else "Connect today's topic to everyday life. Think of a situation at home, in class, or with friends where this lesson could help. We will consider actions without mocking a person and ask which choice is more truthful, fair, and responsible. For religious detail, use the explanation in your assigned course text.")
+            elif course_key == "Duas & Salah":
+                specific_text = ("ہم پہلے اصل کتاب میں دیے ہوئے الفاظ یا مرحلے کو دیکھیں گے۔ پھر اس کا مقصد اور ترتیب سمجھیں گے، چھوٹے حصے میں درست مشق کریں گے اور آخر میں پورا عمل دوبارہ دہرائیں گے۔ کسی دعا کے عربی الفاظ، نماز کی قرأت یا فقہی تفصیل کو اندازے سے تبدیل نہیں کرنا؛ اصل متن اور ادارے کا منظور شدہ طریقہ سامنے رکھنا ضروری ہے۔" if is_ur else "We will first look at the exact words or steps in the assigned book. Then we will understand their purpose and order, practise a short part accurately, and finally review the complete sequence. Never change Arabic dua wording, prayer recitation, or fiqh details by guesswork; keep the approved text and school method in view.")
+            elif course_key == "Quran Translation":
+                specific_text = ("ہم منتخب عبارت کے ہر ضروری لفظ کو اس کے آس پاس کے الفاظ کے ساتھ دیکھیں گے۔ پہلے منظور شدہ ترجمے میں لفظ کا مطلب تلاش کرو، پھر دیکھو کہ وہ فقرے میں کس طرح استعمال ہوا ہے۔ لفظ بہ لفظ مفہوم مدد دیتا ہے، مگر پوری آیت کا مطلب طے کرنے کے لیے عبارت اور سیاق دونوں کو سمجھنا ضروری ہے۔" if is_ur else "We will study each important word together with the words around it. First find the word's meaning in the approved translation, then notice how it is used in the phrase. Word-by-word work is helpful, but understanding a complete verse requires attention to both the phrase and its context.")
+            elif course_key == "Quran Understanding":
+                specific_text = ("ہم پہلے مقررہ عبارت کو منظور شدہ ترجمے کے ساتھ پڑھیں گے اور کہیں گے کہ متن میں واضح طور پر کیا بات موجود ہے۔ پھر اس سے متعلق عملی سبق پر غور کریں گے۔ یہ فرق یاد رکھو کہ آیت کا ثابت شدہ مفہوم ایک چیز ہے اور ہماری ذاتی سوچ یا مثال دوسری چیز۔ اگر تفصیل واضح نہ ہو تو سوال لکھو اور معتبر وضاحت حاصل کرو۔" if is_ur else "We will first read the assigned passage with its approved translation and identify what the text clearly says. Then we will consider an appropriate lesson for daily life. Remember that the established meaning of a verse is one thing, while our own reflection or example is another. If a detail is unclear, write down the question and seek a reliable explanation.")
+            elif course_key == "Tajweed":
+                specific_text = ("قاعدے کو صحیح طور پر سیکھنے کے لیے پہلے اس کی پہچان، پھر اس کا اطلاق اور پھر اپنی تلاوت کی سماعت ضروری ہے۔ ہم آج صرف وہی قواعد استعمال کریں گے جو پہلے سکھائے جا چکے ہیں یا اس سبق میں واضح کیے جا رہے ہیں۔ مثال کے الفاظ اصل تجوید کتاب یا منظور شدہ مصحف سے لیں گے، اپنی طرف سے قرآنی عبارت نہیں بنائیں گے۔" if is_ur else "To learn a rule accurately, first recognise it, then apply it, and then listen back to your recitation. Today we will use only rules already taught or clearly introduced in this lesson. Examples must come from the approved Tajweed book or Mushaf; we will not invent Quranic wording.")
+            else:
+                specific_text = ("آج ہم اس موضوع کو چھوٹے حصوں میں سمجھیں گے، پھر متعلقہ نصابی مثال میں اسے پہچانیں گے اور آخر میں خود کوشش کریں گے۔ درستگی کے لیے ہر بار ایک بات پر توجہ دو: پہلے پہچان، پھر ترتیب، پھر درست ادائیگی یا استعمال۔" if is_ur else "Today we will understand this topic in small parts, recognise it in the assigned course example, and then try it independently. To improve accurately, focus on one thing at a time: first recognition, then sequence, then correct performance or use.")
+
+        if is_ur:
+            heading_script = "بچے کو براہِ راست سنانے کے لیے مکمل سبق"
+            greeting = f"السلام علیکم! آج ہمارا سبق ‘{topic}’ ہے۔ اس سبق میں ہم مل کر اس بات کو سمجھیں گے کہ یہ موضوع کیا ہے، اسے پہچاننا کیوں ضروری ہے اور اسے درست طریقے سے کیسے استعمال کیا جاتا ہے۔ آرام سے پڑھو، غور سے سنو اور جہاں میں سوال کروں وہاں پہلے خود سوچ کر جواب دینے کی کوشش کرو۔ غلطی ہو جائے تو پریشان نہیں ہونا؛ غلطی سے ہمیں معلوم ہوتا ہے کہ کس حصے کی مزید مشق کرنی ہے۔"
+            transition = "\n\nاب اس بات کو ذرا تفصیل سے سمجھتے ہیں۔\n\n"
+            concept = (f"اس موضوع کی بنیادی بات یہ ہے کہ {topic} کو صرف نام سے یاد کرنا کافی نہیں۔ ہمیں اس کا مطلب سمجھنا، اس کی پہچان کی علامت دیکھنا اور درست مثال میں اسے استعمال کرنا بھی سیکھنا ہے۔\n\n{core_facts}\n\n{course_intro}\n\n{specific_text}")
+            example = ("\n\nاب اپنی متعلقہ قاعدے، مصحف یا منظور شدہ نصابی کتاب کا صفحہ سامنے رکھو۔ پہلے پورے صفحے کو ایک نظر دیکھو۔ پھر آج کے موضوع سے متعلق ایک چھوٹی مثال تلاش کرو۔ مثال کو دیکھتے ہوئے تین سوال اپنے ذہن میں رکھو: میں نے کیا دیکھا؟ یہ کس اصول یا معنی سے متعلق ہے؟ اور میں اسے درست طور پر کیسے بیان یا ادا کروں گا؟ اگر مثال قرآنی عبارت یا دعا سے متعلق ہے تو اصل الفاظ کتاب سے دیکھو؛ یادداشت سے کوئی لفظ نہ گھڑو۔")
+            explain = ("\n\nاب پہلی بار صرف سمجھنے کے لیے مثال دیکھو۔ دوسری بار اس کے اہم حصے کی طرف توجہ کرو۔ تیسری بار کوشش کرو کہ اسے اپنی زبان میں سمجھا سکو یا درست طریقے سے پڑھ سکو۔ اگر کوئی لفظ یا علامت مشکل لگے تو اسے الگ پہچانو، اس کا صحیح مطلب یا آواز معلوم کرو، پھر پوری مثال پر واپس آؤ۔ چھوٹے حصے کو درست کرنا اکثر پورے سبق کو آسان بنا دیتا ہے۔")
+            avoid = ("\n\nایک بات خاص طور پر یاد رکھو: جلدی کرنا، اندازہ لگانا اور مشکل حصے کو چھوڑ دینا سیکھنے میں مدد نہیں دیتا۔ بہتر طریقہ یہ ہے کہ مسئلے کی جگہ معلوم کرو، درست مثال دیکھو، ایک مرتبہ غور سے سنو یا پڑھو، اور پھر خود کوشش کرو۔ اگر تمہیں دو مثالوں میں فرق دکھائی دے تو صرف شکل یا آواز نہیں بلکہ وہ اصول بھی بتانے کی کوشش کرو جس سے فرق سمجھ آتا ہے۔")
+            interaction = ("\n\nچلو، اب ذرا سوچو اور جواب دو:\n\nپہلا سوال: آج کے موضوع کا بنیادی مطلب کیا ہے؟\nجواب دینے سے پہلے چند لمحے سوچو، پھر اپنے الفاظ میں بتاؤ۔\n\nدوسرا سوال: تم اسے اپنی کتاب یا آج کی مثال میں کہاں پہچان سکتے ہو؟\nمتعلقہ جگہ تلاش کرو اور وجہ بھی بتاؤ۔\n\nتیسرا سوال: اگر یہی موضوع ایک نئی مثال میں آئے تو تم سب سے پہلے کیا دیکھو گے؟\nاچھا جواب وہ ہے جس میں تم صرف نام نہ دہراؤ بلکہ اپنا طریقہ بھی بیان کرو۔\n\nچوتھا سوال: اس سبق میں کون سی غلطی ہو سکتی ہے؟\nاس غلطی کو درست کرنے کا ایک قدم بتاؤ۔")
+            practice = ("\n\nاب ہمارے ساتھ تین مرحلوں کی مشق کرو۔ پہلی مثال میں ہم مل کر متعلقہ چیز پہچانیں گے۔ دوسری مثال میں تم پہلے خود کوشش کرو، پھر اپنے جواب کو کتاب کے درست نمونے سے ملاؤ۔ تیسری مثال میں تم کوشش کرو کہ بغیر فوری مدد کے وہی اصول استعمال کر سکو۔ ہر کوشش کے بعد اپنی کامیابی کی ایک بات اور بہتری کی ایک بات بتاؤ۔ اگر یہ قرأت یا حفظ کا سبق ہے تو درست تلفظ اور ترتیب کو ترجیح دو؛ اگر یہ اسلامیات یا فہم کا سبق ہے تو جواب کو متن یا منظور شدہ کتاب کی بات سے جوڑو۔")
+            recap = (f"\n\nآج کے سبق ‘{topic}’ کا خلاصہ یہ ہے: پہلے موضوع کو سمجھو، پھر اس کی علامت یا اہم نکتہ پہچانو، پھر متعلقہ مثال میں درست طریقے سے استعمال کرو۔ جو حصہ آسان تھا اسے مضبوط رکھو اور جو حصہ مشکل لگا اسے الگ مشق کرو۔ یاد رکھو، اچھی تعلیم کا مطلب صرف تیزی سے جواب دینا نہیں، بلکہ سمجھ کر درست جواب دینا ہے۔ تم اگلی کلاس میں اسی علم کو نئی مثال کے ساتھ استعمال کرنے کی کوشش کرو گے۔")
+            script = greeting + transition + concept + example + explain + avoid + interaction + practice + recap
+            prompts = "بچے سے گفتگو اور جائزہ\n1. بچے کو جواب دینے کے لیے وقت دیں۔\n2. پہلے بچے کا جواب سنیں، پھر ضرورت ہو تو اصل کتاب یا مصحف کی طرف واپس جائیں۔\n3. قرآنی متن، دعا، تجوید، ترجمے یا شرعی حکم کی تصحیح ہمیشہ ادارے کے منظور شدہ مستند ماخذ سے کریں۔\n4. کامیابی نوٹ کریں: بچہ کیا خود سمجھا/پہچانا/ادا کر سکا، اور اگلی بار کیا دہرائی چاہیے۔"
+            practice_title = "ساتھ مل کر مشق کریں"
+            checks_title = "سبق کے آخر میں خود کو جانچو"
+            checks = (f"1. ‘{topic}’ کو اپنے الفاظ میں سمجھاؤ۔\n2. اپنی کتاب میں اس کی ایک مثال تلاش کرو۔\n3. مثال میں اہم علامت، ترتیب یا مفہوم کی نشاندہی کرو۔\n4. بتاؤ کہ ایک عام غلطی سے کیسے بچا جا سکتا ہے۔\n5. نئی مثال پر خود کوشش کرو اور پھر اپنے جواب کی تصدیق کرو۔")
+            homework_title = "گھر پر دہرائی"
+            homework = (f"آج کے موضوع ‘{topic}’ کی 10 سے 15 منٹ دہرائی کرو۔ اپنی منظور شدہ کتاب یا قاعدے سے تین مثالیں منتخب کرو: ایک آسان، ایک درمیانی اور ایک ایسی جس میں تمہیں تھوڑی محنت درکار ہو۔ ہر مثال کے ساتھ یہ بتاؤ کہ تم نے کیا پہچانا اور کیوں۔ قرآنی یا دعائیہ الفاظ اصل ماخذ سے ہی پڑھو۔ اگلی کلاس کے لیے ایک سوال بھی لکھ کر لاؤ۔")
+            teacher_note = "استاد کے لیے (بچے کو یہ حصہ نہ پڑھیں): یہ متن بچے سے براہِ راست مخاطب ہے، لیکن عملی مشق اور اصل مثالیں ادارے کے مقررہ قاعدے/مصحف/کتاب سے لیں۔ قرآنِ کریم، دعا، تجوید، ترجمہ، تفسیر یا فقہی مسئلے کے غیر تصدیق شدہ الفاظ/احکام شامل نہ کریں۔ 30 منٹ مکمل کرنے کے لیے بچے کو مثالیں ڈھونڈنے، پڑھنے، جواب دینے اور دہرائی کا مناسب وقت دیں۔"
+            labels = ["بچے کو سنانے کے لیے مکمل سبق", practice_title, checks_title, homework_title, "استاد کے لیے تصدیقی نوٹ (بچے کو نہ پڑھیں)"]
+            contents = [script, practice, checks, homework, teacher_note]
+        else:
+            heading_script = "Complete lesson script to read directly to the learner"
+            greeting = f"Assalamu alaikum! Today our lesson is ‘{topic}’. We will understand what this topic means, why it matters, and how to recognise or use it correctly. Read and listen calmly. When I ask a question, take a moment to think and try to answer in your own words. A mistake is not a reason to feel worried; it shows us which part needs more practice."
+            transition = "\n\nLet us understand the idea more carefully.\n\n"
+            concept = (f"The main point of ‘{topic}’ is not merely to remember its name. We need to understand its meaning, recognise its identifying feature, and use it correctly in an example.\n\n{core_facts}\n\n{course_intro}\n\n{specific_text}")
+            example = ("\n\nOpen the relevant page of your assigned Qaida, Mushaf, or approved course book. Look over the page once. Then find one short example connected to today's topic. Ask yourself three questions: What do I notice? Which rule or meaning does it connect to? How can I explain or perform it accurately? If the example concerns Quranic text or a dua, read the exact wording from the source; do not invent words from memory.")
+            explain = ("\n\nLook at the example once to understand it. Look again and focus on its important part. On the third try, explain it in your own words or read it carefully. If a word or sign feels difficult, identify it separately, confirm its correct meaning or sound, and then return to the complete example. Correcting a small part often makes the whole lesson easier.")
+            avoid = ("\n\nRemember this carefully: rushing, guessing, or skipping a difficult part does not help learning. Instead, locate the difficulty, check a correct example, listen or read carefully, and then try it yourself. If two examples look or sound different, do not only name the difference; also try to explain the principle that helps you recognise it.")
+            interaction = ("\n\nNow pause and think about these questions:\n\nQuestion one: What is the main idea of today's topic?\nTake a moment and explain it in your own words.\n\nQuestion two: Where can you recognise it in your book or today's example?\nFind the relevant place and explain why it fits.\n\nQuestion three: If the same idea appeared in a new example, what would you look for first?\nA strong answer explains your method, not only the topic's name.\n\nQuestion four: What is one possible mistake?\nDescribe one step that could help you correct it.")
+            practice = ("\n\nLet's practise in three stages. In the first example, we will identify the relevant feature together. In the second, try it yourself before checking your answer against the correct source. In the third, try to use the same principle with less help. After each try, name one thing you did well and one thing to improve. For recitation or memorisation, prioritise accurate pronunciation and order; for Islamiat or understanding, connect your answer to the approved text.")
+            recap = (f"\n\nHere is the summary of ‘{topic}’: first understand the idea, then recognise its important sign or point, and finally use it correctly in an example. Keep practising the part you already know and give extra attention to the part that was difficult. Good learning is not simply answering quickly; it is answering accurately and understanding why. In our next lesson, you will try to use this knowledge with a new example.")
+            script = greeting + transition + concept + example + explain + avoid + interaction + practice + recap
+            prompts = "Teacher-only check (do not read aloud):\n1. Give the learner time to answer.\n2. Listen first, then return to the approved source when clarification is needed.\n3. Verify Quranic text, duas, Tajweed, translation, tafsir and religious rulings from the institution's approved reliable source.\n4. Record what the learner could understand, recognise, or perform independently and what should be reviewed."
+            practice_title = "Guided practice together"
+            checks_title = "Check what you learned"
+            checks = (f"1. Explain ‘{topic}’ in your own words.\n2. Find an example in your course book.\n3. Identify the important sign, order, or meaning in that example.\n4. Describe one common mistake and how to avoid it.\n5. Try a new example independently, then check your answer.")
+            homework_title = "Home revision"
+            homework = (f"Spend 10–15 minutes reviewing ‘{topic}’. Choose three examples from your approved book or Qaida: one easy, one medium, and one that needs extra care. For each, explain what you recognised and why. Read Quranic or supplication wording only from the approved source. Bring one question to the next lesson.")
+            teacher_note = "For the teacher (do not read this part to the learner): the main script addresses the child directly. Use examples from the assigned Qaida/Mushaf/course text. Do not add unverified Quranic wording, dua text, Tajweed examples, translations, tafsir or fiqh rulings. Allow time for the learner to find examples, read, answer, practise, and revise so the session can fill about 30 minutes."
+            labels = ["Complete read-aloud lesson", practice_title, checks_title, homework_title, "Teacher verification note (do not read aloud)"]
+            contents = [script, practice, checks, homework, teacher_note]
+        # Keep a clear split: the large child-facing script first; short prompts and
+        # teacher-only verification note afterwards. Do not prepend instructor lesson plans.
+        return list(zip(labels, contents))
+
+    def _curriculum_lesson_guide(self, course_key, unit_index):
+        """Build a practical, bilingual teacher guide for one clickable syllabus topic."""
+        lang = "ur" if APP_LANGUAGE == "ur" else "en"
+        en_item = COURSE_CATALOG.get(course_key, {}).get("en", {})
+        ur_item = COURSE_CATALOG.get(course_key, {}).get("ur", {})
+        en_units = en_item.get("units", [])
+        ur_units = ur_item.get("units", [])
+        if not en_units or unit_index < 0 or unit_index >= len(en_units):
+            return None
+        topic_en = en_units[unit_index]
+        topic_ur = ur_units[unit_index] if unit_index < len(ur_units) else topic_en
+        topic = topic_ur if lang == "ur" else topic_en
+
+        # Topic-level prompts are deliberately instructional, not just definitions.
+        # Each entry gives a teachable focus, an activity, a check and home revision.
+        hints = [
+            (("letter recognition", "arabic letter"),
+             "Focus on identifying the letter by its shape and sound, not by guessing from a familiar word.",
+             "حرف کو شکل اور آواز سے پہچاننے پر توجہ دیں؛ صرف مانوس لفظ دیکھ کر اندازہ نہ لگانے دیں۔",
+             "Show a small group of letters in mixed order. Model each sound, then ask the learner to point to and say the named letter.",
+             "چند حروف مختلف ترتیب سے دکھائیں۔ ہر حرف کی آواز خود ادا کریں، پھر طالب علم سے متعلقہ حرف کی طرف اشارہ اور اس کا نام ادا کروائیں۔",
+             "Can the learner recognise the target letters in a new order without a prompt?",
+             "کیا طالب علم اشارے کے بغیر نئی ترتیب میں بھی مطلوبہ حروف پہچان سکتا ہے؟",
+             "Practise a short set of target letters for a few minutes, saying each sound carefully.",
+             "چند منٹ مطلوبہ حروف کی مختصر مشق کریں اور ہر آواز احتیاط سے ادا کریں۔"),
+            (("letter shapes", "beginning, middle", "connected forms"),
+             "Compare the same letter in isolated and connected positions. Emphasise which parts change and which identity remains.",
+             "ایک ہی حرف کی الگ اور جڑی ہوئی شکلوں کا موازنہ کروائیں۔ واضح کریں کہ کون سا حصہ بدلتا ہے اور حرف کی شناخت کیا رہتی ہے۔",
+             "Write one example of each position, point out the connection, and ask the learner to match the forms before reading a word.",
+             "ہر حالت کی ایک مثال لکھیں، حروف کے اتصال کی نشاندہی کریں، پھر لفظ پڑھنے سے پہلے طالب علم سے شکلیں ملانے کو کہیں۔",
+             "Give two unfamiliar combinations and ask the learner to identify the letter forms.",
+             "دو نئی ترکیبیں دے کر طالب علم سے حروف کی شکلیں پہچنوائیں۔",
+             "Review the same letter in two or three different positions from the learner's Qaida.",
+             "قاعدے سے اسی حرف کی دو یا تین مختلف حالتوں کی دہرائی کروائیں۔"),
+            (("makharij", "articulation", "sifaat"),
+             "Teach one sound at a time. Demonstrate the mouth or tongue position gently and contrast it with a commonly confused sound.",
+             "ایک وقت میں ایک آواز سکھائیں۔ منہ یا زبان کی جگہ نرمی سے دکھائیں اور اسے ملتی جلتی آواز سے الگ پہچنوائیں۔",
+             "Model the sound slowly, let the learner listen first, then repeat in short syllables and finally inside a word.",
+             "آواز آہستہ ادا کریں، پہلے طالب علم کو سنوائیں، پھر مختصر ترکیب میں دہرائیں اور آخر میں لفظ کے اندر مشق کروائیں۔",
+             "Listen for the specific target sound; correct one error at a time rather than interrupting every sound.",
+             "مخصوص آواز سنیں؛ ہر آواز پر روکنے کے بجائے ایک وقت میں ایک غلطی کی اصلاح کریں۔",
+             "Repeat a few teacher-selected examples slowly; stop if the learner becomes strained and resume gently.",
+             "استاد کی منتخب چند مثالیں آہستہ دہرائیں؛ اگر طالب علم پر دباؤ ہو تو وقفہ دے کر نرمی سے دوبارہ مشق کروائیں۔"),
+            (("harakat", "fatha", "kasra", "damma"),
+             "Connect each short vowel sign to its sound. Keep the letter constant while changing only the vowel so the difference is audible.",
+             "ہر حرکت کو اس کی آواز سے جوڑیں۔ حرف ایک ہی رکھ کر صرف حرکت بدلیں تاکہ فرق صاف سنائی دے۔",
+             "Model the same letter with Fatha, Kasra and Damma; have the learner read each, then identify the sign before reading.",
+             "ایک ہی حرف کو زبر، زیر اور پیش کے ساتھ پڑھ کر دکھائیں؛ طالب علم سے ہر صورت پڑھوائیں اور پھر آواز نکالنے سے پہلے حرکت پہچنوائیں۔",
+             "Show mixed examples and ask the learner to name the sign and read the sound accurately.",
+             "مختلف مثالیں دکھا کر حرکت کا نام اور درست آواز پوچھیں۔",
+             "Read a short teacher-selected line of vowelled examples, giving attention to accuracy rather than speed.",
+             "استاد کی منتخب حرکات والی مختصر سطر پڑھوائیں؛ رفتار کے بجائے درستگی پر توجہ دیں۔"),
+            (("tanween", "sukoon"),
+             "Explain what the written sign indicates in sound. Contrast a vowelled letter with a sakin letter and listen carefully to the end of the syllable.",
+             "سمجھائیں کہ علامت آواز میں کیا ظاہر کرتی ہے۔ حرکت والے حرف اور ساکن حرف کا فرق دکھائیں اور ہجے کے آخری حصے کو غور سے سنیں۔",
+             "Read a pair of examples aloud, point to the sign, then let the learner identify and practise the same pattern in the Qaida.",
+             "دو مثالیں بلند آواز سے پڑھیں، علامت کی طرف اشارہ کریں، پھر قاعدے میں یہی انداز پہچان کر مشق کروائیں۔",
+             "Ask the learner to point out the sign and read the whole combination without adding an extra vowel.",
+             "طالب علم سے علامت کی نشاندہی کروائیں اور اضافی حرکت لگائے بغیر پوری ترکیب پڑھوائیں۔",
+             "Practise a small number of examples and mark any pattern that needs to be repeated next lesson.",
+             "چند مثالوں کی مشق کریں اور جس انداز میں مزید دہرائی چاہیے اسے اگلے سبق کے لیے نوٹ کریں۔"),
+            (("madd", "stretching", "length"),
+             "Demonstrate a steady, rule-appropriate length. Teach the learner to recognise the cause of madd before trying to lengthen the sound.",
+             "قاعدے کے مطابق یکساں مقدار میں کھینچ کر دکھائیں۔ آواز کھینچنے سے پہلے مد کی وجہ پہچاننا سکھائیں۔",
+             "Model a short example, count the chosen beats consistently for that rule, and practise first in isolation then in a phrase.",
+             "مختصر مثال پڑھ کر دکھائیں، متعلقہ قاعدے کے مطابق مقدار یکساں رکھیں، پھر پہلے الگ اور بعد میں عبارت میں مشق کروائیں۔",
+             "Listen for both correct recognition and consistent duration; do not reward extra-long stretching by default.",
+             "مد کی درست پہچان اور یکساں مقدار دونوں سنیں؛ بلاوجہ زیادہ کھینچنے کو درست نہ سمجھیں۔",
+             "Review the assigned examples with the same measured pace used during the lesson.",
+             "سبق میں اختیار کی گئی مناسب مقدار کے ساتھ مقررہ مثالوں کی دہرائی کریں۔"),
+            (("tashdeed", "doubled sounds"),
+             "Show that the shaddah signals a strengthened/doubled consonant sound. Avoid inserting an unrelated vowel before it.",
+             "واضح کریں کہ تشدید حرف کی مضبوط/دوہری ادائیگی ظاہر کرتی ہے۔ اس سے پہلے غیر ضروری حرکت شامل نہ ہونے دیں۔",
+             "Compare one example with and without shaddah, model the complete syllable, then have the learner repeat it within the word.",
+             "ایک مثال تشدید کے ساتھ اور بغیر پڑھ کر فرق دکھائیں، مکمل ہجا ادا کریں، پھر لفظ کے اندر دہرائی کروائیں۔",
+             "Ask the learner to locate the shaddah and read the word without dropping or weakening the doubled sound.",
+             "طالب علم سے تشدید کی جگہ پہچنوائیں اور حرف کی قوت کم کیے بغیر لفظ پڑھوائیں۔",
+             "Practise a few marked words from the learner's lesson and bring one difficult example back for review.",
+             "سبق کے چند تشدید والے الفاظ کی مشق کریں اور مشکل مثال اگلی کلاس میں دہرائیں۔"),
+            (("joining letters", "word blending", "short words", "fluency"),
+             "Move from accurate parts to a complete word. Keep the learner from guessing by pointing to each written part in sequence.",
+             "درست چھوٹے حصوں سے مکمل لفظ تک جائیں۔ ہر حصے کی ترتیب وار نشاندہی کریں تاکہ طالب علم اندازہ لگا کر نہ پڑھے۔",
+             "Read the parts separately, blend them slowly, then reread the complete word at a natural pace.",
+             "پہلے حصے الگ پڑھیں، پھر آہستہ ملا کر پڑھیں، اس کے بعد مکمل لفظ مناسب رفتار سے دوبارہ پڑھوائیں۔",
+             "Use a new example to check whether the learner can blend independently, not only repeat after the teacher.",
+             "نئی مثال دے کر دیکھیں کہ طالب علم خود حروف ملا سکتا ہے یا صرف استاد کے پیچھے دہراتا ہے۔",
+             "Practise a short list of words, prioritising correct joining before speed.",
+             "الفاظ کی مختصر فہرست پڑھوائیں؛ رفتار سے پہلے درست اتصال کو ترجیح دیں۔"),
+            (("waqf", "stopping", "restarting", "ibtida"),
+             "Teach stopping signs from the approved Mushaf used by the school. Explain the difference between pausing and restarting with a suitable meaning.",
+             "مدرسے کے منظور شدہ مصحف میں موجود علاماتِ وقف سکھائیں۔ رکنے اور مناسب معنی کے ساتھ دوبارہ شروع کرنے کا فرق واضح کریں۔",
+             "Show a short passage, ask where the sign appears, model the stop and a suitable restart, then let the learner practise.",
+             "مختصر آیت دکھائیں، علامت کی جگہ پوچھیں، رکنے اور مناسب مقام سے شروع کرنے کا نمونہ دیں، پھر طالب علم سے مشق کروائیں۔",
+             "Ask the learner to explain the sign used in the example and demonstrate a safe stopping point under guidance.",
+             "طالب علم سے مثال میں استعمال ہونے والی علامت سمجھنے اور رہنمائی میں مناسب مقام پر رکنے کا مظاہرہ کرنے کو کہیں۔",
+             "Review only the stopping signs already taught; record unfamiliar signs for the next lesson.",
+             "صرف پہلے سے سکھائی گئی علامات کی دہرائی کروائیں؛ نامانوس علامات اگلے سبق کے لیے نوٹ کریں۔"),
+            (("noon sakin", "tanween rules"),
+             "Teach the rule by the letter that follows Noon Sakin or Tanween. Introduce one rule at a time and confirm the school's Tajweed reference.",
+             "نون ساکن یا تنوین کے بعد آنے والے حرف کی بنیاد پر حکم سکھائیں۔ ایک وقت میں ایک قاعدہ متعارف کریں اور مدرسے کے منظور شدہ تجوید ماخذ سے تصدیق کریں۔",
+             "State the rule, show its identifying pattern in a trusted example, model recitation, and ask the learner to highlight similar cases.",
+             "قاعدہ بیان کریں، معتبر مثال میں اس کی پہچان دکھائیں، تلاوت کا نمونہ دیں اور طالب علم سے ملتی مثالیں نشان زد کروائیں۔",
+             "Give a few mixed examples and ask the learner to name the rule and recite it with teacher feedback.",
+             "چند مختلف مثالیں دے کر حکم کا نام پوچھیں اور استاد کی اصلاح کے ساتھ پڑھوائیں۔",
+             "Review examples supplied or approved by the teacher rather than creating uncertain Quranic examples.",
+             "غیر یقینی قرآنی مثالیں خود بنانے کے بجائے استاد کی فراہم کردہ یا منظور شدہ مثالوں کی دہرائی کریں۔"),
+            (("meem sakin", "ghunnah", "qalqalah", "ra and laam", "madd types", "tajweed"),
+             "Present the rule with its recognition cue, a model from an approved recitation source, and a clear contrast with a common mistake.",
+             "قاعدے کو اس کی پہچان، منظور شدہ تلاوت کی مثال اور عام غلطی کے واضح فرق کے ساتھ سمجھائیں۔",
+             "Explain the cue, model the sound, let the learner identify it in a selected passage, then practise the passage in short sections.",
+             "پہچان سمجھائیں، آواز کا نمونہ دیں، منتخب عبارت میں قاعدہ تلاش کروائیں، پھر عبارت کو مختصر حصوں میں پڑھوائیں۔",
+             "Ask the learner to identify the rule before reciting; correct the rule application and sound separately.",
+             "تلاوت سے پہلے قاعدہ پہچنوائیں؛ قاعدے کے اطلاق اور آواز کی اصلاح الگ الگ کریں۔",
+             "Practise only the teacher-assigned examples and note which rule needs reinforcement.",
+             "صرف استاد کی مقرر کردہ مثالوں کی مشق کریں اور مزید تقویت کے لیے مطلوب قاعدہ نوٹ کریں۔"),
+            (("sabaq", "new lesson"),
+             "Keep the new portion small enough for accurate learning. Correct pronunciation before asking the learner to memorise a mistake.",
+             "نیا حصہ اتنا مختصر رکھیں کہ درست یاد ہو سکے۔ غلطی یاد ہونے سے پہلے تلفظ درست کروائیں۔",
+             "Teacher recites a short phrase, learner listens, repeats several times, links it to the previous phrase, then recites without prompting.",
+             "استاد مختصر فقرہ پڑھیں، طالب علم پہلے سنے، کئی بار دہرائے، اسے پچھلے فقرے سے جوڑے، پھر اشارے کے بغیر سنائے۔",
+             "Ask for a start from the middle and a link between phrases, not just a start-to-finish repetition.",
+             "صرف شروع سے آخر تک دہرانے کے بجائے درمیان سے آغاز اور فقروں کے درمیان ربط بھی چیک کریں۔",
+             "Follow the agreed daily amount and include a short, accurate revision before adding more.",
+             "طے شدہ روزانہ مقدار اپنائیں اور مزید سبق دینے سے پہلے مختصر مگر درست دہرائی کروائیں۔"),
+            (("sabqi", "recently memorised"),
+             "Review recent portions cumulatively so the learner retrieves them without rebuilding the whole lesson each time.",
+             "قریب کے محفوظ حصوں کو جمعی انداز میں دہرائیں تاکہ طالب علم ہر بار پورا سبق دوبارہ بنانے کے بجائے یاد سے سنائے۔",
+             "Mix the starting points, listen without reading along, then mark exact slips and repeat those links.",
+             "مختلف مقامات سے شروع کروائیں، ساتھ پڑھنے کے بجائے سنیں، پھر غلطی کی درست جگہ نوٹ کرکے وہ ربط دہرائیں۔",
+             "Check whether the learner can continue after a prompt at a difficult transition.",
+             "دیکھیں کہ مشکل مقام پر مختصر اشارے کے بعد طالب علم آگے جاری رکھ سکتا ہے یا نہیں۔",
+             "Revise the teacher-assigned recent portion once slowly and once from selected starting points.",
+             "استاد کی مقرر کردہ حالیہ منزل ایک بار آہستہ اور ایک بار مختلف آغاز سے دہرائیں۔"),
+            (("manzil", "older revision"),
+             "Use a sustainable long-term revision schedule and track weak passages; do not let new memorisation displace established revision.",
+             "پرانے حفظ کے لیے قابلِ عمل مستقل شیڈول بنائیں اور کمزور مقامات نوٹ کریں؛ نیا سبق پرانی دہرائی کی جگہ نہ لے۔",
+             "Choose a planned portion, listen for continuity and accuracy, mark weak transitions, and schedule them for the next revision cycle.",
+             "مقررہ حصہ منتخب کریں، تسلسل اور درستگی سنیں، کمزور مقامات نشان زد کریں اور اگلی دہرائی کے شیڈول میں شامل کریں۔",
+             "Ask the learner to begin at a few selected points and continue without verbal prompting.",
+             "چند منتخب مقامات سے شروع کروا کر بغیر زبانی اشارے کے تسلسل چیک کریں۔",
+             "Complete only the assigned revision quantity and report the passages that felt difficult.",
+             "صرف مقررہ دہرائی مکمل کریں اور مشکل محسوس ہونے والے مقامات کی اطلاع دیں۔"),
+            (("weekly review", "mistake log", "progress review", "assessment", "diagnostic"),
+             "Use a short baseline or review to identify what is secure and what needs practice. Keep the tone supportive and specific.",
+             "مختصر ابتدائی یا دورانی جائزے سے معلوم کریں کہ کیا پختہ ہے اور کس چیز کی مشق درکار ہے۔ لہجہ حوصلہ افزا اور واضح رکھیں۔",
+             "Check a small representative sample, record errors by type, choose one priority goal, and explain the next practice step.",
+             "چند نمائندہ مثالیں جانچیں، غلطیوں کی قسم نوٹ کریں، ایک ترجیحی ہدف چنیں اور اگلی مشق بتائیں۔",
+             "Can the learner perform the target without copying the teacher? Record one strength and one next step.",
+             "کیا طالب علم استاد کی نقل کیے بغیر مطلوبہ کام کر سکتا ہے؟ ایک خوبی اور اگلا ہدف نوٹ کریں۔",
+             "Revise the single priority area identified in class; avoid assigning too much at once.",
+             "کلاس میں شناخت کیے گئے ایک ترجیحی حصے کی دہرائی کریں؛ ایک ساتھ بہت زیادہ کام نہ دیں۔"),
+            (("beliefs", "articles of faith", "pillars of islam"),
+             "Present the key term in age-appropriate language, explain its meaning, and distinguish understanding from memorising a list only.",
+             "اہم اصطلاح عمر کے مطابق زبان میں بیان کریں، اس کا مفہوم سمجھائیں اور صرف فہرست یاد کرنے کو سمجھ بوجھ نہ سمجھیں۔",
+             "Ask what the learner already knows, teach one idea at a time, use a simple example, then invite the learner to explain it in their own words.",
+             "پہلے معلوم کریں کہ طالب علم کیا جانتا ہے، ایک وقت میں ایک خیال سکھائیں، سادہ مثال دیں، پھر اپنے الفاظ میں وضاحت کروائیں۔",
+             "Ask one meaning question and one everyday-life example question; correct gently using the school's approved material.",
+             "معنی سے متعلق ایک سوال اور روزمرہ مثال سے متعلق ایک سوال کریں؛ مدرسے کے منظور شدہ مواد سے نرمی کے ساتھ اصلاح کریں۔",
+             "Explain the concept to a family member in two or three sentences and bring one question next time.",
+             "یہ تصور گھر میں دو تین جملوں میں کسی فرد کو سمجھائیں اور اگلی کلاس کے لیے ایک سوال لائیں۔"),
+            (("seerah", "prophet", "prophets", "stories"),
+             "Teach a verified event or story with its context, then focus on the lesson rather than adding unverified dramatic details.",
+             "معتبر واقعہ یا قصہ اس کے سیاق سمیت پڑھائیں، پھر سبق پر توجہ دیں اور غیر مصدقہ تفصیلات شامل نہ کریں۔",
+             "Retell the event in sequence, ask who/what/why questions, and let the learner connect one lesson to a practical situation.",
+             "واقعہ ترتیب سے بیان کریں، کون/کیا/کیوں کے سوال کریں اور طالب علم سے ایک سبق کو عملی صورتِ حال سے جوڑوائیں۔",
+             "Ask the learner to summarise the event and state one lesson supported by the taught material.",
+             "طالب علم سے واقعے کا خلاصہ اور پڑھائے گئے مواد سے ثابت ایک سبق بیان کروائیں۔",
+             "Review the class notes and share one remembered lesson; use only the assigned reliable source.",
+             "کلاس کے نوٹس دہرائیں اور یاد رہنے والا ایک سبق بیان کریں؛ صرف مقررہ معتبر ماخذ استعمال کریں۔"),
+            (("manners", "honesty", "promises", "rights", "responsibilities", "character", "family", "neighbour"),
+             "Translate the principle into observable behaviour. Avoid vague advice by giving a realistic, age-appropriate scenario.",
+             "اصول کو ایسے عمل میں بدل کر سمجھائیں جسے دیکھا جا سکے۔ مبہم نصیحت کے بجائے عمر کے مطابق حقیقت پسندانہ مثال دیں۔",
+             "Present a scenario, ask what choices are possible, discuss likely effects on others, and role-play a respectful response.",
+             "ایک صورتِ حال پیش کریں، ممکنہ انتخاب پوچھیں، دوسروں پر اثرات پر بات کریں اور باادب جواب کی مشق کروائیں۔",
+             "Ask the learner to choose a helpful action in a new scenario and explain why it is responsible.",
+             "نئی صورتِ حال میں مناسب عمل منتخب کرنے اور اس کی وجہ بتانے کو کہیں۔",
+             "Practise one specific behaviour during the week and report what happened without shame or blame.",
+             "ہفتے میں ایک مخصوص اچھے عمل کی مشق کریں اور نتیجہ شرمندہ کیے بغیر بیان کریں۔"),
+            (("wudu", "purity", "cleanliness"),
+             "Teach the school's approved practical steps in sequence and explain the purpose of cleanliness using simple, careful language.",
+             "مدرسے کے منظور شدہ عملی مراحل ترتیب سے سکھائیں اور صفائی کا مقصد سادہ اور محتاط زبان میں سمجھائیں۔",
+             "Demonstrate one step at a time, ask the learner to repeat it, then have the learner perform the full sequence while you observe.",
+             "ایک وقت میں ایک مرحلہ دکھائیں، طالب علم سے دہرائیں، پھر پوری ترتیب خود ادا کروائیں اور مشاہدہ کریں۔",
+             "Check order and the specific details taught by the school's approved guide; correct privately and respectfully.",
+             "ترتیب اور مدرسے کے منظور شدہ رہنما میں سکھائی گئی تفصیلات چیک کریں؛ تنہائی اور احترام سے اصلاح کریں۔",
+             "Practise recalling the steps in order; follow the school's approved fiqh teaching if details differ.",
+             "مراحل کی ترتیب یاد کرنے کی مشق کریں؛ تفصیلات میں اختلاف ہو تو مدرسے کے منظور شدہ فقہی طریقے پر عمل کریں۔"),
+            (("salah", "prayer times", "prayer positions", "sequence", "recitations"),
+             "Use a clear demonstration and the school's approved prayer method. Separate sequence, physical movement and pronunciation checks.",
+             "واضح عملی نمونہ اور مدرسے کا منظور شدہ طریقۂ نماز استعمال کریں۔ ترتیب، جسمانی حرکت اور تلفظ الگ الگ چیک کریں۔",
+             "Model the target portion, narrate the sequence briefly, let the learner mirror it, then practise the recitation or movement again.",
+             "متعلقہ حصہ دکھائیں، ترتیب مختصر بتائیں، طالب علم سے نقل کروائیں، پھر قرأت یا حرکت دوبارہ مشق کروائیں۔",
+             "Ask the learner to show or explain the next step. Give one specific correction at a time.",
+             "طالب علم سے اگلا مرحلہ دکھانے یا بتانے کو کہیں۔ ایک وقت میں ایک واضح اصلاح کریں۔",
+             "Review the taught sequence with the school's approved guide or family supervision as appropriate.",
+             "مناسب صورت میں گھر کی نگرانی اور مدرسے کے منظور شدہ رہنما کے مطابق سکھائی گئی ترتیب دہرائیں۔"),
+            (("duas", "supplications", "remembrances", "azkar", "meanings and practical use"),
+             "Teach when the supplication is used, its approved wording and pronunciation, and its simple meaning; do not invent wording.",
+             "دعا کا موقع، اس کے منظور شدہ الفاظ، تلفظ اور سادہ معنی سکھائیں؛ اپنی طرف سے الفاظ نہ بنائیں۔",
+             "Model the approved text in small phrases, explain its context, let the learner repeat, then ask when it is used.",
+             "منظور شدہ متن مختصر فقروں میں پڑھیں، موقع سمجھائیں، طالب علم سے دہرائیں، پھر پوچھیں کہ دعا کب پڑھی جاتی ہے۔",
+             "Check the opening words, correct pronunciation and appropriate occasion, not memorisation alone.",
+             "ابتدائی الفاظ، درست تلفظ اور مناسب موقع چیک کریں؛ صرف زبانی یاد کرنا کافی نہ سمجھیں۔",
+             "Practise the assigned text with the approved source and explain its use to a family member.",
+             "منظور شدہ ماخذ سے مقررہ دعا کی مشق کریں اور گھر میں اس کا موقع سمجھائیں۔"),
+            (("common quranic words", "vocabulary", "word-by-word"),
+             "Use the school's approved translation/reference. Teach each selected word in context because one Arabic word may carry different meanings in different contexts.",
+             "مدرسے کا منظور شدہ ترجمہ/ماخذ استعمال کریں۔ ہر منتخب لفظ سیاق میں سکھائیں کیونکہ عربی لفظ کا مفہوم مختلف سیاق میں بدل سکتا ہے۔",
+             "Read the selected verse, mark the target words, give the approved simple meanings, then rebuild the whole phrase in natural Urdu or English.",
+             "منتخب آیت پڑھیں، مطلوبہ الفاظ نشان زد کریں، منظور شدہ سادہ معنی بتائیں، پھر پورے فقرے کا رواں مفہوم بنائیں۔",
+             "Ask for two target word meanings and the plain meaning of the whole phrase; do not judge from isolated word lists alone.",
+             "دو مطلوبہ الفاظ کے معنی اور پورے فقرے کا سادہ مفہوم پوچھیں؛ صرف الگ الفاظ کی فہرست پر فیصلہ نہ کریں۔",
+             "Review the assigned words in their original phrases and bring one confusing word for discussion.",
+             "مقررہ الفاظ کو اصل فقروں میں دہرائیں اور ایک مشکل لفظ اگلی گفتگو کے لیے نوٹ کریں۔"),
+            (("word patterns", "pronouns", "sentence structure"),
+             "Introduce only the grammar pattern needed for the selected passage. Keep grammar in service of understanding the verse.",
+             "منتخب آیت سمجھنے کے لیے جتنی صرف و نحو درکار ہو اتنی ہی متعارف کروائیں۔ قواعد کو آیت کے مفہوم کی خدمت میں رکھیں۔",
+             "Highlight the pattern or pronoun, identify its role using the approved teaching resource, then compare two short examples.",
+             "متعلقہ ساخت یا ضمیر نمایاں کریں، منظور شدہ تعلیمی ماخذ سے اس کا کردار سمجھائیں، پھر دو مختصر مثالوں کا موازنہ کریں۔",
+             "Ask the learner to locate the same pattern and explain how it helps the phrase make sense.",
+             "طالب علم سے یہی ساخت پہچنوانے اور سمجھانے کو کہیں کہ اس سے فقرہ سمجھنے میں کیا مدد ملتی ہے۔",
+             "Review the pattern in the assigned example rather than learning a long list without context.",
+             "سیاق کے بغیر لمبی فہرست یاد کرنے کے بجائے مقررہ مثال میں ساخت دہرائیں۔"),
+            (("context", "themes", "central theme", "related verses", "meaning of selected passages"),
+             "Start with the approved translation and the passage context. Separate the direct meaning, reliable tafsir and personal reflection.",
+             "منظور شدہ ترجمے اور آیات کے سیاق سے آغاز کریں۔ براہِ راست مفہوم، معتبر تفسیر اور ذاتی غوروفکر میں فرق رکھیں۔",
+             "Read the passage, ask what the surrounding verses add, identify the main theme from the approved source, then discuss one supported connection.",
+             "آیات پڑھیں، پوچھیں کہ ساتھ والی آیات کیا وضاحت کرتی ہیں، منظور شدہ ماخذ سے مرکزی موضوع چنیں، پھر ایک ثابت شدہ ربط پر گفتگو کریں۔",
+             "Ask the learner to state the main message and point to the source or verse that supports the answer.",
+             "طالب علم سے مرکزی پیغام بیان کروائیں اور وہ آیت یا ماخذ بتانے کو کہیں جو جواب کی تائید کرتا ہے۔",
+             "Write one sentence describing the main message and one respectful question to discuss next time.",
+             "مرکزی پیغام پر ایک جملہ اور اگلی کلاس کے لیے ایک مؤدبانہ سوال لکھیں۔"),
+            (("reflection journal", "discussion", "reflect", "creation"),
+             "Use reflection to encourage careful observation and ethical application, not to claim a definitive interpretation without a reliable source.",
+             "غوروفکر کے ذریعے مشاہدہ اور اخلاقی اطلاق پیدا کریں؛ معتبر ماخذ کے بغیر قطعی تفسیر کا دعویٰ نہ کریں۔",
+             "Read the selected material, invite evidence-based observations, distinguish what the text says from the learner's reflection, and capture one practical takeaway.",
+             "منتخب مواد پڑھیں، متن سے ثابت مشاہدات پوچھیں، آیت کے بیان اور طالب علم کے غوروفکر میں فرق کریں، پھر ایک عملی نتیجہ نوٹ کریں۔",
+             "Ask which point comes from the lesson source and which is the learner's personal reflection.",
+             "پوچھیں کہ کون سی بات سبق کے ماخذ سے ہے اور کون سی طالب علم کا اپنا غوروفکر ہے۔",
+             "Write one reflection linked to the studied theme and label it as a personal reflection.",
+             "پڑھے گئے موضوع سے متعلق ایک غوروفکر لکھیں اور اسے ذاتی تاثر کے طور پر واضح کریں۔"),
+        ]
+        selected_hint = None
+        source = (topic_en + " " + course_key).casefold()
+        for keywords, focus_en, focus_ur, activity_en, activity_ur, check_en, check_ur, home_en, home_ur in hints:
+            if any(k in source for k in keywords):
+                selected_hint = {
+                    "focus": focus_ur if lang == "ur" else focus_en,
+                    "activity": activity_ur if lang == "ur" else activity_en,
+                    "check": check_ur if lang == "ur" else check_en,
+                    "home": home_ur if lang == "ur" else home_en,
+                }
+                break
+        if selected_hint is None:
+            if course_key == "Noorani Qaida":
+                selected_hint = {"focus": "Build accurate recognition before increasing reading speed." if lang == "en" else "رفتار بڑھانے سے پہلے درست پہچان مضبوط کریں۔",
+                    "activity": "Model one example, practise it together, then try a new example independently." if lang == "en" else "ایک مثال دکھائیں، مل کر مشق کریں، پھر نئی مثال خود پڑھوائیں۔",
+                    "check": "Ask the learner to demonstrate the target without copying the teacher." if lang == "en" else "طالب علم سے استاد کی نقل کے بغیر مطلوبہ مہارت دکھانے کو کہیں۔",
+                    "home": "Practise a short teacher-assigned section accurately." if lang == "en" else "استاد کا مقررہ مختصر حصہ درستگی سے دہرائیں۔"}
+            else:
+                selected_hint = {"focus": "Teach the topic in small steps and relate each step to a reliable course source." if lang == "en" else "موضوع کو چھوٹے مراحل میں پڑھائیں اور ہر مرحلے کو معتبر نصابی ماخذ سے جوڑیں۔",
+                    "activity": "Explain briefly, model one example, practise together, then let the learner try independently." if lang == "en" else "مختصر وضاحت کریں، ایک مثال دکھائیں، مل کر مشق کریں، پھر طالب علم سے خود کوشش کروائیں۔",
+                    "check": "Ask the learner to explain or demonstrate the key point in their own words." if lang == "en" else "طالب علم سے اہم نکتہ اپنے الفاظ میں سمجھانے یا دکھانے کو کہیں۔",
+                    "home": "Review the assigned material and note one question for the next class." if lang == "en" else "مقررہ مواد دہرائیں اور اگلی کلاس کے لیے ایک سوال نوٹ کریں۔"}
+
+        # Teaching sequence and safeguarding notes are specific to each course family.
+        methods = {
+            "Noorani Qaida": {
+                "en": ["Review the previous sound or pattern for 2–3 minutes.", "Teacher models the new point slowly; learner listens before repeating.", "Practise together from easy examples to the target topic.", "Ask the learner to read a fresh example independently and correct one error at a time."],
+                "ur": ["دو تین منٹ پچھلی آواز یا ترکیب کی دہرائی کروائیں۔", "نیا نکتہ آہستہ نمونے کے طور پر پڑھیں؛ طالب علم پہلے سنے پھر دہرائے۔", "آسان مثالوں سے شروع کرکے مطلوبہ موضوع کی مشترکہ مشق کروائیں۔", "نئی مثال خود پڑھوائیں اور ایک وقت میں ایک غلطی کی اصلاح کریں۔"]},
+            "Qaida & Nazra Quran": {
+                "en": ["Listen to a short passage first and identify one or two priorities.", "Model correct reading with clear pacing and pauses.", "Read phrase by phrase together; learner then repeats without the model.", "Return to the full passage and note accuracy, fluency and stopping points."],
+                "ur": ["پہلے مختصر عبارت سنیں اور ایک دو ترجیحی اصلاحات شناخت کریں۔", "درست رفتار اور وقفوں کے ساتھ قرأت کا نمونہ دیں۔", "فقرہ بہ فقرہ مل کر پڑھیں، پھر طالب علم سے نمونے کے بغیر دہرائیں۔", "آخر میں پوری عبارت پڑھوا کر درستگی، روانی اور رکنے کی جگہیں نوٹ کریں۔"]},
+            "Tajweed": {
+                "en": ["Name the rule and its visible or audible recognition cue.", "Demonstrate the rule using an example from the school's approved Mushaf/recitation source.", "Have the learner find the same rule in a selected passage before reciting it.", "Listen to a short recitation, give one precise correction, then repeat the target example."],
+                "ur": ["قاعدے کا نام اور اس کی ظاہری یا صوتی پہچان بتائیں۔", "مدرسے کے منظور شدہ مصحف یا تلاوت کے ماخذ سے مثال دے کر قاعدہ دکھائیں۔", "تلاوت سے پہلے منتخب عبارت میں یہی قاعدہ تلاش کروائیں۔", "مختصر تلاوت سنیں، ایک واضح اصلاح دیں، پھر مطلوبہ مثال دوبارہ پڑھوائیں۔"]},
+            "Hifz-e-Quran": {
+                "en": ["Check the last lesson and agreed revision portion before adding new memorisation.", "Recite the new portion accurately; learner listens and repeats in short chunks.", "Link chunks and gradually remove prompts; correct pronunciation before consolidating memory.", "Test from a selected starting point and record the exact weak link for revision."],
+                "ur": ["نیا حفظ بڑھانے سے پہلے پچھلا سبق اور مقررہ دہرائی سنیں۔", "نیا حصہ درست پڑھیں؛ طالب علم پہلے سنے پھر چھوٹے حصوں میں دہرائے۔", "حصوں کو جوڑیں اور آہستہ آہستہ اشارے کم کریں؛ حفظ پختہ کرنے سے پہلے تلفظ درست کریں۔", "منتخب مقام سے سنا کر کمزور ربط نوٹ کریں تاکہ اسی کی دہرائی ہو۔"]},
+            "Islamiat": {
+                "en": ["Start with a short question to discover what the learner already knows.", "Explain one key idea in age-appropriate language using the approved teaching material.", "Use a practical scenario, story or role-play to connect the idea to everyday behaviour.", "Ask the learner to summarise the lesson and name one practical application."],
+                "ur": ["مختصر سوال سے معلوم کریں کہ طالب علم پہلے سے کیا جانتا ہے۔", "منظور شدہ نصابی مواد کے مطابق ایک بنیادی بات عمر کے مناسب انداز میں سمجھائیں۔", "روزمرہ عمل سے جوڑنے کے لیے عملی صورتِ حال، واقعہ یا کردار ادا کرنے کی مشق کریں۔", "طالب علم سے سبق کا خلاصہ اور ایک عملی اطلاق بیان کروائیں۔"]},
+            "Duas & Salah": {
+                "en": ["Tell the learner the purpose and context of the practice using the approved course guide.", "Demonstrate the step or wording clearly at a moderate pace.", "Let the learner imitate in small parts, then perform the full sequence.", "Check order, pronunciation and meaning; follow the school's approved fiqh method for details."],
+                "ur": ["منظور شدہ نصابی رہنما کے مطابق عمل کا مقصد اور موقع بتائیں۔", "متعلقہ مرحلہ یا الفاظ مناسب رفتار سے واضح طور پر دکھائیں۔", "طالب علم سے چھوٹے حصوں میں نقل کروائیں، پھر پوری ترتیب ادا کروائیں۔", "ترتیب، تلفظ اور معنی جانچیں؛ تفصیلات میں مدرسے کا منظور شدہ فقہی طریقہ اختیار کریں۔"]},
+            "Quran Translation": {
+                "en": ["Read the selected verse/passage and identify the lesson's approved translation source.", "Teach key vocabulary in context, then work through the phrase meaning.", "Rebuild the phrase into a clear natural-language meaning without adding unsupported interpretation.", "Ask the learner to explain the plain meaning and identify words that remain uncertain."],
+                "ur": ["منتخب آیت/عبارت پڑھیں اور سبق کے منظور شدہ ترجمے کا ماخذ واضح کریں۔", "اہم الفاظ سیاق میں سمجھائیں، پھر فقرے کے مفہوم پر کام کریں۔", "بغیر غیر ثابت شدہ تشریح شامل کیے فقرے کا سادہ اور رواں مفہوم بنائیں۔", "طالب علم سے سادہ مفہوم بیان کروائیں اور غیر واضح الفاظ نشان زد کریں۔"]},
+            "Quran Understanding": {
+                "en": ["Read the selected passage in context with an approved translation or tafsir reference.", "Identify the main message and supporting points that are actually present in the source.", "Discuss one age-appropriate reflection while distinguishing it from the verse's direct meaning.", "Invite a respectful summary and one practical application supported by the lesson."],
+                "ur": ["منظور شدہ ترجمے یا تفسیری ماخذ کے ساتھ منتخب آیات سیاق میں پڑھیں۔", "مرکزی پیغام اور ماخذ میں موجود معاون نکات شناخت کریں۔", "آیت کے براہِ راست مفہوم سے الگ رکھتے ہوئے عمر کے مطابق ایک غوروفکر پر بات کریں۔", "مؤدبانہ خلاصہ اور سبق سے تائید پانے والا ایک عملی اطلاق بیان کروائیں۔"]}
+        }
+        default_method = methods.get(course_key, methods["Islamiat"])[lang]
+        if lang == "ur":
+            labels = {"objective":"سبق کا مقصد", "materials":"درکار مواد", "steps":"کلاس میں پڑھانے کے مراحل", "focus":"اس موضوع کی خاص بات", "practice":"رہنمائی کے ساتھ مشق", "check":"فوری جائزہ", "home":"گھر کی دہرائی", "note":"استاد کے لیے اہم نوٹ", "duration":"تجویز کردہ وقت", "close":"بند کریں", "previous":"پچھلا موضوع", "next":"اگلا موضوع", "copy":"سبق کی ہدایات کاپی کریں", "copied":"سبق کی ہدایات کاپی ہو گئیں۔"}
+            objective = f"طالب علم اس سبق کے اختتام پر ‘{topic}’ کے بنیادی نکتے کو سمجھ/پہچان/ادا کر سکے اور استاد کی مختصر مدد کے بعد خود مشق کر سکے۔"
+            materials = "متعلقہ قاعدہ/قرآنِ کریم، مدرسے کا منظور شدہ نصابی ماخذ، اسکرین پر موجود سبق اور ضرورت کے مطابق وائٹ بورڈ یا نوٹ بک۔"
+            note = "یہ تدریسی رہنمائی ہے، مستند نصاب یا اہلِ علم کی رہنمائی کا متبادل نہیں۔ قرآنی متن، تجوید، ترجمہ، تفسیر اور فقہی تفصیلات کے لیے ادارے کا منظور شدہ ماخذ استعمال کریں؛ اختلافی جزئیات کو غیر مشروط حکم کے طور پر نہ پڑھائیں۔"
+            practice_prefix = "کلاس میں پہلے استاد نمونہ دے، پھر مل کر مشق ہو، اور آخر میں طالب علم بغیر نقل کیے کوشش کرے۔"
+            duration = "تقریباً 25–35 منٹ؛ طالب علم کی عمر، سطح اور توجہ کے مطابق بدلیں۔"
+        else:
+            labels = {"objective":"Lesson objective", "materials":"Materials to prepare", "steps":"Teaching sequence", "focus":"Topic-specific teaching focus", "practice":"Guided practice", "check":"Quick assessment", "home":"Home revision", "note":"Important teacher note", "duration":"Suggested duration", "close":"Close", "previous":"Previous topic", "next":"Next topic", "copy":"Copy lesson guide", "copied":"Lesson guide copied."}
+            objective = f"By the end of this lesson, the learner should understand or demonstrate the key point in “{topic}” and practise it independently after brief guidance."
+            materials = "The relevant Qaida/Quran passage, the school's approved course reference, this lesson guide, and a whiteboard or notebook if useful."
+            note = "This is a teaching aid, not a replacement for an approved syllabus or qualified instruction. Use the institution's approved references for Quranic text, Tajweed, translation, tafsir and fiqh; do not present disputed details as universal rulings."
+            practice_prefix = "Teacher models first, learner practises together with the teacher, then attempts the skill without copying."
+            duration = "About 25–35 minutes; adjust for the learner's age, level and attention."
+
+        steps = default_method
+        if lang == "ur":
+            sections = [(labels["objective"], objective), (labels["materials"], materials), (labels["steps"], "\n".join(f"{i}. {v}" for i, v in enumerate(steps, 1))),
+                        (labels["focus"], selected_hint["focus"]), (labels["practice"], practice_prefix + "\n" + selected_hint["activity"]),
+                        (labels["check"], selected_hint["check"]), (labels["home"], selected_hint["home"]),
+                        (labels["duration"], duration), (labels["note"], note)]
+        else:
+            sections = [(labels["objective"], objective), (labels["materials"], materials), (labels["steps"], "\n".join(f"{i}. {v}" for i, v in enumerate(steps, 1))),
+                        (labels["focus"], selected_hint["focus"]), (labels["practice"], practice_prefix + "\n" + selected_hint["activity"]),
+                        (labels["check"], selected_hint["check"]), (labels["home"], selected_hint["home"]),
+                        (labels["duration"], duration), (labels["note"], note)]
+        # Show the child-facing read-aloud script first, with separate practice and teacher-only notes.
+        sections = self._curriculum_full_30min_sections(course_key, unit_index, lang, topic, selected_hint)
+        return {"topic": topic, "course": (ur_item.get("title") if lang == "ur" else en_item.get("title")),
+                "sections": sections, "labels": labels, "lang": lang, "unit_index": unit_index,
+                "unit_count": max(len(en_units), len(ur_units)), "course_key": course_key}
+
+    def _open_curriculum_lesson(self, course_key, unit_index):
+        """Full-size lesson reader with paragraph-form text and body-only zoom.
+
+        Each paragraph is a separate native Tk Label with word wrapping enabled.
+        This preserves natural paragraph presentation; it does not render every line
+        as a separate widget. The label width is recalculated on resize/zoom, and
+        Urdu paragraphs are right-aligned using the selected Nastaleeq font.
+        """
+        guide = self._curriculum_lesson_guide(course_key, unit_index)
+        if not guide:
+            return
+        lang = guide.get("lang", "en")
+        is_urdu = lang == "ur"
+        base_family = URDU_FONT if is_urdu else UI_FONT
+        sections = list(guide.get("sections") or [])
+        if not sections:
+            sections = [("مکمل سبق" if is_urdu else "Full lesson",
+                         (f"اس سبق ‘{guide.get('topic', '')}’ کا متن دستیاب نہیں۔ براہِ کرم اس موضوع کے لیے نصابی مواد شامل کریں۔"
+                          if is_urdu else f"The lesson text for ‘{guide.get('topic', '')}’ is not available yet. Please add approved curriculum content for this topic."))]
+
+        win = tk.Toplevel(self.root)
+        win.title(("سبق کا مطالعہ" if is_urdu else "Lesson reader") + " — " + str(guide.get("topic", "")))
+        win.configure(bg=APP_BG)
+        win.resizable(True, True)
+        try:
+            win.transient(self.root)
+        except tk.TclError:
+            pass
+
+        titlebar = tk.Frame(win, bg=GREEN, padx=18, pady=7)
+        titlebar.pack(fill="x")
+        titlebar.grid_columnconfigure(0, weight=1)
+        tk.Label(titlebar, text=guide.get("topic", ""), bg=GREEN, fg=WHITE,
+                 font=(base_family, 15 if is_urdu else 13, "bold"),
+                 anchor="e" if is_urdu else "w", justify="right" if is_urdu else "left"
+                 ).grid(row=0, column=0, sticky="ew")
+        meta = (f"{guide.get('course', '')}  •  سبق {unit_index + 1} / {guide.get('unit_count', len(sections))}" if is_urdu
+                else f"{guide.get('course', '')}  •  Topic {unit_index + 1} of {guide.get('unit_count', len(sections))}")
+        tk.Label(titlebar, text=meta, bg=GREEN, fg="#E7F3EE", font=(base_family, 9),
+                 anchor="e" if is_urdu else "w", justify="right" if is_urdu else "left"
+                 ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
+
+        # The previous 130% English / 150% Urdu baseline is now 100%.
+        baseline = 1.5 if is_urdu else 1.3
+        base_points = (15 if is_urdu else 13) * baseline
+        body_font = tkfont.Font(root=win, family=base_family, size=int(round(base_points)))
+        zoom_state = {"percent": 100, "syncing": False, "render_after": None}
+        zoom_pct = tk.StringVar(value="100%")
+        slider_value = tk.DoubleVar(value=100.0)
+
+        toolbar = tk.Frame(win, bg=CARD_BG, padx=8, pady=4,
+                           highlightbackground=BORDER, highlightthickness=1)
+        toolbar.pack(fill="x")
+        tk.Label(toolbar, text=("متن کا سائز" if is_urdu else "Text size"), bg=CARD_BG, fg=DARK,
+                 font=(base_family, 9, "bold")).pack(side="left", padx=(2, 6))
+
+        def btn(parent, label, command, primary=False):
+            return tk.Button(parent, text=label, command=command,
+                             bg=GREEN if primary else "#F1F6F3", fg=WHITE if primary else DARK,
+                             activebackground=GREEN_HOVER if primary else PALE,
+                             activeforeground=WHITE if primary else GREEN,
+                             relief="flat", bd=0, padx=9, pady=3, cursor="hand2",
+                             font=(UI_FONT, 9, "bold"))
+
+        btn(toolbar, "A−", lambda: set_zoom(zoom_state["percent"] - 10)).pack(side="left", padx=2)
+        tk.Label(toolbar, textvariable=zoom_pct, bg=CARD_BG, fg=GREEN,
+                 font=(UI_FONT, 9, "bold"), width=5).pack(side="left", padx=3)
+        tk.Label(toolbar, text="60%", bg=CARD_BG, fg=MUTED, font=(UI_FONT, 8)).pack(side="left", padx=(5, 1))
+        slider = ttk.Scale(toolbar, from_=60, to=200, orient="horizontal", variable=slider_value,
+                           command=lambda v: set_zoom(v) if not zoom_state["syncing"] else None)
+        slider.pack(side="left", fill="x", expand=True, padx=4)
+        tk.Label(toolbar, text="200%", bg=CARD_BG, fg=MUTED, font=(UI_FONT, 8)).pack(side="left", padx=(1, 5))
+        btn(toolbar, "A+", lambda: set_zoom(zoom_state["percent"] + 10), primary=True).pack(side="left", padx=2)
+        btn(toolbar, ("ڈیفالٹ" if is_urdu else "Default"), lambda: set_zoom(100)).pack(side="left", padx=3)
+
+        outer = tk.Frame(win, bg=APP_BG, padx=5, pady=4)
+        outer.pack(fill="both", expand=True)
+        section_bar = tk.Frame(outer, bg=APP_BG)
+        section_bar.pack(fill="x", pady=(0, 3))
+        reader_area = tk.Frame(outer, bg=CARD_BG, highlightthickness=1, highlightbackground=BORDER)
+        reader_area.pack(fill="both", expand=True)
+        reader_area.grid_rowconfigure(0, weight=1)
+        reader_area.grid_columnconfigure(0, weight=1)
+        reader = tk.Canvas(reader_area, bg=CARD_BG, highlightthickness=0, bd=0, relief="flat")
+        ybar = ttk.Scrollbar(reader_area, orient="vertical", command=reader.yview)
+        reader.configure(yscrollcommand=ybar.set)
+        reader.grid(row=0, column=0, sticky="nsew")
+        ybar.grid(row=0, column=1, sticky="ns")
+        reader_content = tk.Frame(reader, bg=CARD_BG, bd=0, highlightthickness=0)
+        reader_window = reader.create_window((0, 0), window=reader_content, anchor="nw")
+        reader_content.grid_columnconfigure(0, weight=1)
+
+        selected_section = {"index": 0}
+        current_body = {"text": ""}
+        section_buttons = []
+        render_pending = {"job": None}
+        fallback_labels = {
+            "ur": ["مکمل سبق", "مشق", "سوالات", "گھر کا کام", "استاد کے نوٹس"],
+            "en": ["Full lesson", "Practice", "Questions", "Home revision", "Teacher notes"],
+        }[lang]
+
+        def split_paragraphs(text):
+            """Keep the lesson in natural paragraph blocks, not individual line widgets."""
+            raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+            if not raw:
+                return []
+            # Blank lines mark paragraph boundaries. Single newlines inside a paragraph
+            # become spaces so Tk can reflow the paragraph as the zoom changes.
+            blocks = re.split(r"\n[ \t]*\n+", raw)
+            paragraphs = []
+            for block in blocks:
+                clean = re.sub(r"\s*\n\s*", " ", block).strip()
+                if clean:
+                    paragraphs.append(clean)
+                else:
+                    paragraphs.append("")
+            return paragraphs
+
+        # Pillow's RAQM layout engine applies Unicode bidirectional ordering and
+        # Arabic/Urdu shaping together. Native Tk Label wraps Urdu glyphs, but on
+        # some Tk/Windows combinations it can visually interleave RTL runs within
+        # one line. Render Urdu paragraph blocks with RAQM into crisp images while
+        # keeping the original logical text in `sections` for copy/search purposes.
+        bidi_font_cache = {}
+        image_ref_state = {"items": []}
+
+        def _pillow_font_path(family):
+            """Find the real font file used for Urdu rendering (prefer Nastaleeq)."""
+            candidates = []
+            for p in list(_FONT_RESOURCES or []):
+                if os.path.isfile(p):
+                    candidates.append(p)
+            candidates.extend([
+                app_asset_path("assets", "fonts", "Jameel Noori Nastaleeq Regular.ttf"),
+                app_asset_path("assets", "fonts", "Jameel Noori Nastaleeq.ttf"),
+                app_asset_path("assets", "fonts", "Aptos.ttf"),
+            ])
+            if sys.platform == "win32":
+                # The font can be privately bundled or installed system-wide.
+                windir = os.environ.get("WINDIR", r"C:\\Windows")
+                font_dir = os.path.join(windir, "Fonts")
+                wanted = str(family or URDU_FONT).casefold()
+                try:
+                    import winreg
+                    registry_paths = [
+                        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"),
+                        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Fonts"),
+                    ]
+                    for hive, keypath in registry_paths:
+                        try:
+                            with winreg.OpenKey(hive, keypath) as key:
+                                for i in range(winreg.QueryInfoKey(key)[1]):
+                                    name, value, _typ = winreg.EnumValue(key, i)
+                                    name_l = str(name).casefold()
+                                    if any(mark in name_l for mark in ("jameel", "nastaleeq", "nastaliq", "urdu", wanted)):
+                                        value_path = str(value)
+                                        if not os.path.isabs(value_path):
+                                            value_path = os.path.join(font_dir, value_path)
+                                        candidates.insert(0, value_path)
+                        except OSError:
+                            continue
+                except Exception:
+                    pass
+                candidates.extend([
+                    os.path.join(font_dir, "Jameel Noori Nastaleeq Regular.ttf"),
+                    os.path.join(font_dir, "Jameel Noori Nastaleeq.ttf"),
+                    os.path.join(font_dir, "NotoNastaliqUrdu-Regular.ttf"),
+                    os.path.join(font_dir, "NotoNaskhArabic-Regular.ttf"),
+                    os.path.join(font_dir, "arial.ttf"),
+                ])
+            else:
+                candidates.extend([
+                    "/usr/share/fonts/truetype/noto/NotoNastaliqUrdu-Regular.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Regular.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf",
+                    "/usr/share/fonts/truetype/freefont/FreeSerif.ttf",
+                ])
+            # Prefer Jameel/Nastaleeq paths rather than whichever font loaded first.
+            existing = []
+            seen = set()
+            for p in candidates:
+                if p and os.path.isfile(p) and os.path.abspath(p).lower() not in seen:
+                    seen.add(os.path.abspath(p).lower())
+                    existing.append(p)
+            for p in existing:
+                name = os.path.basename(p).casefold()
+                if any(x in name for x in ("jameel", "nastaleeq", "nastaliq", "noto", "freeserif")):
+                    return p
+            return existing[0] if existing else None
+
+        def _get_raqm_font():
+            if ImageFont is None or PILFeatures is None:
+                return None
+            try:
+                if not PILFeatures.check_feature("raqm"):
+                    return None
+            except Exception:
+                return None
+            size_tk = int(body_font.cget("size"))
+            key = (size_tk, URDU_FONT)
+            if key in bidi_font_cache:
+                return bidi_font_cache[key]
+            # Tk font sizes are points; PIL wants pixels. This keeps the new image
+            # renderer visually close to the size the user already selected.
+            try:
+                px = max(10, int(round(win.winfo_fpixels(f"{size_tk}p"))))
+            except Exception:
+                px = max(10, int(round(size_tk * 1.30)))
+            path = _pillow_font_path(URDU_FONT)
+            font = None
+            if path:
+                try:
+                    font = ImageFont.truetype(path, px, layout_engine=ImageFont.Layout.RAQM)
+                except Exception:
+                    font = None
+            if font is None:
+                # Last-resort font: still shape correctly and preserve bidi order.
+                try:
+                    font = ImageFont.truetype("arial.ttf", px, layout_engine=ImageFont.Layout.RAQM)
+                except Exception:
+                    return None
+            bidi_font_cache[key] = font
+            return font
+
+        def _render_windows_gdi_paragraph(paragraph, image_width):
+            """Render Urdu with Windows Uniscribe/GDI when available.
+
+            This is deliberately the primary Windows path. Some Windows Tk builds
+            shape Arabic letters but do not keep RTL runs in correct order while
+            wrapping a long paragraph. DrawTextW uses the Windows text layout stack
+            for shaping, bidi ordering, and word wrapping before the result is put
+            into a bitmap; Tk then only displays the bitmap and cannot reorder it.
+            """
+            if sys.platform != "win32" or Image is None:
+                return None
+            hdc = hfont = old_font = hbitmap = old_bitmap = None
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                user32 = ctypes.WinDLL("user32", use_last_error=True)
+                gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+
+                class RECT(ctypes.Structure):
+                    _fields_ = [("left", wintypes.LONG), ("top", wintypes.LONG),
+                                ("right", wintypes.LONG), ("bottom", wintypes.LONG)]
+
+                class BITMAPINFOHEADER(ctypes.Structure):
+                    _fields_ = [
+                        ("biSize", wintypes.DWORD), ("biWidth", wintypes.LONG),
+                        ("biHeight", wintypes.LONG), ("biPlanes", wintypes.WORD),
+                        ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                        ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", wintypes.LONG),
+                        ("biYPelsPerMeter", wintypes.LONG), ("biClrUsed", wintypes.DWORD),
+                        ("biClrImportant", wintypes.DWORD),
+                    ]
+
+                class RGBQUAD(ctypes.Structure):
+                    _fields_ = [("rgbBlue", ctypes.c_ubyte), ("rgbGreen", ctypes.c_ubyte),
+                                ("rgbRed", ctypes.c_ubyte), ("rgbReserved", ctypes.c_ubyte)]
+
+                class BITMAPINFO(ctypes.Structure):
+                    _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", RGBQUAD * 1)]
+
+                hdc_type = wintypes.HDC
+                hobj_type = wintypes.HGDIOBJ if hasattr(wintypes, "HGDIOBJ") else ctypes.c_void_p
+                gdi32.CreateCompatibleDC.argtypes = [hdc_type]
+                gdi32.CreateCompatibleDC.restype = hdc_type
+                gdi32.CreateFontW.argtypes = [wintypes.INT, wintypes.INT, wintypes.INT, wintypes.INT,
+                    wintypes.INT, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                    wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR]
+                gdi32.CreateFontW.restype = hobj_type
+                gdi32.SelectObject.argtypes = [hdc_type, hobj_type]
+                gdi32.SelectObject.restype = hobj_type
+                gdi32.DeleteObject.argtypes = [hobj_type]
+                gdi32.DeleteObject.restype = wintypes.BOOL
+                gdi32.DeleteDC.argtypes = [hdc_type]
+                gdi32.DeleteDC.restype = wintypes.BOOL
+                gdi32.CreateDIBSection.argtypes = [hdc_type, ctypes.POINTER(BITMAPINFO), wintypes.UINT,
+                                                    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD]
+                gdi32.CreateDIBSection.restype = hobj_type
+                user32.DrawTextW.argtypes = [hdc_type, wintypes.LPCWSTR, ctypes.c_int,
+                                             ctypes.POINTER(RECT), wintypes.UINT]
+                user32.DrawTextW.restype = ctypes.c_int
+                user32.FillRect.argtypes = [hdc_type, ctypes.POINTER(RECT), hobj_type]
+                user32.FillRect.restype = ctypes.c_int
+                gdi32.SetBkMode.argtypes = [hdc_type, ctypes.c_int]
+                gdi32.SetTextColor.argtypes = [hdc_type, wintypes.DWORD]
+                gdi32.GdiFlush.argtypes = []
+                gdi32.GetStockObject.argtypes = [ctypes.c_int]
+                gdi32.GetStockObject.restype = hobj_type
+
+                size_pt = max(9, int(body_font.cget("size")))
+                try:
+                    font_px = max(12, int(round(float(size_pt) * float(win.winfo_fpixels("1p")))))
+                except Exception:
+                    font_px = max(12, int(round(size_pt * 1.333)))
+                image_width = max(260, int(image_width))
+                side_pad = max(24, int(round(font_px * 0.9)))
+                text_width = max(120, image_width - side_pad * 2)
+                top_pad = max(12, int(round(font_px * 0.45)))
+                bottom_pad = max(14, int(round(font_px * 0.55)))
+                family = str(URDU_FONT or "Jameel Noori Nastaleeq")
+
+                hdc = gdi32.CreateCompatibleDC(None)
+                if not hdc:
+                    return None
+                # The negative height requests a character height in device pixels.
+                hfont = gdi32.CreateFontW(-font_px, 0, 0, 0, 400, 0, 0, 0,
+                    1, 4, 0, 4, 0, family)
+                if not hfont:
+                    return None
+                old_font = gdi32.SelectObject(hdc, hfont)
+
+                text = str(paragraph or "")
+                # DT_WORDBREAK + DT_RTLREADING + DT_RIGHT is the key: GDI wraps
+                # the logical Unicode paragraph itself; don't reverse the string.
+                DT_RIGHT = 0x00000002
+                DT_WORDBREAK = 0x00000010
+                DT_NOPREFIX = 0x00000800
+                DT_RTLREADING = 0x00020000
+                DT_CALCRECT = 0x00000400
+                flags = DT_RIGHT | DT_WORDBREAK | DT_NOPREFIX | DT_RTLREADING
+                calc = RECT(0, 0, text_width, 0)
+                user32.DrawTextW(hdc, text, len(text), ctypes.byref(calc), flags | DT_CALCRECT)
+                measured_height = max(font_px * 2, int(calc.bottom - calc.top))
+                image_height = max(32, top_pad + measured_height + bottom_pad)
+
+                bmi = BITMAPINFO()
+                bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.bmiHeader.biWidth = image_width
+                bmi.bmiHeader.biHeight = -image_height  # top-down DIB
+                bmi.bmiHeader.biPlanes = 1
+                bmi.bmiHeader.biBitCount = 32
+                bmi.bmiHeader.biCompression = 0  # BI_RGB
+                bmi.bmiHeader.biSizeImage = image_width * image_height * 4
+                bits = ctypes.c_void_p()
+                hbitmap = gdi32.CreateDIBSection(hdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+                if not hbitmap or not bits.value:
+                    return None
+                old_bitmap = gdi32.SelectObject(hdc, hbitmap)
+                full = RECT(0, 0, image_width, image_height)
+                user32.FillRect(hdc, ctypes.byref(full), gdi32.GetStockObject(0))  # WHITE_BRUSH
+                gdi32.SetBkMode(hdc, 1)  # TRANSPARENT
+                # COLORREF stores R in the low byte, then G, then B.
+                gdi32.SetTextColor(hdc, 23 | (61 << 8) | (50 << 16))
+                draw_rect = RECT(side_pad, top_pad, image_width - side_pad, image_height - bottom_pad)
+                result = user32.DrawTextW(hdc, text, len(text), ctypes.byref(draw_rect), flags)
+                if result <= 0:
+                    return None
+                gdi32.GdiFlush()
+                pixels = ctypes.string_at(bits.value, image_width * image_height * 4)
+                try:
+                    return Image.frombytes("RGB", (image_width, image_height), pixels, "raw", "BGRX", 0, 1)
+                except Exception:
+                    raw = Image.frombytes("RGBA", (image_width, image_height), pixels, "raw", "BGRA", 0, 1)
+                    return raw.convert("RGB")
+            except Exception:
+                # Try Pillow's RAQM below if the native GDI path is unavailable.
+                return None
+            finally:
+                try:
+                    if hdc and old_bitmap:
+                        gdi32.SelectObject(hdc, old_bitmap)
+                except Exception:
+                    pass
+                try:
+                    if hdc and old_font:
+                        gdi32.SelectObject(hdc, old_font)
+                except Exception:
+                    pass
+                try:
+                    if hbitmap:
+                        gdi32.DeleteObject(hbitmap)
+                except Exception:
+                    pass
+                try:
+                    if hfont:
+                        gdi32.DeleteObject(hfont)
+                except Exception:
+                    pass
+                try:
+                    if hdc:
+                        gdi32.DeleteDC(hdc)
+                except Exception:
+                    pass
+
+        def _render_urdu_paragraph(paragraph, image_width):
+            """Return one raster image per whole paragraph with proper RTL layout.
+
+            On Windows use native DrawTextW/Uniscribe first because its paragraph
+            layout matches the installed Windows Urdu font. Pillow/RAQM remains the
+            cross-platform fallback. Never reverse the logical source string.
+            """
+            if Image is None or ImageTk is None:
+                return None
+            if sys.platform == "win32":
+                native_image = _render_windows_gdi_paragraph(paragraph, image_width)
+                if native_image is not None:
+                    return native_image
+            font = _get_raqm_font()
+            if font is None or ImageDraw is None:
+                return None
+            image_width = max(260, int(image_width))
+            font_px = max(10, int(getattr(font, "size", 20)))
+            side_pad = max(22, int(round(font_px * 0.95)))
+            max_text_width = max(120, image_width - side_pad * 2)
+            temp = Image.new("RGB", (max(8, image_width), max(8, font_px * 3)), WHITE)
+            draw = ImageDraw.Draw(temp)
+
+            # Greedy word wrapping is based on RAQM's measured display width; the
+            # paragraph text itself stays logical and is never reversed or mutated.
+            words = str(paragraph or "").split()
+            if not words:
+                return Image.new("RGB", (image_width, max(12, int(font_px * 0.6))), WHITE)
+            lines = []
+            line = ""
+            for word in words:
+                candidate = (line + " " + word).strip()
+                try:
+                    measured = draw.textlength(candidate, font=font, direction="rtl", language="ur")
+                except Exception:
+                    measured = draw.textlength(candidate, font=font)
+                if line and measured > max_text_width:
+                    lines.append(line)
+                    line = word
+                else:
+                    line = candidate
+            if line:
+                lines.append(line)
+
+            # Nastaleeq needs generous leading for its upper/lower strokes.
+            side_gap = max(8, int(round(font_px * 0.48)))
+            top_pad = max(10, int(round(font_px * 0.48)))
+            bottom_pad = max(12, int(round(font_px * 0.58)))
+            line_metrics = []
+            for item in lines:
+                try:
+                    bbox = draw.textbbox((0, 0), item, font=font, direction="rtl", language="ur", anchor="rt")
+                except Exception:
+                    bbox = draw.textbbox((0, 0), item, font=font)
+                line_h = max(font_px, int(bbox[3] - bbox[1]))
+                line_metrics.append((item, line_h))
+            total_h = top_pad + sum(h for _line, h in line_metrics) + side_gap * max(0, len(line_metrics) - 1) + bottom_pad
+            image = Image.new("RGB", (image_width, max(1, total_h)), WHITE)
+            outdraw = ImageDraw.Draw(image)
+            y = top_pad
+            for item, line_h in line_metrics:
+                try:
+                    outdraw.text((image_width - side_pad, y), item, fill=DARK, font=font,
+                                 anchor="rt", direction="rtl", language="ur")
+                except Exception:
+                    outdraw.text((image_width - side_pad, y), item, fill=DARK, font=font, anchor="rt")
+                y += line_h + side_gap
+            return image
+
+        def refresh_section(preserve_scroll=False):
+            """Rebuild naturally wrapped paragraphs; use RAQM for Urdu bidi/shaping."""
+            try:
+                previous_fraction = reader.yview()[0] if preserve_scroll else 0.0
+            except tk.TclError:
+                previous_fraction = 0.0
+            for child in reader_content.winfo_children():
+                child.destroy()
+            image_ref_state["items"] = []
+
+            content_width = max(260, reader.winfo_width() - 56)
+            paragraphs = split_paragraphs(current_body.get("text", ""))
+            row_index = 0
+            font_px = max(10, int(body_font.cget("size")))
+            paragraph_gap = max(12, int(font_px * (0.85 if is_urdu else 0.55)))
+            line_pad = max(8, int(font_px * (0.45 if is_urdu else 0.30)))
+
+            for paragraph in paragraphs:
+                if not paragraph:
+                    tk.Frame(reader_content, bg=CARD_BG, height=paragraph_gap).grid(
+                        row=row_index, column=0, sticky="ew")
+                    row_index += 1
+                    continue
+                if is_urdu:
+                    rendered = _render_urdu_paragraph(paragraph, content_width)
+                    if rendered is not None:
+                        photo = ImageTk.PhotoImage(rendered, master=reader_content)
+                        image_ref_state["items"].append(photo)
+                        widget = tk.Label(reader_content, image=photo, bg=CARD_BG, bd=0,
+                                          highlightthickness=0, anchor="e", padx=0, pady=0)
+                        widget.image = photo
+                        widget.grid(row=row_index, column=0, sticky="ew", padx=(28, 28), pady=(0, paragraph_gap // 3))
+                        widget.bind("<MouseWheel>", on_wheel)
+                        row_index += 1
+                        continue
+                    # Fail visibly rather than silently using Tk's unreliable RTL
+                    # wrapping, which can reproduce the exact mixed-word problem.
+                    label = tk.Label(reader_content,
+                        text="اردو متن کی درست ترتیب کے لیے Windows RTL رینڈرر دستیاب نہیں۔ Pillow کا RAQM-enabled ورژن درکار ہے۔",
+                        bg=CARD_BG, fg="#B42318", font=(base_family, max(10, int(body_font.cget("size"))), "bold"),
+                        anchor="e", justify="right", wraplength=max(200, content_width - 24),
+                        bd=0, padx=24, pady=line_pad)
+                    label.grid(row=row_index, column=0, sticky="ew", padx=(28, 28), pady=0)
+                    label.bind("<MouseWheel>", on_wheel)
+                    row_index += 1
+                    continue
+                # English: retain selectable native text.
+                wrap_width = max(180, content_width - 24)
+                label = tk.Label(
+                    reader_content,
+                    text=paragraph,
+                    bg=CARD_BG,
+                    fg=DARK,
+                    font=body_font,
+                    anchor="w",
+                    justify="left",
+                    wraplength=wrap_width,
+                    bd=0,
+                    relief="flat",
+                    padx=0,
+                    pady=line_pad,
+                    takefocus=0,
+                )
+                label.grid(row=row_index, column=0, sticky="ew", padx=(28, 28), pady=0)
+                label.bind("<MouseWheel>", on_wheel)
+                row_index += 1
+
+            reader_content.grid_columnconfigure(0, weight=1)
+            reader_content.update_idletasks()
+            reader.itemconfigure(reader_window, width=max(260, reader.winfo_width()))
+            reader.configure(scrollregion=reader.bbox("all"))
+            if preserve_scroll:
+                reader.yview_moveto(previous_fraction)
+            else:
+                reader.yview_moveto(0)
+
+        def queue_render(_event=None, preserve_scroll=True):
+            try:
+                if render_pending["job"]:
+                    win.after_cancel(render_pending["job"])
+                render_pending["job"] = win.after(80, lambda: refresh_section(preserve_scroll=preserve_scroll))
+            except tk.TclError:
+                pass
+
+        def set_zoom(percent):
+            try:
+                percent = max(60, min(200, int(round(float(percent) / 5.0) * 5)))
+            except (TypeError, ValueError):
+                percent = 100
+            zoom_state["percent"] = percent
+            zoom_pct.set(f"{percent}%")
+            zoom_state["syncing"] = True
+            try:
+                slider_value.set(percent)
+            finally:
+                zoom_state["syncing"] = False
+            new_size = max(9, min(54, int(round(base_points * percent / 100.0))))
+            body_font.configure(size=new_size)
+            queue_render(preserve_scroll=True)
+
+        def show_section(index):
+            index = max(0, min(len(sections) - 1, int(index)))
+            selected_section["index"] = index
+            _heading, content = sections[index]
+            current_body["text"] = str(content or "").strip()
+            if not current_body["text"]:
+                current_body["text"] = ("اس حصے کے لیے ابھی متن موجود نہیں۔" if is_urdu
+                                         else "No text is available for this section yet.")
+            for i, b in enumerate(section_buttons):
+                b.configure(bg=GREEN if i == index else "#EAF4F0",
+                            fg=WHITE if i == index else GREEN,
+                            activebackground=GREEN if i == index else PALE,
+                            activeforeground=WHITE if i == index else GREEN)
+            queue_render(preserve_scroll=False)
+
+        for i, (section_heading, _content) in enumerate(sections):
+            label = fallback_labels[i] if i < len(fallback_labels) else str(section_heading)
+            b = tk.Button(section_bar, text=label, command=lambda ix=i: show_section(ix),
+                          bg="#EAF4F0", fg=GREEN, activebackground=PALE,
+                          activeforeground=GREEN, relief="flat", bd=0, padx=10, pady=5,
+                          cursor="hand2", font=(base_family, 9, "bold"))
+            b.pack(side="right" if is_urdu else "left", padx=2)
+            section_buttons.append(b)
+
+        def copy_guide():
+            try:
+                text_blob = str(guide.get("course", "")) + "\n" + str(guide.get("topic", "")) + "\n\n" + "\n\n".join(
+                    str(h) + "\n" + str(c) for h, c in sections)
+                win.clipboard_clear()
+                win.clipboard_append(text_blob)
+                messagebox.showinfo("Copied" if not is_urdu else "کاپی ہو گیا",
+                                    guide.get("labels", {}).get("copied", "Copied to clipboard."), parent=win)
+            except tk.TclError:
+                pass
+
+        def go_to(offset):
+            new_index = unit_index + offset
+            if 0 <= new_index < int(guide.get("unit_count", 0)):
+                win.destroy()
+                self._open_curriculum_lesson(course_key, new_index)
+
+        footer = tk.Frame(win, bg=CARD_BG, padx=8, pady=4,
+                          highlightbackground=BORDER, highlightthickness=1)
+        footer.pack(fill="x", side="bottom")
+        labels = guide.get("labels", {})
+        if unit_index > 0:
+            tk.Button(footer, text=labels.get("previous", "Previous" if not is_urdu else "پچھلا موضوع"),
+                      command=lambda: go_to(-1), bg="#EAF4F0", fg=GREEN, relief="flat",
+                      padx=10, pady=4, cursor="hand2", font=(base_family, 9)).pack(side="left", padx=(0, 5))
+        if unit_index + 1 < int(guide.get("unit_count", 0)):
+            tk.Button(footer, text=labels.get("next", "Next" if not is_urdu else "اگلا موضوع"),
+                      command=lambda: go_to(1), bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER,
+                      relief="flat", padx=10, pady=4, cursor="hand2", font=(base_family, 9, "bold")).pack(side="left", padx=(0, 5))
+        tk.Button(footer, text=("Lesson images" if not is_urdu else "سبق کی تصاویر"),
+                  command=lambda: self._open_curriculum_images(course_key, topic_index=unit_index),
+                  bg="#FDF0D5", fg="#855D12", relief="flat", padx=10, pady=4,
+                  cursor="hand2", font=(base_family, 9, "bold")).pack(side="left", padx=(0, 5))
+        tk.Button(footer, text=labels.get("copy", "Copy lesson" if not is_urdu else "سبق کاپی کریں"),
+                  command=copy_guide, bg="#E8F0F7", fg="#1D5FA8", relief="flat",
+                  padx=10, pady=4, cursor="hand2", font=(base_family, 9)).pack(side="left", padx=(0, 5))
+        tk.Button(footer, text=labels.get("close", "Close" if not is_urdu else "بند کریں"),
+                  command=win.destroy, bg="#EFF3F1", fg=DARK, relief="flat",
+                  padx=12, pady=4, cursor="hand2", font=(base_family, 9)).pack(side="right")
+
+        def on_wheel(event):
+            try:
+                steps = int(-event.delta / 120)
+                if steps == 0 and event.delta:
+                    steps = -1 if event.delta > 0 else 1
+                reader.yview_scroll(steps, "units")
+            except (AttributeError, tk.TclError):
+                pass
+            return "break"
+
+        def resize_content(event):
+            try:
+                reader.itemconfigure(reader_window, width=max(240, event.width))
+                queue_render(preserve_scroll=True)
+            except tk.TclError:
+                pass
+
+        def content_changed(_event=None):
+            try:
+                reader.configure(scrollregion=reader.bbox("all"))
+            except tk.TclError:
+                pass
+
+        reader.bind("<MouseWheel>", on_wheel)
+        section_bar.bind("<MouseWheel>", on_wheel)
+        outer.bind("<MouseWheel>", on_wheel)
+        reader_content.bind("<Configure>", content_changed)
+        reader.bind("<Configure>", resize_content, add="+")
+        reader.bind("<Control-plus>", lambda _e: (set_zoom(zoom_state["percent"] + 10), "break")[1])
+        reader.bind("<Control-equal>", lambda _e: (set_zoom(zoom_state["percent"] + 10), "break")[1])
+        reader.bind("<Control-minus>", lambda _e: (set_zoom(zoom_state["percent"] - 10), "break")[1])
+        reader.bind("<Control-0>", lambda _e: (set_zoom(100), "break")[1])
+
+        win.update_idletasks()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        try:
+            win.state("zoomed")
+        except tk.TclError:
+            win.geometry(f"{max(900, sw)}x{max(650, sh - 45)}+0+0")
+        win.minsize(min(850, sw), min(560, max(420, sh - 50)))
+        win.update_idletasks()
+        show_section(0)
+        set_zoom(100)
+        win.after(180, lambda: refresh_section(preserve_scroll=False))
+        win.lift()
+        win.focus_force()
+
+    def courses_curriculum_page(self, parent):
+        """Bilingual course outlines and an admin-managed PDF library rendered as page images."""
+        self._curriculum_table_ready()
+        is_admin = bool(self.user and self.user.get("role") == "admin")
+        title = "Courses & Curriculum" if APP_LANGUAGE == "en" else "کورسز اور نصاب"
+        subtitle = ("Browse the structured course outlines. Administrators can attach one official PDF per course; PDF pages open as crisp images." if APP_LANGUAGE == "en"
+                    else "مرتب نصاب دیکھیں۔ منتظم ہر کورس کے ساتھ ایک PDF منسلک کر سکتا ہے؛ PDF کے صفحات واضح تصاویر کی صورت میں کھلیں گے۔")
+        self.page_title(parent, title, subtitle)
+
+        shell = tk.Frame(parent, bg=APP_BG)
+        shell.pack(fill="both", expand=True)
+        sidebar = tk.Frame(shell, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, width=265)
+        sidebar.pack(side="left", fill="y", padx=(0, 12), pady=2)
+        sidebar.pack_propagate(False)
+        side_title = "Course library" if APP_LANGUAGE == "en" else "کورس لائبریری"
+        smart_label(tk.Label, sidebar, text=side_title, bg=CARD_BG, fg=GREEN,
+                    font=(UI_FONT, 12, "bold")).pack(anchor="w", padx=13, pady=(14, 8))
+        search_var = tk.StringVar()
+        search_entry = ttk.Entry(sidebar, textvariable=search_var)
+        search_entry.pack(fill="x", padx=12, pady=(0, 9), ipady=3)
+        search_entry.configure(state="normal")
+        search_entry.insert(0, "Search courses…" if APP_LANGUAGE == "en" else "کورس تلاش کریں…")
+        placeholder = search_entry.get()
+        search_entry.bind("<FocusIn>", lambda _e: (search_entry.delete(0, "end") if search_entry.get() == placeholder else None))
+        list_outer = tk.Frame(sidebar, bg=CARD_BG)
+        list_outer.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        list_canvas = tk.Canvas(list_outer, bg=CARD_BG, highlightthickness=0, bd=0)
+        list_scroll = ttk.Scrollbar(list_outer, orient="vertical", command=list_canvas.yview)
+        list_inner = tk.Frame(list_canvas, bg=CARD_BG)
+        list_inner.bind("<Configure>", lambda _e: list_canvas.configure(scrollregion=list_canvas.bbox("all")))
+        list_window = list_canvas.create_window((0, 0), window=list_inner, anchor="nw")
+        list_canvas.configure(yscrollcommand=list_scroll.set)
+        list_canvas.pack(side="left", fill="both", expand=True)
+        list_scroll.pack(side="right", fill="y")
+        list_canvas.bind("<Configure>", lambda e: list_canvas.itemconfigure(list_window, width=e.width))
+
+        detail = tk.Frame(shell, bg=APP_BG)
+        detail.pack(side="left", fill="both", expand=True)
+        selected = {"key": COURSES[0]}
+        detail_widgets = []
+        course_buttons = {}
+
+        def clear_detail():
+            for widget in detail.winfo_children():
+                widget.destroy()
+
+        def section_card(parent_frame, heading, accent=GREEN):
+            card = tk.Frame(parent_frame, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=15, pady=12)
+            card.pack(fill="x", pady=(0, 10))
+            tk.Frame(card, bg=accent, height=3).pack(fill="x", pady=(0, 10))
+            smart_label(tk.Label, card, text=heading, bg=CARD_BG, fg=accent, font=(UI_FONT, 12, "bold")).pack(anchor="w")
+            return card
+
+        def render_selected():
+            key = selected["key"]
+            item = self._curriculum_lang(key)
+            clear_detail()
+            hero = tk.Frame(detail, bg=GREEN, padx=20, pady=17)
+            hero.pack(fill="x", pady=(2, 10))
+            smart_label(tk.Label, hero, text=item["title"], bg=GREEN, fg=WHITE,
+                        font=(UI_FONT, 19, "bold"), wraplength=760).pack(anchor="w")
+            smart_label(tk.Label, hero, text=item["summary"], bg=GREEN, fg="#EAF4F0",
+                        font=(UI_FONT, 10), wraplength=820, justify="left").pack(anchor="w", pady=(6, 0))
+
+            goal_heading = "Learning goal" if APP_LANGUAGE == "en" else "تعلیمی مقصد"
+            goal = section_card(detail, goal_heading, "#2F7F8F")
+            smart_label(tk.Label, goal, text=item["goal"], bg=CARD_BG, fg=DARK,
+                        font=(UI_FONT, 10), wraplength=820, justify="left").pack(anchor="w", pady=(7, 0))
+
+            units_heading = "Course outline" if APP_LANGUAGE == "en" else "نصاب کی تفصیل"
+            units_card = section_card(detail, units_heading, GREEN)
+            for idx, unit in enumerate(item["units"], 1):
+                topic_row = tk.Frame(units_card, bg=CARD_BG)
+                topic_row.pack(fill="x", pady=3)
+                marker = tk.Label(topic_row, text=f"{idx:02d}", bg=SOFT_GREEN, fg=GREEN,
+                                  font=(UI_FONT, 9, "bold"), width=4, padx=3, pady=6)
+                marker.pack(side="left", padx=(0, 8))
+                open_text = ("سبق کھولیں  ›" if APP_LANGUAGE == "ur" else "Open lesson  ›")
+                topic_button = tk.Button(topic_row, text=unit, anchor="w", justify="right" if APP_LANGUAGE == "ur" else "left",
+                    command=lambda course=key, lesson_index=idx - 1: self._open_curriculum_lesson(course, lesson_index),
+                    bg=CARD_BG, fg=DARK, activebackground=SOFT_GREEN, activeforeground=GREEN,
+                    relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
+                    padx=10, pady=7, wraplength=650, cursor="hand2",
+                    font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 10, "bold"))
+                topic_button.pack(side="left", fill="x", expand=True)
+                tk.Label(topic_row, text=open_text, bg=CARD_BG, fg=GREEN,
+                         font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 8, "bold")).pack(side="left", padx=(7, 0))
+
+            outcomes_heading = "Expected learning outcomes" if APP_LANGUAGE == "en" else "متوقعہ تعلیمی نتائج"
+            outcomes = section_card(detail, outcomes_heading, "#C8962E")
+            for value in item["outcomes"]:
+                line = tk.Frame(outcomes, bg=CARD_BG)
+                line.pack(fill="x", anchor="w", pady=3)
+                tk.Label(line, text="✓", bg=CARD_BG, fg="#157347", font=(UI_FONT, 10, "bold")).pack(side="left", padx=(0, 8))
+                smart_label(tk.Label, line, text=value, bg=CARD_BG, fg=DARK,
+                            font=(UI_FONT, 10), wraplength=780, justify="left", anchor="w").pack(side="left", fill="x", expand=True)
+
+            # Curriculum image library: imported book pages stay byte-for-byte original
+            # in a sidecar assets folder beside the active database.
+            image_card = section_card(detail, "Curriculum image library" if APP_LANGUAGE == "en" else "نصاب کی تصویری لائبریری", "#2F7F8F")
+            image_count_row = self.db.conn.execute("SELECT COUNT(*) AS n, COUNT(DISTINCT collection_name) AS collections FROM curriculum_image_assets WHERE course_key=?", (key,)).fetchone()
+            image_count = int(image_count_row["n"] or 0) if image_count_row else 0
+            collection_count = int(image_count_row["collections"] or 0) if image_count_row else 0
+            image_summary = ((f"{image_count:,} pages in {collection_count:,} collections. Imported pages can be linked to individual lessons." if APP_LANGUAGE == "en"
+                              else f"{collection_count:,} مجموعوں میں {image_count:,} صفحات موجود ہیں۔ صفحات کو انفرادی اسباق سے منسلک کیا جا سکتا ہے۔"))
+            smart_label(tk.Label, image_card, text=image_summary, bg=CARD_BG, fg=MUTED,
+                        font=(UI_FONT, 10), wraplength=780, justify="left").pack(anchor="w", pady=(7, 8))
+            image_actions = tk.Frame(image_card, bg=CARD_BG)
+            image_actions.pack(fill="x", anchor="w")
+            tk.Button(image_actions, text=("Open image pages" if APP_LANGUAGE == "en" else "تصویری صفحات کھولیں"),
+                      command=lambda k=key: self._open_curriculum_images(k), bg=GREEN, fg=WHITE,
+                      activebackground=GREEN_HOVER, activeforeground=WHITE, relief="flat",
+                      padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
+            if is_admin:
+                tk.Button(image_actions, text=("Import folder" if APP_LANGUAGE == "en" else "فولڈر درآمد کریں"),
+                          command=lambda k=key: self._curriculum_import_image_tree(default_course=k, after_import=render_selected),
+                          bg=SOFT_GREEN, fg=GREEN, activebackground=PALE, relief="flat",
+                          padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
+                if key == "Noorani Qaida":
+                    tk.Button(image_actions, text=("Import supplied Qaida pages" if APP_LANGUAGE == "en" else "بھیجے گئے قاعدے کے صفحات شامل کریں"),
+                              command=lambda: self._curriculum_import_bundled_noorani_pages(after_import=render_selected),
+                              bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER, relief="flat",
+                              padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
+
+            # Separate curriculum-upload/library option. PDFs are stored in the same
+            # local database as a BLOB, so moving the DB does not strand a sidecar file.
+            pdf_card = section_card(detail, "Curriculum PDF library" if APP_LANGUAGE == "en" else "نصاب کی PDF لائبریری", "#C8962E")
+            row = self.db.conn.execute("SELECT pdf_name, uploaded_at, length(pdf_data) AS pdf_size FROM course_curriculum WHERE course_key=?", (key,)).fetchone()
+            if row and row["pdf_name"]:
+                pdf_name = row["pdf_name"]
+                meta_text = ((f"Uploaded: {row['uploaded_at']}  •  {int(row['pdf_size'] or 0) // 1024:,} KB") if APP_LANGUAGE == "en"
+                             else (f"اپ لوڈ: {row['uploaded_at']}  •  {int(row['pdf_size'] or 0) // 1024:,} KB"))
+                smart_label(tk.Label, pdf_card, text=pdf_name, bg=CARD_BG, fg=DARK,
+                            font=(UI_FONT, 10, "bold"), wraplength=680, justify="left").pack(anchor="w", pady=(7, 2))
+                smart_label(tk.Label, pdf_card, text=meta_text, bg=CARD_BG, fg=MUTED,
+                            font=(UI_FONT, 9)).pack(anchor="w", pady=(0, 9))
+                action_row = tk.Frame(pdf_card, bg=CARD_BG)
+                action_row.pack(fill="x", anchor="w")
+                tk.Button(action_row, text=("Open as page images" if APP_LANGUAGE == "en" else "تصویری صفحات میں کھولیں"),
+                          command=lambda k=key: self._open_curriculum_pdf(k), bg=GREEN, fg=WHITE,
+                          activebackground=GREEN_HOVER, activeforeground=WHITE, relief="flat",
+                          padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
+                if is_admin:
+                    tk.Button(action_row, text=("Replace PDF" if APP_LANGUAGE == "en" else "PDF تبدیل کریں"),
+                              command=lambda k=key: upload_pdf(k), bg=SOFT_GREEN, fg=GREEN,
+                              activebackground=PALE, relief="flat", padx=12, pady=8,
+                              cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
+                    tk.Button(action_row, text=("Remove PDF" if APP_LANGUAGE == "en" else "PDF ہٹائیں"),
+                              command=lambda k=key: remove_pdf(k), bg="#FCE8E6", fg="#B42318",
+                              activebackground="#F9D4D1", relief="flat", padx=12, pady=8,
+                              cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left")
+            else:
+                empty_text = ("No PDF is attached to this course yet. The written course outline above is available now." if APP_LANGUAGE == "en"
+                              else "اس کورس کے ساتھ ابھی PDF منسلک نہیں۔ اوپر تحریری نصاب فی الحال دستیاب ہے۔")
+                smart_label(tk.Label, pdf_card, text=empty_text, bg=CARD_BG, fg=MUTED,
+                            font=(UI_FONT, 10), wraplength=780, justify="left").pack(anchor="w", pady=(7, 8))
+                if is_admin:
+                    tk.Button(pdf_card, text=("Upload curriculum PDF" if APP_LANGUAGE == "en" else "نصاب کی PDF اپ لوڈ کریں"),
+                              command=lambda k=key: upload_pdf(k), bg=GREEN, fg=WHITE,
+                              activebackground=GREEN_HOVER, activeforeground=WHITE, relief="flat",
+                              padx=13, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(anchor="w")
+            if not is_admin and not (row and row["pdf_name"]):
+                viewer_note = ("Ask the administrator to attach the official PDF if your class requires one." if APP_LANGUAGE == "en"
+                               else "اگر آپ کی کلاس کے لیے سرکاری PDF درکار ہو تو منتظم سے منسلک کرنے کو کہیں۔")
+                smart_label(tk.Label, pdf_card, text=viewer_note, bg=CARD_BG, fg=MUTED,
+                            font=(UI_FONT, 9), wraplength=780).pack(anchor="w", pady=(8, 0))
+
+        def upload_pdf(key):
+            if not is_admin:
+                messagebox.showerror("Permission denied", "Only an administrator can upload curriculum PDFs.", parent=self.root)
+                return
+            path = filedialog.askopenfilename(parent=self.root,
+                title=("Select curriculum PDF" if APP_LANGUAGE == "en" else "نصاب کی PDF منتخب کریں"),
+                filetypes=[("PDF documents", "*.pdf"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                size = os.path.getsize(path)
+                if size <= 0 or size > 50 * 1024 * 1024:
+                    messagebox.showerror("PDF size", "Choose a non-empty PDF up to 50 MB.", parent=self.root)
+                    return
+                with open(path, "rb") as stream:
+                    data = stream.read()
+                if not data.startswith(b"%PDF-"):
+                    messagebox.showerror("Invalid PDF", "The selected file does not look like a valid PDF document.", parent=self.root)
+                    return
+                if fitz is not None:
+                    probe = fitz.open(stream=data, filetype="pdf")
+                    try:
+                        if getattr(probe, "needs_pass", False):
+                            messagebox.showerror("Protected PDF", "Password-protected PDFs are not supported. Upload an unlocked PDF.", parent=self.root)
+                            return
+                        if probe.page_count < 1:
+                            messagebox.showerror("Empty PDF", "The PDF contains no pages.", parent=self.root)
+                            return
+                    finally:
+                        probe.close()
+                existing = self.db.conn.execute("SELECT pdf_name FROM course_curriculum WHERE course_key=?", (key,)).fetchone()
+                if existing and existing["pdf_name"]:
+                    if not messagebox.askyesno("Replace curriculum PDF?", "A PDF is already attached to this course. Replace it with the selected file?", parent=self.root):
+                        return
+                saved_by = (self.user or {}).get("username", "admin")
+                self.db.conn.execute("""INSERT INTO course_curriculum(course_key,pdf_name,pdf_data,uploaded_at,uploaded_by)
+                    VALUES(?,?,?,?,?) ON CONFLICT(course_key) DO UPDATE SET pdf_name=excluded.pdf_name,
+                    pdf_data=excluded.pdf_data,uploaded_at=excluded.uploaded_at,uploaded_by=excluded.uploaded_by""",
+                    (key, os.path.basename(path), sqlite3.Binary(data), datetime.now().strftime("%Y-%m-%d %H:%M"), saved_by))
+                self.db.conn.commit()
+                messagebox.showinfo("Saved", "Curriculum PDF was saved inside this local database.", parent=self.root)
+                render_selected()
+            except Exception as exc:
+                messagebox.showerror("PDF upload failed", str(exc), parent=self.root)
+
+        def remove_pdf(key):
+            if not is_admin:
+                return
+            if not messagebox.askyesno("Remove curriculum PDF?", "Remove the PDF attachment for this course? The written course outline will remain.", parent=self.root):
+                return
+            try:
+                self.db.conn.execute("DELETE FROM course_curriculum WHERE course_key=?", (key,))
+                self.db.conn.commit()
+                render_selected()
+            except sqlite3.Error as exc:
+                messagebox.showerror("Could not remove PDF", str(exc), parent=self.root)
+
+        def refresh_course_buttons(*_args):
+            for widget in list_inner.winfo_children():
+                widget.destroy()
+            course_buttons.clear()
+            query = "" if search_var.get() == placeholder else search_var.get().strip().casefold()
+            for key in COURSES:
+                item = self._curriculum_lang(key)
+                search_blob = (key + " " + item["title"] + " " + item["summary"]).casefold()
+                if query and query not in search_blob:
+                    continue
+                active = selected["key"] == key
+                button = tk.Button(list_inner, text=item["title"], anchor="w", justify="left",
+                    command=lambda k=key: choose_course(k), bg=GREEN if active else WHITE,
+                    fg=WHITE if active else DARK, activebackground=SOFT_GREEN, activeforeground=GREEN,
+                    relief="flat", bd=0, padx=12, pady=10, wraplength=210,
+                    font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 10, "bold"), cursor="hand2")
+                button.pack(fill="x", padx=3, pady=2)
+                course_buttons[key] = button
+            if not course_buttons:
+                empty = "No matching courses" if APP_LANGUAGE == "en" else "کوئی متعلقہ کورس نہیں ملا"
+                smart_label(tk.Label, list_inner, text=empty, bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9)).pack(anchor="w", padx=8, pady=12)
+
+        def choose_course(key):
+            selected["key"] = key
+            refresh_course_buttons()
+            render_selected()
+
+        search_var.trace_add("write", refresh_course_buttons)
+        render_selected()
+        refresh_course_buttons()
+
+    def _open_curriculum_pdf(self, course_key):
+        """Open one uploaded PDF as rendered page images with zoom and paging controls."""
+        row = self.db.conn.execute("SELECT pdf_name,pdf_data FROM course_curriculum WHERE course_key=?", (course_key,)).fetchone()
+        if not row or not row["pdf_data"]:
+            messagebox.showinfo("No curriculum PDF", "No PDF has been uploaded for this course yet.", parent=self.root)
+            return
+        if fitz is None or Image is None or ImageTk is None:
+            # In the 32-bit Windows build, do not require PyMuPDF to compile from source.
+            # The PDF remains stored in the local database; write a temporary copy and
+            # open it with the computer's default PDF reader (e.g. Edge or Acrobat).
+            try:
+                data = bytes(row["pdf_data"])
+                fd, pdf_path = tempfile.mkstemp(prefix="InstituteLedger_Curriculum_", suffix=".pdf")
+                with os.fdopen(fd, "wb") as pdf_file:
+                    pdf_file.write(data)
+                if os.name == "nt":
+                    os.startfile(pdf_path)
+                else:
+                    webbrowser.open("file://" + os.path.abspath(pdf_path))
+                messagebox.showinfo(
+                    "PDF opened / PDF کھل گئی",
+                    "The PDF was opened in your default PDF application. The attached PDF remains saved in the local database.\n\nPDF آپ کے کمپیوٹر کے ڈیفالٹ PDF پروگرام میں کھول دی گئی ہے۔ منسلک PDF مقامی ڈیٹابیس میں محفوظ ہے۔",
+                    parent=self.root,
+                )
+            except Exception as exc:
+                messagebox.showerror(
+                    "Could not open PDF / PDF نہیں کھلی",
+                    f"Could not open the PDF in your default PDF application:\n{exc}\n\nMake sure a PDF reader is installed and associated with .pdf files.",
+                    parent=self.root,
+                )
+            return
+        data = bytes(row["pdf_data"])
+        try:
+            document = fitz.open(stream=data, filetype="pdf")
+            if getattr(document, "needs_pass", False):
+                document.close()
+                messagebox.showerror("Protected PDF", "Password-protected PDFs are not supported.", parent=self.root)
+                return
+        except Exception as exc:
+            messagebox.showerror("Could not open PDF", str(exc), parent=self.root)
+            return
+
+        lang = self._curriculum_lang(course_key)
+        viewer = tk.Toplevel(self.root)
+        viewer.title(("Curriculum PDF • " if APP_LANGUAGE == "en" else "نصاب کی PDF • ") + lang["title"])
+        viewer.configure(bg=APP_BG)
+        # Keep the PDF reader as a normal resizable workspace, not a transient dialog.
+        sw, sh = viewer.winfo_screenwidth(), viewer.winfo_screenheight()
+        w, h = min(sw, max(900, sw - 40)), min(max(650, sh - 60), sh - 40)
+        viewer.geometry(f"{w}x{h}+0+0")
+        viewer.minsize(min(820, sw), min(560, max(440, sh - 50)))
+
+        toolbar = tk.Frame(viewer, bg=CARD_BG, padx=10, pady=9, highlightbackground=BORDER, highlightthickness=1)
+        toolbar.pack(fill="x")
+        state = {"page": 0, "zoom": 1.0, "fit": True, "render_after": None, "photo": None, "image_size": (0, 0)}
+        page_var = tk.StringVar(value="1")
+        page_total = document.page_count
+        page_text = tk.StringVar(value=f"1 / {page_total}")
+        def control(text, command, accent=False):
+            return tk.Button(toolbar, text=text, command=command, bg=GREEN if accent else WHITE,
+                fg=WHITE if accent else DARK, activebackground=GREEN_HOVER if accent else SOFT_GREEN,
+                activeforeground=WHITE if accent else GREEN, relief="flat", bd=0, padx=10, pady=7,
+                cursor="hand2", font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 9, "bold"))
+        prev_btn = control("‹  " + ("Previous" if APP_LANGUAGE == "en" else "پچھلا"), lambda: change_page(-1))
+        prev_btn.pack(side="left", padx=3)
+        next_btn = control(("Next" if APP_LANGUAGE == "en" else "اگلا") + "  ›", lambda: change_page(1))
+        next_btn.pack(side="left", padx=3)
+        smart_label(tk.Label, toolbar, text=("Page" if APP_LANGUAGE == "en" else "صفحہ"), bg=CARD_BG, fg=DARK,
+                    font=(UI_FONT, 9)).pack(side="left", padx=(9, 4))
+        page_entry = ttk.Entry(toolbar, textvariable=page_var, width=5, justify="center")
+        page_entry.pack(side="left", padx=3, ipady=2)
+        def go_to_page(_event=None):
+            try:
+                page_num = int(page_var.get())
+            except (TypeError, ValueError):
+                page_num = state["page"] + 1
+            state["page"] = max(0, min(page_total - 1, page_num - 1))
+            state["fit"] = state["fit"]
+            render_page()
+        control("Go / جائیں" if APP_LANGUAGE == "en" else "جائیں", go_to_page).pack(side="left", padx=3)
+        smart_label(tk.Label, toolbar, textvariable=page_text, bg=CARD_BG, fg=MUTED,
+                    font=(UI_FONT, 9, "bold")).pack(side="left", padx=(3, 8))
+        control("−", lambda: change_zoom(-0.15)).pack(side="left", padx=2)
+        control("+", lambda: change_zoom(0.15)).pack(side="left", padx=2)
+        control("Fit width / پوری چوڑائی", fit_width).pack(side="left", padx=3)
+        control("Save PDF copy / کاپی محفوظ کریں", save_copy).pack(side="right", padx=3)
+
+        viewer_body = tk.Frame(viewer, bg=APP_BG)
+        viewer_body.pack(fill="both", expand=True, padx=8, pady=8)
+        pdf_canvas = tk.Canvas(viewer_body, bg="#E7EEEA", highlightthickness=0, bd=0)
+        vertical = ttk.Scrollbar(viewer_body, orient="vertical", command=pdf_canvas.yview)
+        horizontal = ttk.Scrollbar(viewer_body, orient="horizontal", command=pdf_canvas.xview)
+        pdf_canvas.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        vertical.pack(side="right", fill="y")
+        horizontal.pack(side="bottom", fill="x")
+        pdf_canvas.pack(side="left", fill="both", expand=True)
+
+        def render_page():
+            try:
+                if not viewer.winfo_exists() or not pdf_canvas.winfo_exists():
+                    return
+                page = document.load_page(state["page"])
+                rect = page.rect
+                if state["fit"]:
+                    available = max(300, pdf_canvas.winfo_width() - 42)
+                    scale = max(0.25, min(3.0, available / max(1.0, float(rect.width))))
+                else:
+                    scale = max(0.35, min(3.0, float(state["zoom"])))
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, annots=True)
+                image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
+                photo = ImageTk.PhotoImage(image)
+                pdf_canvas.delete("all")
+                x = max(16, (pdf_canvas.winfo_width() - image.width) // 2)
+                y = 16
+                pdf_canvas.create_image(x, y, image=photo, anchor="nw")
+                pdf_canvas._curriculum_pdf_photo = photo
+                state["photo"] = photo
+                state["image_size"] = (image.width, image.height)
+                pdf_canvas.configure(scrollregion=(0, 0, max(pdf_canvas.winfo_width(), x + image.width + 16), y + image.height + 16))
+                page_var.set(str(state["page"] + 1))
+                page_text.set(f"{state['page'] + 1} / {page_total}")
+                prev_btn.configure(state="normal" if state["page"] > 0 else "disabled")
+                next_btn.configure(state="normal" if state["page"] < page_total - 1 else "disabled")
+            except Exception as exc:
+                messagebox.showerror("PDF page could not be rendered", str(exc), parent=viewer)
+
+        def change_page(delta):
+            state["page"] = max(0, min(page_total - 1, state["page"] + int(delta)))
+            render_page()
+
+        def change_zoom(delta):
+            if state["fit"]:
+                width = max(300, pdf_canvas.winfo_width() - 42)
+                try:
+                    rect = document.load_page(state["page"]).rect
+                    state["zoom"] = width / max(1.0, float(rect.width))
+                except Exception:
+                    state["zoom"] = 1.0
+                state["fit"] = False
+            state["zoom"] = max(0.35, min(3.0, state["zoom"] + delta))
+            render_page()
+
+        def fit_width():
+            state["fit"] = True
+            render_page()
+
+        def save_copy():
+            destination = filedialog.asksaveasfilename(parent=viewer,
+                title=("Save a copy of the curriculum PDF" if APP_LANGUAGE == "en" else "نصاب کی PDF کی کاپی محفوظ کریں"),
+                defaultextension=".pdf", initialfile=os.path.basename(row["pdf_name"] or "curriculum.pdf"),
+                filetypes=[("PDF documents", "*.pdf")])
+            if not destination:
+                return
+            try:
+                with open(destination, "wb") as stream:
+                    stream.write(data)
+                messagebox.showinfo("Saved", "A copy of the PDF was saved.", parent=viewer)
+            except OSError as exc:
+                messagebox.showerror("Could not save PDF", str(exc), parent=viewer)
+
+        last_width = {"value": 0}
+        def resize_fit(event):
+            if not state["fit"] or abs(event.width - last_width["value"]) < 30:
+                return
+            last_width["value"] = event.width
+            if state["render_after"]:
+                try:
+                    viewer.after_cancel(state["render_after"])
+                except tk.TclError:
+                    pass
+            state["render_after"] = viewer.after(140, render_page)
+        pdf_canvas.bind("<Configure>", resize_fit)
+        viewer.bind("<Left>", lambda _e: change_page(-1))
+        viewer.bind("<Right>", lambda _e: change_page(1))
+        def close_viewer():
+            try:
+                if state["render_after"]:
+                    viewer.after_cancel(state["render_after"])
+                document.close()
+            except Exception:
+                pass
+            viewer.destroy()
+        viewer.protocol("WM_DELETE_WINDOW", close_viewer)
+        def maximize_pdf_viewer():
+            try:
+                if not viewer.winfo_exists():
+                    return
+                viewer.deiconify()
+                try:
+                    viewer.state("zoomed")
+                except tk.TclError:
+                    try:
+                        viewer.attributes("-zoomed", True)
+                    except tk.TclError:
+                        pass
+                viewer.update_idletasks()
+                screen_w, screen_h = viewer.winfo_screenwidth(), viewer.winfo_screenheight()
+                if viewer.winfo_width() < int(screen_w * 0.78) or viewer.winfo_height() < int(screen_h * 0.72):
+                    viewer.geometry(f"{screen_w}x{max(600, screen_h - 48)}+0+0")
+                viewer.lift()
+            except tk.TclError:
+                pass
+        viewer.after(180, maximize_pdf_viewer)
+        viewer.after(520, maximize_pdf_viewer)
+        viewer.after(360, render_page)
+
+
+    def _calculate_end_time(self, start_str, duration_mins=45):
+        try:
+            t = datetime.strptime(str(start_str).strip(), "%I:%M %p")
+            total = t.hour * 60 + t.minute + duration_mins
+            h = (total // 60) % 24
+            m = total % 60
+            ampm = "AM" if h < 12 else "PM"
+            h12 = h % 12 or 12
+            return f"{h12:02d}:{m:02d} {ampm}"
+        except Exception:
+            return start_str
+
+    def _get_teacher_slots(self, teacher_id, student_id=None):
+        """Return all weekly slots for a teacher with status: AVAILABLE, BOOKED, or CURRENT SLOT."""
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        std_slots = []
+        for d in days:
+            for h in range(8, 22):
+                for minute in (0, 30):
+                    h12 = h % 12 or 12
+                    ampm = "AM" if h < 12 else "PM"
+                    std_slots.append(f"{d} {h12:02d}:{minute:02d} {ampm}")
+
+        teacher = self.db.conn.execute("SELECT availability FROM teachers WHERE id=?", (teacher_id,)).fetchone()
+        avail_str = (teacher["availability"] or "").strip() if teacher else ""
+        avail_set = {x.strip() for x in avail_str.split(",") if x.strip()} if avail_str else set()
+
+        sched_rows = self.db.conn.execute(
+            "SELECT w.weekday, w.start_time, w.student_id, s.full_name "
+            "FROM weekly_class_schedule w JOIN students s ON s.id=w.student_id "
+            "WHERE w.teacher_id=?", (teacher_id,)).fetchall()
+        booked = {}
+        for r in sched_rows:
+            slot_key = f"{r['weekday']} {r['start_time']}".strip()
+            booked[slot_key] = {"sid": r["student_id"], "name": r["full_name"]}
+
+        stu_rows = self.db.conn.execute(
+            "SELECT s.id, s.full_name, s.class_time FROM students s "
+            "JOIN teacher_students ts ON ts.student_id=s.id "
+            "WHERE ts.teacher_id=? AND s.status='Active' AND COALESCE(s.class_time,'')<>''",
+            (teacher_id,)).fetchall()
+        for r in stu_rows:
+            c_time = str(r["class_time"] or "").strip()
+            if c_time and c_time not in booked:
+                booked[c_time] = {"sid": r["id"], "name": r["full_name"]}
+
+        has_explicit_avail = bool(avail_set and any(any(x.startswith(d) for d in days) for x in avail_set))
+
+        results = []
+        for slot in std_slots:
+            booked_info = booked.get(slot)
+            if booked_info:
+                if student_id and booked_info["sid"] == student_id:
+                    status = "CURRENT SLOT"
+                    name = booked_info["name"]
+                else:
+                    status = "BOOKED"
+                    name = booked_info["name"]
+            elif has_explicit_avail and slot not in avail_set:
+                status = "NOT IN AVAILABILITY"
+                name = "—"
+            else:
+                status = "AVAILABLE"
+                name = "—"
+            results.append({
+                "slot": slot,
+                "status": status,
+                "booked_by": name,
+                "is_current": status == "CURRENT SLOT",
+                "is_available": status in ("AVAILABLE", "CURRENT SLOT")
+            })
+        return results
+
+    def certificate_generator_dialog(self, student_id=None):
+        """Generate high-resolution printable Hifz/Nazra completion certificates with institute branding."""
+        students = self.db.conn.execute("SELECT id, full_name, guardian_name, course FROM students ORDER BY full_name").fetchall()
+        teachers = self.db.conn.execute("SELECT id, full_name FROM teachers ORDER BY full_name").fetchall()
+        if not students:
+            messagebox.showwarning("Records Needed", "No student records found.", parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Certificate Generator / تکمیلِ حفظ و ناظرہ سند")
+        win.geometry("640x520")
+        win.configure(bg=CARD_BG)
+        win.transient(self.root)
+        win.grab_set()
+
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text="Generate Completion Certificate / سند تکمیل", style="Title.TLabel").pack(anchor="w")
+        smart_label(ttk.Label, body, text="Generate an elegant, printable completion certificate with institute branding, student details, and official signature lines.", style="Sub.TLabel", wraplength=580).pack(anchor="w", pady=(2, 12))
+
+        form = ttk.Frame(body)
+        form.pack(fill="x", pady=4)
+
+        smart_label(ttk.Label, form, text="Student / طالب علم").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        student_opts = [f"{r['id']} - {r['full_name']}" for r in students]
+        student_var = tk.StringVar(value=student_opts[0])
+        if student_id:
+            for opt in student_opts:
+                if opt.startswith(f"{student_id} -"):
+                    student_var.set(opt)
+                    break
+        ttk.Combobox(form, textvariable=student_var, values=student_opts, state="readonly", width=34).grid(row=0, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Course / کورس").grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        course_opts = ["Hifz-ul-Quran / حفظ القرآن الكريم", "Nazra Quran / ناظرہ قرآن مجید", "Tajweed-ul-Quran / تجوید القرآن", "Islamic Studies / دینیات", "Custom Course"]
+        course_var = tk.StringVar(value=course_opts[0])
+        ttk.Combobox(form, textvariable=course_var, values=course_opts, state="normal", width=34).grid(row=1, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Completion Date (YYYY-MM-DD)").grid(row=2, column=0, sticky="w", padx=6, pady=5)
+        date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        ttk.Entry(form, textvariable=date_var, width=34).grid(row=2, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Grade / Distinction / درجہ").grid(row=3, column=0, sticky="w", padx=6, pady=5)
+        grade_opts = ["Mumtaz (Distinction) / ممتاز", "Jayyid Jiddan (Very Good) / جید جداً", "Jayyid (Good) / جید", "Maqbool (Passed) / مقبول"]
+        grade_var = tk.StringVar(value=grade_opts[0])
+        ttk.Combobox(form, textvariable=grade_var, values=grade_opts, state="normal", width=34).grid(row=3, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Teacher / نگران استاد").grid(row=4, column=0, sticky="w", padx=6, pady=5)
+        teacher_opts = [r["full_name"] for r in teachers] or ["Principal / مدیر"]
+        teacher_var = tk.StringVar(value=teacher_opts[0])
+        ttk.Combobox(form, textvariable=teacher_var, values=teacher_opts, state="normal", width=34).grid(row=4, column=1, sticky="w", padx=6, pady=5)
+
+        def generate_html_cert():
+            try:
+                sid = int(student_var.get().split(" - ", 1)[0])
+            except Exception:
+                sid = students[0]["id"]
+            stu_row = self.db.conn.execute("SELECT * FROM students WHERE id=?", (sid,)).fetchone()
+            stu_name = stu_row["full_name"] if stu_row else "Student Name"
+            guardian = stu_row["guardian_name"] if (stu_row and stu_row["guardian_name"]) else "Parent / Guardian"
+            course_title = course_var.get()
+            comp_date = date_var.get()
+            grade_val = grade_var.get()
+            t_name = teacher_var.get()
+
+            import base64
+            logo_img_tag = ""
+            if self.logo_path and os.path.isfile(self.logo_path):
+                try:
+                    with open(self.logo_path, "rb") as lf:
+                        b64_logo = base64.b64encode(lf.read()).decode("ascii")
+                        logo_img_tag = f'<img src="data:image/png;base64,{b64_logo}" style="width:90px;height:90px;border-radius:50%;border:3px solid #0F5132;margin-bottom:10px;">'
+                except Exception:
+                    logo_img_tag = ""
+
+            slogan_disp = self._brand_slogan() or ""
+
+            html = f"""<!DOCTYPE html>
+<html lang="ur" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>Completion Certificate - {stu_name}</title>
+<style>
+@page {{ size: landscape; margin: 15mm; }}
+body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, Arial, sans-serif; background: #FAF9F6; margin: 0; padding: 20px; text-align: center; color: #1A3026; }}
+.cert-border {{ border: 12px double #0F5132; padding: 25px; background: #FFFFFF; box-shadow: 0 0 20px rgba(0,0,0,0.1); max-width: 950px; margin: 0 auto; position: relative; }}
+.inner-border {{ border: 2px solid #D4AF37; padding: 30px; position: relative; }}
+.bismillah {{ font-size: 26px; color: #0F5132; margin-bottom: 8px; font-weight: bold; }}
+.inst-title {{ font-size: 28px; font-weight: bold; color: #0F5132; margin: 4px 0; }}
+.inst-subtitle {{ font-size: 16px; color: #5D736A; margin-bottom: 12px; }}
+.cert-header {{ font-size: 32px; font-weight: bold; color: #D4AF37; text-transform: uppercase; margin: 15px 0 20px 0; letter-spacing: 2px; text-shadow: 1px 1px 1px #8C7320; }}
+.cert-body {{ font-size: 18px; line-height: 2.2; margin: 20px 40px; text-align: center; }}
+.stu-name {{ font-size: 26px; font-weight: bold; color: #0F5132; border-bottom: 2px dashed #0F5132; display: inline-block; padding: 0 20px; }}
+.signatures {{ display: flex; justify-content: space-between; margin-top: 50px; padding: 0 50px; }}
+.sig-block {{ width: 220px; text-align: center; border-top: 1px solid #1A3026; padding-top: 8px; font-size: 16px; }}
+.print-btn {{ margin-top: 25px; padding: 10px 24px; background: #0F5132; color: #FFF; border: none; font-size: 16px; border-radius: 6px; cursor: pointer; }}
+@media print {{ .print-btn {{ display: none; }} body {{ background: #FFF; padding: 0; }} .cert-border {{ box-shadow: none; border: 8px double #0F5132; }} }}
+</style>
+</head>
+<body>
+<div class="cert-border">
+  <div class="inner-border">
+    {logo_img_tag}
+    <div class="bismillah">بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ</div>
+    <div class="inst-title">{self.brand_name_ur} / {self.brand_name}</div>
+    <div class="inst-subtitle">{slogan_disp}</div>
+    <div class="cert-header">شهادة إتمام وتقدير / Completion Certificate</div>
+    <div class="cert-body">
+      تشهد إدارة المعهد بأن الطالب / طالب علم <span class="stu-name">{stu_name}</span> ولد / ولدیت <span style="font-weight:bold;">{guardian}</span><br>
+      قد أتم بنجاح دراسة منهج <strong>{course_title}</strong> بتقدير <strong>{grade_val}</strong><br>
+      بتاريخ <strong>{comp_date}</strong>. نسأل الله له التوفيق والثبات والعمل بكتابه العزيز.
+    </div>
+    <div class="signatures">
+      <div class="sig-block">نگران استاد / Teacher<br><strong>{t_name}</strong></div>
+      <div class="sig-block">مہر ادارہ / Seal</div>
+      <div class="sig-block">مہتمم و مدیر / Principal<br><strong>{self.brand_name}</strong></div>
+    </div>
+  </div>
+</div>
+<button class="print-btn" onclick="window.print()">🖨️ Print Certificate / سند پرنٹ کریں</button>
+</body>
+</html>"""
+            tmp_path = os.path.join(tempfile.gettempdir(), f"certificate_{sid}.html")
+            with open(tmp_path, "w", encoding="utf-8") as hf:
+                hf.write(html)
+            self.open_folder(tmp_path) if hasattr(os, "startfile") else None
+            try:
+                import webbrowser
+                webbrowser.open("file://" + os.path.abspath(tmp_path))
+            except Exception:
+                pass
+            messagebox.showinfo("Certificate Generated", "Certificate generated and opened in browser:\n" + str(tmp_path) + "\nUse Print (Ctrl+P) to print or save as PDF.", parent=win)
+            win.destroy()
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(14, 0))
+        ttk.Button(btn_row, text="🖨️ Generate & Preview / سند تیار کریں", style="Accent.TButton", command=generate_html_cert).pack(side="left")
+        ttk.Button(btn_row, text="Close / بند کریں", command=win.destroy).pack(side="right")
+
+    def monthly_report_card_dialog(self, student_id=None):
+        """Generate formatted printable student progress and sabaq report card."""
+        students = self.db.conn.execute("SELECT id, full_name, course FROM students ORDER BY full_name").fetchall()
+        if not students:
+            messagebox.showwarning("Records Needed", "No student records found.", parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Monthly Progress Report Card / ماہانہ تعلیمی رپورٹ کارڈ")
+        win.geometry("640x500")
+        win.configure(bg=CARD_BG)
+        win.transient(self.root)
+        win.grab_set()
+
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text="Monthly Student Progress Card", style="Title.TLabel").pack(anchor="w")
+        smart_label(ttk.Label, body, text="Generate a detailed report card covering daily sabaq, revision, attendance, and teacher remarks.", style="Sub.TLabel", wraplength=580).pack(anchor="w", pady=(2, 10))
+
+        form = ttk.Frame(body)
+        form.pack(fill="x", pady=4)
+
+        smart_label(ttk.Label, form, text="Student / طالب علم").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        student_opts = [f"{r['id']} - {r['full_name']}" for r in students]
+        student_var = tk.StringVar(value=student_opts[0])
+        ttk.Combobox(form, textvariable=student_var, values=student_opts, state="readonly", width=34).grid(row=0, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Month / مہینہ (YYYY-MM)").grid(row=1, column=0, sticky="w", padx=6, pady=5)
+        month_var = tk.StringVar(value=datetime.now().strftime("%Y-%m"))
+        ttk.Entry(form, textvariable=month_var, width=34).grid(row=1, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Sabaq (New Lesson) Score / سبق").grid(row=2, column=0, sticky="w", padx=6, pady=5)
+        sabaq_var = tk.StringVar(value="Excellent / ممتاز")
+        ttk.Entry(form, textvariable=sabaq_var, width=34).grid(row=2, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Sabqi (Recent Revision) / سبقی").grid(row=3, column=0, sticky="w", padx=6, pady=5)
+        sabqi_var = tk.StringVar(value="Good / جید")
+        ttk.Entry(form, textvariable=sabqi_var, width=34).grid(row=3, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Manzil (Old Revision) / منزل").grid(row=4, column=0, sticky="w", padx=6, pady=5)
+        manzil_var = tk.StringVar(value="Regular / باقاعدہ")
+        ttk.Entry(form, textvariable=manzil_var, width=34).grid(row=4, column=1, sticky="w", padx=6, pady=5)
+
+        smart_label(ttk.Label, form, text="Teacher Remarks / تبصرہ").grid(row=5, column=0, sticky="w", padx=6, pady=5)
+        remarks_var = tk.StringVar(value="ماشاء اللہ! محنتی طالب علم ہیں۔ روزانہ باقاعدگی سے پڑھتے ہیں۔")
+        ttk.Entry(form, textvariable=remarks_var, width=34).grid(row=5, column=1, sticky="w", padx=6, pady=5)
+
+        def print_report():
+            try: sid = int(student_var.get().split(" - ", 1)[0])
+            except Exception: sid = students[0]["id"]
+            stu_row = self.db.conn.execute("SELECT * FROM students WHERE id=?", (sid,)).fetchone()
+            stu_name = stu_row["full_name"] if stu_row else "Student"
+            course_name = stu_row["course"] if stu_row else "Quran"
+            month = month_var.get()
+
+            # Calculate attendance stats for this month
+            att_rows = self.db.conn.execute("SELECT status FROM attendance WHERE student_id=? AND class_date LIKE ?", (sid, f"{month}%")).fetchall()
+            total_days = len(att_rows)
+            present_days = sum(1 for r in att_rows if str(r["status"]).lower().startswith("present"))
+            att_pct = f"{int(present_days*100/total_days)}%" if total_days else "100%"
+
+            html = f"""<!DOCTYPE html>
+<html lang="ur" dir="rtl">
+<head>
+<meta charset="utf-8">
+<title>Progress Report - {stu_name} - {month}</title>
+<style>
+body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; background: #F8FAF8; padding: 25px; color: #132D23; }}
+.card {{ background: #FFF; border: 2px solid #0F5132; max-width: 800px; margin: 0 auto; padding: 30px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border-radius: 8px; }}
+.header {{ text-align: center; border-bottom: 2px solid #D4AF37; padding-bottom: 15px; margin-bottom: 20px; }}
+.inst-name {{ font-size: 26px; font-weight: bold; color: #0F5132; }}
+.table {{ width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 16px; }}
+.table th, .table td {{ border: 1px solid #DCE5E0; padding: 10px 14px; text-align: right; }}
+.table th {{ background: #E8F4EE; color: #0F5132; font-weight: bold; }}
+.print-btn {{ display: block; margin: 20px auto 0 auto; padding: 10px 24px; background: #0F5132; color: #FFF; border: none; font-size: 16px; border-radius: 6px; cursor: pointer; }}
+@media print {{ .print-btn {{ display: none; }} body {{ padding: 0; background: #FFF; }} .card {{ box-shadow: none; }} }}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="header">
+    <div class="inst-name">{self.brand_name_ur} / {self.brand_name}</div>
+    <div style="font-size:18px;color:#D4AF37;font-weight:bold;margin-top:5px;">ماہانہ تعلیمی کارکردگی رپورٹ کارڈ / Monthly Progress Report</div>
+    <div style="font-size:14px;color:#5D736A;margin-top:4px;">مہینہ: {month}</div>
+  </div>
+  <table class="table">
+    <tr><th>طالب علم کا نام / Student Name</th><td><strong>{stu_name}</strong></td><th>کورس / Course</th><td>{course_name}</td></tr>
+    <tr><th>سبق کی کیفیت / Daily Lesson (Sabaq)</th><td colspan="3">{sabaq_var.get()}</td></tr>
+    <tr><th>سبقی کی کیفیت / Recent Revision (Sabqi)</th><td colspan="3">{sabqi_var.get()}</td></tr>
+    <tr><th>منزل کی کیفیت / Old Revision (Manzil)</th><td colspan="3">{manzil_var.get()}</td></tr>
+    <tr><th>ماہانہ حاضری / Attendance</th><td colspan="3">{att_pct} ({present_days}/{total_days} دن حاضر)</td></tr>
+    <tr><th>استاد کا تبصرہ / Teacher Remarks</th><td colspan="3" style="color:#0F5132;font-weight:bold;">{remarks_var.get()}</td></tr>
+  </table>
+  <div style="display:flex;justify-content:space-between;margin-top:40px;padding:0 30px;">
+    <div>دستخط نگران استاد: _______________</div>
+    <div>دستخط سرپرست: _______________</div>
+    <div>مہر ادارہ: _______________</div>
+  </div>
+</div>
+<button class="print-btn" onclick="window.print()">🖨️ Print Report Card / رپورٹ پرنٹ کریں</button>
+</body>
+</html>"""
+            tmp_path = os.path.join(tempfile.gettempdir(), f"report_card_{sid}.html")
+            with open(tmp_path, "w", encoding="utf-8") as hf:
+                hf.write(html)
+            try:
+                import webbrowser
+                webbrowser.open("file://" + os.path.abspath(tmp_path))
+            except Exception:
+                pass
+            messagebox.showinfo("Report Card Generated", "Progress report card generated:\n" + str(tmp_path), parent=win)
+            win.destroy()
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(14, 0))
+        ttk.Button(btn_row, text="🖨️ Generate & Print / رپورٹ تیار کریں", style="Accent.TButton", command=print_report).pack(side="left")
+        ttk.Button(btn_row, text="Close / بند کریں", command=win.destroy).pack(side="right")
+
+    def link_and_restore_backup_folder(self, initial_folder=None):
+        """Browse an existing backup folder, list verified backups with student/teacher/payment counts, and safely restore with pre-restore safety copy."""
+        from pathlib import Path
+        default_dir = _default_backup_dir()
+        folder = initial_folder or filedialog.askdirectory(
+            parent=self.root, title="Link Existing Backup Folder / پرانا بیک اپ فولڈر چنیں",
+            initialdir=default_dir if os.path.isdir(default_dir) else os.path.dirname(os.path.abspath(self.db.path))
+        )
+        if not folder or not os.path.isdir(folder):
+            return
+
+        self._save_setting("backup_primary_folder", folder)
+
+        win = tk.Toplevel(self.root)
+        win.title("Link Backup Folder & Restore / بیک اپ فولڈر اور بحالی")
+        win.geometry("920x560")
+        win.minsize(780, 440)
+        win.configure(bg=CARD_BG)
+        win.transient(self.root)
+        win.grab_set()
+
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+
+        smart_label(ttk.Label, body, text="Linked Backup Folder / منسلک شدہ بیک اپ فولڈر", style="Title.TLabel").pack(anchor="w")
+        smart_label(ttk.Label, body, text=f"Folder: {folder}", style="Sub.TLabel").pack(anchor="w", pady=(2, 6))
+
+        # Scan for backup files
+        backup_files = []
+        for root_dir, _, files in os.walk(folder):
+            for f in files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in (".sqlite3", ".db", ".bak"):
+                    full_p = os.path.join(root_dir, f)
+                    try:
+                        mtime = os.path.getmtime(full_p)
+                        size_mb = os.path.getsize(full_p) / (1024 * 1024)
+                        backup_files.append((mtime, full_p, size_mb))
+                    except OSError:
+                        pass
+        backup_files.sort(key=lambda x: x[0], reverse=True)
+
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(fill="both", expand=True, pady=6)
+
+        cols = ("date", "name", "size", "integrity", "students", "teachers", "payments")
+        btree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=12)
+        btree.heading("date", text="Date / تاریخ")
+        btree.heading("name", text="Filename / فائل کا نام")
+        btree.heading("size", text="Size / حجم")
+        btree.heading("integrity", text="Integrity / صحت")
+        btree.heading("students", text="Students")
+        btree.heading("teachers", text="Teachers")
+        btree.heading("payments", text="Payments")
+
+        btree.column("date", width=140)
+        btree.column("name", width=220)
+        btree.column("size", width=80, anchor="e")
+        btree.column("integrity", width=90, anchor="center")
+        btree.column("students", width=70, anchor="center")
+        btree.column("teachers", width=70, anchor="center")
+        btree.column("payments", width=80, anchor="center")
+
+        bsb = ttk.Scrollbar(tree_frame, orient="vertical", command=btree.yview)
+        btree.configure(yscrollcommand=bsb.set)
+        btree.pack(side="left", fill="both", expand=True)
+        bsb.pack(side="right", fill="y")
+
+        file_map = {}
+        for idx, (mtime, full_p, size_mb) in enumerate(backup_files):
+            dt_str = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+            fname = os.path.basename(full_p)
+            integ = "Checking..."
+            stu_cnt, tea_cnt, pay_cnt = "—", "—", "—"
+            try:
+                src = sqlite3.connect(Path(full_p).resolve().as_uri() + "?mode=ro", uri=True)
+                check = src.execute("PRAGMA integrity_check").fetchone()[0]
+                integ = "OK" if check == "ok" else "Damaged"
+                if check == "ok":
+                    tbls = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    if "students" in tbls: stu_cnt = str(src.execute("SELECT COUNT(*) FROM students").fetchone()[0])
+                    if "teachers" in tbls: tea_cnt = str(src.execute("SELECT COUNT(*) FROM teachers").fetchone()[0])
+                    if "payments" in tbls: pay_cnt = str(src.execute("SELECT COUNT(*) FROM payments").fetchone()[0])
+                src.close()
+            except Exception:
+                integ = "Unreadable"
+
+            item_id = str(idx)
+            file_map[item_id] = full_p
+            btree.insert("", "end", iid=item_id, values=(dt_str, fname, f"{size_mb:.2f} MB", integ, stu_cnt, tea_cnt, pay_cnt))
+
+        def restore_selected():
+            sel = btree.selection()
+            if not sel:
+                messagebox.showwarning("Select Backup", "Please choose a backup file from the list to restore.", parent=win)
+                return
+            target_file = file_map[sel[0]]
+            vals = btree.item(sel[0], "values")
+            if vals[3] != "OK":
+                messagebox.showerror("Damaged Backup", "This backup file failed the integrity check and cannot be safely restored.", parent=win)
+                return
+
+            confirm_msg = (
+                "Selected Backup: " + str(vals[1]) + " (" + str(vals[0]) + ")\n"
+                "Contains: " + str(vals[4]) + " Students, " + str(vals[5]) + " Teachers, " + str(vals[6]) + " Payments.\n\n"
+                "WARNING: Restoring will replace all current data with this backup.\n"
+                "An automatic safety copy of your current active data will be created first.\n\n"
+                "Do you want to proceed with restore?"
+            )
+            if not messagebox.askyesno("Confirm Restore / بحالی کی تصدیق", confirm_msg, icon="warning", parent=win):
+                return
+
+            safety_folder = os.path.join(os.path.dirname(os.path.abspath(self.db.path)), "backups")
+            os.makedirs(safety_folder, exist_ok=True)
+            safety_copy = os.path.join(safety_folder, f"safety_before_restore_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite3")
+            try:
+                self.make_verified_backup(safety_copy)
+                src = sqlite3.connect(Path(target_file).resolve().as_uri() + "?mode=ro", uri=True)
+                with self.db.conn:
+                    src.backup(self.db.conn)
+                src.close()
+                self._save_setting("backup_last_auto", timestamp())
+                messagebox.showinfo("Restore Complete / بحالی مکمل", "Backup restored successfully!\nPre-restore safety copy saved at:\n" + str(safety_copy) + "\n\nThe application will now refresh.", parent=win)
+                win.destroy()
+                self.dashboard()
+            except Exception as exc:
+                messagebox.showerror("Restore Failed", "Could not complete restore:\n" + str(exc) + "\nYour previous data was preserved.", parent=win)
+
+        btn_row = ttk.Frame(body)
+        btn_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_row, text="♻️ Restore Selected Backup / منتخب بیک اپ بحال کریں", style="Accent.TButton", command=restore_selected).pack(side="left")
+        ttk.Button(btn_row, text="📂 Open Folder in Explorer", command=lambda: self.open_folder(folder)).pack(side="left", padx=8)
+        ttk.Button(btn_row, text="Close / بند کریں", command=win.destroy).pack(side="right")
+
+    def settings_page(self, parent):
+        """Central offline settings for institution identity and branding with live preview, presets, and persistent backup."""
+        is_admin = bool(self.user and self.user.get("role") == "admin")
+        self.page_title(parent, "⚙️ Institution Settings / ادارے کی ترتیبات",
+                        "Changes are saved locally in this database. No internet or cloud account is required.")
+        if not is_admin:
+            info_card = tk.Frame(parent, bg=PALE, highlightbackground=BORDER, highlightthickness=1, padx=14, pady=10)
+            info_card.pack(fill="x", pady=(0, 10))
+            smart_label(tk.Label, info_card,
+                        text="🔒 Read-only view: Only an administrator can modify institution identity, branding, and colors. / صرف ایڈمن ترتیبات تبدیل کر سکتے ہیں۔",
+                        bg=PALE, fg=DARK, font=(UI_FONT, 10, "bold"), anchor="w").pack(anchor="w")
+
+        entry_state = "normal" if is_admin else "disabled"
+        combo_state = "readonly" if is_admin else "disabled"
+
+        form = ttk.LabelFrame(parent, text="Institution identity & Branding / ادارے کی شناخت اور برانڈنگ", padding=16)
+        form.pack(fill="x", pady=(0, 12))
+
+        en_var = tk.StringVar(value=self.brand_name)
+        ur_var = tk.StringVar(value=self.brand_name_ur)
+        slogan_en_var = tk.StringVar(value=self.settings.get("institution_slogan_en", getattr(self, "slogan_en", "")) or "")
+        slogan_ur_var = tk.StringVar(value=self.settings.get("institution_slogan_ur", getattr(self, "slogan_ur", "")) or "")
+        logo_var = tk.StringVar(value=self.logo_path)
+        primary_var = tk.StringVar(value=self.settings.get("primary_color", GREEN))
+        bg_var = tk.StringVar(value=self.settings.get("background_color", APP_BG))
+        text_color_var = tk.StringVar(value=self.settings.get("text_color", DARK))
+        font_size_var = tk.StringVar(value=str(self.settings.get("font_size", "12")))
+
+        preset_keys = ["emerald", "royal_blue", "teal", "purple", "charcoal", "custom"]
+        preset_labels = {
+            "emerald": "Emerald & Gold (Default) / زمرد اور سنہری",
+            "royal_blue": "Royal Blue & Gold / شاہی نیلا اور سنہری",
+            "teal": "Teal & Amber / نیلگوں اور عنبری",
+            "purple": "Deep Purple & Mint / گہرا جامنی اور پودینہ",
+            "charcoal": "Charcoal & Green / کوئلہ اور سبز",
+            "custom": "Custom Color / اپنی مرضی کا رنگ",
+        }
+        current_preset = str(self.settings.get("theme_preset", "emerald") or "emerald").strip().lower()
+        if current_preset not in preset_labels:
+            current_preset = "emerald"
+        theme_preset_var = tk.StringVar(value=preset_labels[current_preset])
+
+        try:
+            installed_fonts = sorted({str(x) for x in self.root.tk.call("font", "families")}, key=str.casefold)
+        except Exception:
+            installed_fonts = ["Arial", "Aptos", "Segoe UI", "Tahoma", "Jameel Noori Nastaleeq", "Noto Nastaliq Urdu"]
+        english_options = [x for x in ("Arial", "Aptos", "Segoe UI", "Tahoma", "Calibri") if x.casefold() in {f.casefold() for f in installed_fonts}]
+        english_options += [x for x in installed_fonts if x not in english_options and x.casefold() not in {y.casefold() for y in english_options}]
+        urdu_options = [x for x in ("Jameel Noori Nastaleeq", "Noto Nastaliq Urdu", "Noto Nastaliq Urdu UI", "Urdu Typesetting", "Nafees Nastaleeq", "Segoe UI") if x.casefold() in {f.casefold() for f in installed_fonts}]
+        if not urdu_options:
+            urdu_options = [choose_urdu_font(self.root)]
+        english_font_var = tk.StringVar(value=self.settings.get("english_font", UI_FONT))
+        urdu_font_var = tk.StringVar(value=self.settings.get("urdu_font", URDU_FONT))
+
+        # Row 0: English Name
+        smart_label(ttk.Label, form, text="Institution name (English) / ادارے کا انگریزی نام").grid(row=0, column=0, sticky="w", padx=7, pady=6)
+        ttk.Entry(form, textvariable=en_var, width=38, state=entry_state).grid(row=0, column=1, sticky="w", padx=7, pady=6)
+
+        # Row 1: Urdu Name
+        smart_label(ttk.Label, form, text="Institution name (Urdu) / ادارے کا اردو نام").grid(row=1, column=0, sticky="w", padx=7, pady=6)
+        ttk.Entry(form, textvariable=ur_var, width=38, state=entry_state).grid(row=1, column=1, sticky="w", padx=7, pady=6)
+
+        # Row 2: English Slogan
+        smart_label(ttk.Label, form, text="Tagline / Slogan (English) / انگریزی سلوگن").grid(row=2, column=0, sticky="w", padx=7, pady=6)
+        ttk.Entry(form, textvariable=slogan_en_var, width=38, state=entry_state).grid(row=2, column=1, sticky="w", padx=7, pady=6)
+
+        # Row 3: Urdu Slogan
+        smart_label(ttk.Label, form, text="Tagline / Slogan (Urdu) / اردو سلوگن").grid(row=3, column=0, sticky="w", padx=7, pady=6)
+        ttk.Entry(form, textvariable=slogan_ur_var, width=38, state=entry_state).grid(row=3, column=1, sticky="w", padx=7, pady=6)
+
+        # Row 4: Logo image + Live Preview Canvas
+        smart_label(ttk.Label, form, text="Logo image / ادارے کا لوگو").grid(row=4, column=0, sticky="w", padx=7, pady=6)
+        logo_area = ttk.Frame(form)
+        logo_area.grid(row=4, column=1, sticky="ew", padx=7, pady=6)
+
+        preview_canvas = tk.Canvas(logo_area, width=84, height=84, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
+        preview_canvas.pack(side="left", padx=(0, 12))
+        preview_ref = {"img": None}
+
+        def update_logo_preview():
+            path = logo_var.get().strip()
+            preview_canvas.delete("all")
+            if path and os.path.isfile(path) and Image is not None and ImageTk is not None:
+                try:
+                    photo = self._circular_logo_photo(path, 76, GREEN, 2)
+                    preview_ref["img"] = photo
+                    preview_canvas.create_image(42, 42, image=photo)
+                    return
+                except Exception:
+                    pass
+            # Fallback circle
+            preview_canvas.create_oval(8, 8, 76, 76, fill=PALE, outline=GREEN, width=2)
+            preview_canvas.create_text(42, 42, text="📖", font=("Segoe UI Emoji", 26))
+
+        logo_controls = ttk.Frame(logo_area)
+        logo_controls.pack(side="left", fill="both", expand=True)
+        ttk.Entry(logo_controls, textvariable=logo_var, state=entry_state).pack(fill="x", pady=(0, 6))
+
+        def crop_selected_logo(path):
+            try:
+                branding_dir = os.path.join(os.path.dirname(os.path.abspath(self.db.path)), "branding")
+                os.makedirs(branding_dir, exist_ok=True)
+                target = os.path.join(branding_dir, "institution_logo.png")
+                if self._show_logo_cropper(path, target):
+                    logo_var.set(target)
+                    update_logo_preview()
+            except OSError as exc:
+                messagebox.showerror("Logo could not be saved / لوگو محفوظ نہیں ہوا",
+                                     "Could not save the adjusted logo in the local branding folder:\n" + str(exc), parent=self.root)
+
+        def pick_logo():
+            path = filedialog.askopenfilename(
+                parent=self.root, title="Choose institution logo",
+                filetypes=[("Image files", "*.png *.jpg *.jpeg *.gif *.bmp *.webp *.tif *.tiff"), ("All files", "*.*")])
+            if path:
+                crop_selected_logo(path)
+
+        def edit_logo():
+            path = logo_var.get().strip()
+            if not path or not os.path.isfile(path):
+                pick_logo()
+            else:
+                crop_selected_logo(path)
+
+        def remove_logo():
+            logo_var.set("")
+            update_logo_preview()
+
+        btn_row_logo = ttk.Frame(logo_controls)
+        btn_row_logo.pack(anchor="w")
+        ttk.Button(btn_row_logo, text="Choose & crop… / منتخب کریں", command=pick_logo, state=entry_state).pack(side="left")
+        ttk.Button(btn_row_logo, text="Adjust / فریم درست کریں", command=edit_logo, state=entry_state).pack(side="left", padx=6)
+        ttk.Button(btn_row_logo, text="Remove logo / ڈیفالٹ", command=remove_logo, state=entry_state).pack(side="left", padx=6)
+        update_logo_preview()
+
+        # Row 5: Theme Presets Dropdown & Reset Theme
+        smart_label(ttk.Label, form, text="Theme preset / ڈیزائن و رنگ").grid(row=5, column=0, sticky="w", padx=7, pady=6)
+        preset_row = ttk.Frame(form)
+        preset_row.grid(row=5, column=1, sticky="ew", padx=7, pady=6)
+        preset_combo = ttk.Combobox(preset_row, textvariable=theme_preset_var, values=list(preset_labels.values()), state=combo_state, width=36)
+        preset_combo.pack(side="left")
+
+        def on_preset_selected(_e=None):
+            sel_val = theme_preset_var.get()
+            chosen_key = "emerald"
+            for k, label in preset_labels.items():
+                if label == sel_val:
+                    chosen_key = k
+                    break
+            if chosen_key in THEME_PRESETS:
+                p_col = THEME_PRESETS[chosen_key]["primary"]
+                primary_var.set(p_col)
+
+        preset_combo.bind("<<ComboboxSelected>>", on_preset_selected)
+
+        def reset_to_emerald():
+            theme_preset_var.set(preset_labels["emerald"])
+            primary_var.set(THEME_PRESETS["emerald"]["primary"])
+            bg_var.set(DEFAULT_BACKGROUND_COLOR)
+            text_color_var.set(DEFAULT_TEXT_COLOR)
+
+        ttk.Button(preset_row, text="Reset to Default Theme / اصل تھیم", command=reset_to_emerald, state=entry_state).pack(side="left", padx=(8, 0))
+
+        # Row 6: Primary Color
+        smart_label(ttk.Label, form, text="Primary color / بنیادی رنگ (HEX)").grid(row=6, column=0, sticky="w", padx=7, pady=6)
+        color_row = ttk.Frame(form)
+        color_row.grid(row=6, column=1, sticky="ew", padx=7, pady=6)
+        ttk.Entry(color_row, textvariable=primary_var, width=16, state=entry_state).pack(side="left")
+        ttk.Button(color_row, text="Choose…", command=lambda: self._choose_color(primary_var), state=entry_state).pack(side="left", padx=6)
+
+        # Row 7: Background & Text Colors
+        smart_label(ttk.Label, form, text="Background color / پس منظر کا رنگ").grid(row=7, column=0, sticky="w", padx=7, pady=6)
+        bg_row = ttk.Frame(form)
+        bg_row.grid(row=7, column=1, sticky="ew", padx=7, pady=6)
+        ttk.Entry(bg_row, textvariable=bg_var, width=16, state=entry_state).pack(side="left")
+        ttk.Button(bg_row, text="Choose…", command=lambda: self._choose_color(bg_var), state=entry_state).pack(side="left", padx=6)
+
+        smart_label(ttk.Label, form, text="Text color / تحریر کا رنگ").grid(row=8, column=0, sticky="w", padx=7, pady=6)
+        text_row = ttk.Frame(form)
+        text_row.grid(row=8, column=1, sticky="w", padx=7, pady=6)
+        ttk.Entry(text_row, textvariable=text_color_var, width=16, state=entry_state).pack(side="left")
+        ttk.Button(text_row, text="Choose…", command=lambda: self._choose_color(text_color_var), state=entry_state).pack(side="left", padx=6)
+
+        # Row 9: Fonts
+        smart_label(ttk.Label, form, text="English font / انگریزی فونٹ").grid(row=9, column=0, sticky="w", padx=7, pady=6)
+        ttk.Combobox(form, textvariable=english_font_var, values=english_options, state=combo_state, width=34).grid(row=9, column=1, sticky="w", padx=7, pady=6)
+
+        smart_label(ttk.Label, form, text="Urdu font / اردو فونٹ").grid(row=10, column=0, sticky="w", padx=7, pady=6)
+        ttk.Combobox(form, textvariable=urdu_font_var, values=urdu_options, state=combo_state, width=34).grid(row=10, column=1, sticky="w", padx=7, pady=6)
+
+        smart_label(ttk.Label, form, text="Font size / فونٹ سائز").grid(row=11, column=0, sticky="w", padx=7, pady=6)
+        font_row = ttk.Frame(form)
+        font_row.grid(row=11, column=1, sticky="w", padx=7, pady=6)
+        ttk.Spinbox(font_row, from_=9, to=24, increment=1, textvariable=font_size_var, width=6, state=entry_state).pack(side="left")
+        ttk.Label(font_row, text="  9 = Small   12 = Normal   16 = Large   24 = Extra large").pack(side="left")
+
+        # Separate font-size controls
+        area_size_vars = {
+            "heading": tk.StringVar(value=str(self.settings.get("font_size_heading", "14"))),
+            "body": tk.StringVar(value=str(self.settings.get("font_size_body", "12"))),
+            "fields": tk.StringVar(value=str(self.settings.get("font_size_fields", "12"))),
+            "buttons": tk.StringVar(value=str(self.settings.get("font_size_buttons", "12"))),
+            "tables": tk.StringVar(value=str(self.settings.get("font_size_tables", "11"))),
+        }
+        area_rows = [
+            ("Headings / عنوان", "heading"),
+            ("General text / عام متن", "body"),
+            ("Form fields / فارم کے خانے", "fields"),
+            ("Buttons / بٹن", "buttons"),
+            ("Tables / ٹیبل", "tables"),
+        ]
+        area_box = ttk.LabelFrame(form, text="Separate font sizes / مختلف حصوں کے الگ فونٹ سائز", padding=10)
+        area_box.grid(row=12, column=0, columnspan=2, sticky="ew", padx=7, pady=(8, 4))
+        def set_all_area_sizes(*_):
+            value = font_size_var.get().strip()
+            for var in area_size_vars.values():
+                var.set(value)
+        ttk.Button(font_row, text="Set all sizes / سب پر لاگو", command=set_all_area_sizes, state=entry_state).pack(side="left", padx=(8, 0))
+        for idx, (label_text, key) in enumerate(area_rows):
+            smart_label(ttk.Label, area_box, text=label_text).grid(row=idx // 3, column=(idx % 3) * 2, sticky="w", padx=(6, 3), pady=5)
+            ttk.Spinbox(area_box, from_=9, to=24, increment=1, textvariable=area_size_vars[key], width=5, state=entry_state).grid(row=idx // 3, column=(idx % 3) * 2 + 1, sticky="w", padx=(0, 12), pady=5)
+
+        form.grid_columnconfigure(1, weight=1)
+
+        buttons = ttk.Frame(parent)
+        buttons.pack(anchor="w", pady=10)
+
+        def save_settings():
+            nonlocal en_var, ur_var, slogan_en_var, slogan_ur_var, logo_var, primary_var, bg_var
+            if not is_admin:
+                messagebox.showerror("Permission denied", "Only an administrator can change institution settings.", parent=self.root)
+                return
+            en = en_var.get().strip() or DEFAULT_INSTITUTION_NAME
+            ur = ur_var.get().strip() or DEFAULT_INSTITUTION_NAME_UR
+            s_en = slogan_en_var.get().strip()
+            s_ur = slogan_ur_var.get().strip()
+            pc = primary_var.get().strip()
+            bc = bg_var.get().strip()
+            tc = text_color_var.get().strip()
+            try:
+                self.root.winfo_rgb(pc)
+                self.root.winfo_rgb(bc)
+                if tc.lower() not in ("", "auto"):
+                    self.root.winfo_rgb(tc)
+                else:
+                    tc = "auto"
+            except tk.TclError:
+                messagebox.showerror("Invalid color", "Enter valid Tk color values, such as #0F7457 and #EAF4F0.", parent=self.root)
+                return
+            lp = logo_var.get().strip()
+            if lp and not os.path.isfile(lp):
+                if not messagebox.askyesno("Logo not found", "The selected logo file is not currently accessible. Save its path anyway?", parent=self.root):
+                    return
+            try:
+                chosen_font_size = int(font_size_var.get())
+                if not 9 <= chosen_font_size <= 24:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid font size", "Choose a font size between 9 and 24.", parent=self.root)
+                return
+
+            sel_preset = "custom"
+            for k, label in preset_labels.items():
+                if label == theme_preset_var.get():
+                    sel_preset = k
+                    break
+
+            area_sizes = {}
+            try:
+                for key, var in area_size_vars.items():
+                    value = int(var.get())
+                    if not 9 <= value <= 24:
+                        raise ValueError
+                    area_sizes["font_size_" + key] = str(value)
+            except ValueError:
+                messagebox.showerror("Invalid font size", "Each area font size must be between 9 and 24.", parent=self.root)
+                return
+
+            values = {
+                "institution_name_en": en,
+                "institution_name_ur": ur,
+                "institution_slogan_en": s_en,
+                "institution_slogan_ur": s_ur,
+                "logo_path": lp,
+                "theme_preset": sel_preset,
+                "primary_color": pc,
+                "background_color": bc,
+                "text_color": tc,
+                "english_font": english_font_var.get().strip() or "Arial",
+                "urdu_font": urdu_font_var.get().strip() or "Jameel Noori Nastaleeq",
+                "font_size": str(chosen_font_size),
+                **area_sizes
+            }
+            self.db.conn.executemany("INSERT INTO app_settings(setting_key,setting_value) VALUES(?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value", values.items())
+            self.db.conn.commit()
+            self.settings.update(values)
+            self.brand_name = en
+            self.brand_name_ur = ur
+            self.slogan_en = s_en
+            self.slogan_ur = s_ur
+            self.logo_path = lp
+
+            global GREEN, GREEN_HOVER, APP_BG, DARK, FONT_SCALE, UI_FONT, UI_BOLD_FONT, URDU_FONT
+            GREEN = pc
+            GREEN_HOVER = pc
+            APP_BG = bc
+            DARK = tc if tc != "auto" else DARK
+            FONT_SCALE = chosen_font_size / 10.0
+            self.root._taha_font_sizes = {
+                "global": chosen_font_size,
+                "heading": int(values["font_size_heading"]),
+                "body": int(values["font_size_body"]),
+                "fields": int(values["font_size_fields"]),
+                "buttons": int(values["font_size_buttons"]),
+                "tables": int(values["font_size_tables"]),
+            }
+            UI_FONT = values["english_font"]
+            UI_BOLD_FONT = UI_FONT
+            URDU_FONT = values["urdu_font"]
+            self._apply_theme_palette()
+            self.root.title(en)
+            self.style()
+            messagebox.showinfo("Settings saved / ترتیبات محفوظ", "Institution identity and branding saved locally. Changes are applied live across the dashboard and reports.", parent=self.root)
+            self.dashboard()
+            apply_script_fonts(self.root)
+
+        if is_admin:
+            ttk.Button(buttons, text="💾 Save & Apply / محفوظ کریں", style="Accent.TButton", command=save_settings).pack(side="left", padx=(0, 8))
+            ttk.Button(buttons, text="🎨 Customize Header / ہیڈر کسٹمائز کریں", command=self.header_customizer).pack(side="left", padx=8)
+
+        # -----------------------------------------------------------------
+        # Dedicated Persistent Database Backup & Relink Box
+        # -----------------------------------------------------------------
+        backup_card = ttk.LabelFrame(parent, text="Persistent Database Backup & Restore / ڈیٹا بیس بیک اپ و بحالی", padding=14)
+        backup_card.pack(fill="x", pady=(10, 0))
+
+        default_backup_path = self.settings.get("backup_primary_folder", _default_backup_dir())
+        prim_var = tk.StringVar(value=default_backup_path)
+        last_b_time = self.settings.get("backup_last_auto", "")
+        last_b_text = f"Last backup: {last_b_time}" if last_b_time else "No backup recorded yet"
+
+        b_row1 = ttk.Frame(backup_card)
+        b_row1.pack(fill="x", pady=4)
+        smart_label(ttk.Label, b_row1, text="Primary Backup Folder / مرکزی بیک اپ فولڈر: ").pack(side="left")
+        ttk.Label(b_row1, textvariable=prim_var, font=(UI_FONT, 9, "bold")).pack(side="left", padx=6)
+
+        def choose_primary_backup_dir():
+            p = filedialog.askdirectory(parent=self.root, title="Choose Primary Backup Folder", initialdir=prim_var.get())
+            if p:
+                prim_var.set(p)
+                self._save_setting("backup_primary_folder", p)
+
+        ttk.Button(b_row1, text="Change Folder / منتخب کریں", command=choose_primary_backup_dir, state=entry_state).pack(side="left", padx=6)
+        ttk.Button(b_row1, text="📂 Open Folder", command=lambda: self.open_folder(prim_var.get())).pack(side="left", padx=4)
+
+        b_row2 = ttk.Frame(backup_card)
+        b_row2.pack(fill="x", pady=6)
+        ttk.Label(b_row2, text=f"Status: {last_b_text}", style="Sub.TLabel").pack(side="left")
+
+        b_actions = ttk.Frame(backup_card)
+        b_actions.pack(anchor="w", pady=(6, 0))
+
+        def trigger_instant_backup():
+            folder = prim_var.get().strip() or _default_backup_dir()
+            try:
+                os.makedirs(folder, exist_ok=True)
+                target = os.path.join(folder, f"backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite3")
+                self.make_verified_backup(target)
+                self._save_setting("backup_last_auto", timestamp())
+                messagebox.showinfo("Backup Complete / بیک اپ مکمل", "Verified backup successfully created:\n" + target, parent=self.root)
+            except Exception as exc:
+                messagebox.showerror("Backup Failed", str(exc), parent=self.root)
+
+        ttk.Button(b_actions, text="🛡️ Back up now / ابھی بیک اپ", style="Accent.TButton", command=trigger_instant_backup, state=entry_state).pack(side="left", padx=(0, 8))
+        ttk.Button(b_actions, text="📁 Link Existing Backup Folder / پرانا فولڈر منسلک کریں", command=lambda: self.link_and_restore_backup_folder(), state=entry_state).pack(side="left", padx=6)
+        ttk.Button(b_actions, text="♻️ Direct Restore from Backup File…", command=self.restore_backup, state=entry_state).pack(side="left", padx=6)
+
+        # -----------------------------------------------------------------
+        # Interface Background & Layout (Wallpaper)
+        # -----------------------------------------------------------------
+        appearance_box = ttk.LabelFrame(parent, text="Interface Background & Layout / انٹرفیس کا پس منظر اور ترتیب", padding=12)
+        appearance_box.pack(fill="x", pady=(10, 0))
+        wallpaper_path_var = tk.StringVar(value=str(self.settings.get("background_image_path", "") or ""))
+        wallpaper_trans_var = tk.IntVar(value=max(0, min(100, int(self.settings.get("background_transparency", "68") or 68))) if str(self.settings.get("background_transparency", "68")).strip().isdigit() else 68)
+        nav_orientation_var = tk.StringVar(value=str(self.settings.get("nav_orientation", "row") or "row"))
+        wallpaper_path_row = ttk.Frame(appearance_box)
+        wallpaper_path_row.pack(fill="x", pady=(0, 5))
+        ttk.Label(wallpaper_path_row, text="Background image / پس منظر کی تصویر").pack(side="left", padx=(0, 8))
+        ttk.Entry(wallpaper_path_row, textvariable=wallpaper_path_var, state=entry_state).pack(side="left", fill="x", expand=True, padx=4)
+        def browse_wallpaper():
+            selected = filedialog.askopenfilename(parent=self.root, title="Choose background image / پس منظر کی تصویر منتخب کریں",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
+            if selected:
+                wallpaper_path_var.set(os.path.abspath(selected))
+                self._refresh_page_wallpaper(parent, wallpaper_path_var.get(), wallpaper_trans_var.get())
+        ttk.Button(wallpaper_path_row, text="Browse / منتخب کریں", command=browse_wallpaper, state=entry_state).pack(side="left", padx=(4, 0))
+        def remove_wallpaper():
+            wallpaper_path_var.set("")
+            self._refresh_page_wallpaper(parent, "", 68)
+        ttk.Button(wallpaper_path_row, text="Remove / Default / پس منظر ہٹائیں", command=remove_wallpaper, state=entry_state).pack(side="left", padx=(4, 0))
+
+        trans_row = ttk.Frame(appearance_box)
+        trans_row.pack(fill="x", pady=4)
+        ttk.Label(trans_row, text="Background transparency 0 = visible • 100 = hidden / شفافیت ۰ = نمایاں، ۱۰۰ = پوشیدہ").pack(side="left", padx=(0, 8))
+        transparency_value = ttk.Label(trans_row, text=f"{wallpaper_trans_var.get()}%", width=6)
+        transparency_value.pack(side="right")
+        def on_transparency(value):
+            try:
+                amount = max(0, min(100, int(float(value))))
+            except (TypeError, ValueError):
+                amount = 68
+            transparency_value.configure(text=f"{amount}%")
+            self._refresh_page_wallpaper(parent, wallpaper_path_var.get(), amount)
+        tk.Scale(appearance_box, from_=0, to=100, resolution=1, orient="horizontal", variable=wallpaper_trans_var,
+                 command=on_transparency, showvalue=True, bg=APP_BG, fg=DARK, activebackground=GREEN,
+                 troughcolor="#DCE8E2", highlightthickness=0, font=(UI_FONT, 9)).pack(fill="x", padx=6)
+
+        # Individual page backgrounds: each tab stores its own image/transparency,
+        # with the global wallpaper remaining the fallback for pages not customized.
+        page_bg_box = ttk.LabelFrame(appearance_box, text="Background for an individual page / ہر صفحے کا الگ پس منظر", padding=10)
+        page_bg_box.pack(fill="x", pady=(12, 6))
+        page_labels = {
+            "Dashboard": "dashboard", "Students": "students", "Teachers": "teachers",
+            "Fees & Payments": "fees", "Timetable": "timetable", "Attendance": "attendance",
+            "Progress": "progress", "Accounts": "accounts", "Graphs": "graphs",
+            "Reports": "reports", "Settings": "settings", "Login / لاگ اِن": "login",
+            "Create Admin / ایڈمن": "first_setup", "Student Learning / طالب علم": "student_learning",
+            "Teacher — My Students": "teacher_students", "Teacher — Attendance": "teacher_attendance",
+            "Teacher — Progress": "teacher_progress",
+        }
+        page_choice_var = tk.StringVar(value="Dashboard")
+        page_path_var = tk.StringVar(value="")
+        page_alpha_var = tk.IntVar(value=68)
+        page_row = ttk.Frame(page_bg_box); page_row.pack(fill="x", pady=4)
+        ttk.Label(page_row, text="Page / صفحہ").pack(side="left", padx=(0, 8))
+        page_picker = ttk.Combobox(page_row, textvariable=page_choice_var, values=list(page_labels), state="readonly", width=24)
+        page_picker.pack(side="left", padx=(0, 12))
+        ttk.Label(page_row, text="Image / تصویر").pack(side="left", padx=(0, 6))
+        ttk.Entry(page_row, textvariable=page_path_var).pack(side="left", fill="x", expand=True, padx=4)
+        def load_selected_page_wallpaper(_event=None):
+            page_key = page_labels.get(page_choice_var.get(), "dashboard")
+            saved = self._page_wallpaper_map().get(page_key, {})
+            if not isinstance(saved, dict): saved = {}
+            page_path_var.set(str(saved.get("path", "") or ""))
+            try: page_alpha_var.set(max(0, min(100, int(saved.get("transparency", self.settings.get("background_transparency", "68"))))))
+            except (TypeError, ValueError): page_alpha_var.set(68)
+        def browse_page_wallpaper():
+            selected = filedialog.askopenfilename(parent=self.root, title="Choose background for selected page / منتخب صفحے کی تصویر",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp"), ("All files", "*.*")])
+            if selected: page_path_var.set(os.path.abspath(selected))
+        ttk.Button(page_row, text="Browse", command=browse_page_wallpaper).pack(side="left", padx=(4, 0))
+        alpha_row = ttk.Frame(page_bg_box); alpha_row.pack(fill="x", pady=4)
+        ttk.Label(alpha_row, text="Wallpaper visibility / تصویر کی نمایاں مقدار").pack(side="left", padx=(0, 8))
+        ttk.Label(alpha_row, textvariable=page_alpha_var, width=5).pack(side="right")
+        tk.Scale(page_bg_box, from_=0, to=100, resolution=1, orient="horizontal", variable=page_alpha_var,
+                 showvalue=True, bg=APP_BG, fg=DARK, activebackground=GREEN, troughcolor=BORDER,
+                 highlightthickness=0, font=(UI_FONT, 9)).pack(fill="x", padx=6)
+        page_picker.bind("<<ComboboxSelected>>", load_selected_page_wallpaper)
+        load_selected_page_wallpaper()
+        def save_selected_page_wallpaper():
+            selected_path = page_path_var.get().strip()
+            if selected_path and not os.path.isfile(selected_path):
+                messagebox.showerror("Image not found", "Choose a valid image file or leave the field empty to use the global wallpaper.", parent=self.root); return
+            page_key = page_labels.get(page_choice_var.get(), "dashboard")
+            page_map = self._page_wallpaper_map()
+            if selected_path:
+                page_map[page_key] = {"path": os.path.abspath(selected_path), "transparency": str(max(0, min(100, int(page_alpha_var.get()))))}
+            else:
+                page_map.pop(page_key, None)
+            serialized = json.dumps(page_map, ensure_ascii=False, separators=(",", ":"))
+            self._save_setting("page_backgrounds", serialized)
+            self._il_workspace_wallpaper_cache = LRUCache(8)
+            self._il_button_texture_cache = LRUCache(160)
+            if getattr(self, "_active_page_key", "") == page_key:
+                self._refresh_page_wallpaper(parent, selected_path or self.settings.get("background_image_path", ""), page_alpha_var.get())
+                self._refresh_page_button_styles(force=True)
+                self._refresh_active_header_wallpaper()
+            messagebox.showinfo("Page background saved", f"Background saved for {page_choice_var.get()}. Open that page to see the full-screen background.", parent=self.root)
+        page_actions = ttk.Frame(page_bg_box); page_actions.pack(anchor="w", pady=(6, 0))
+        ttk.Button(page_actions, text="Save page background / اس صفحے کا پس منظر محفوظ کریں", style="Accent.TButton", command=save_selected_page_wallpaper).pack(side="left", padx=(0, 8))
+        ttk.Button(page_actions, text="Use global background / عمومی پس منظر استعمال کریں", command=lambda: (page_path_var.set(""), save_selected_page_wallpaper())).pack(side="left")
+        smart_label(ttk.Label, page_bg_box, text="Each page can use a different image. If no image is saved for a page, it uses the main wallpaper above. / ہر صفحہ اپنی تصویر استعمال کر سکتا ہے؛ خالی چھوڑنے پر اوپر والا عمومی وال پیپر استعمال ہوگا۔", style="Sub.TLabel", wraplength=1000).pack(anchor="w", pady=(6, 0))
+
+        # Persistent day/night palette; applied to the complete interface when saved.
+        theme_row = ttk.Frame(appearance_box); theme_row.pack(fill="x", pady=(10, 4))
+        theme_mode_var = tk.StringVar(value=str(self.settings.get("theme_mode", "light") or "light"))
+        ttk.Label(theme_row, text="Display mode / ڈسپلے موڈ").pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(theme_row, text="Light / دن", variable=theme_mode_var, value="light").pack(side="left", padx=5)
+        ttk.Radiobutton(theme_row, text="Dark / رات", variable=theme_mode_var, value="dark").pack(side="left", padx=5)
+
+        wallpaper_on_var = tk.BooleanVar(value=str(self.settings.get("wallpaper_enabled", "0")) == "1")
+        wp_row = ttk.Frame(appearance_box); wp_row.pack(fill="x", pady=(7, 4))
+        ttk.Checkbutton(wp_row, text="Show background wallpaper (may flicker while scrolling on slow PCs) / پس منظر کی تصویر دکھائیں",
+                        variable=wallpaper_on_var).pack(side="left")
+
+        layout_row = ttk.Frame(appearance_box)
+        layout_row.pack(fill="x", pady=(7, 4))
+        ttk.Label(layout_row, text="Navigation tabs / نیویگیشن ٹیبز").pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(layout_row, text="Horizontal row / افقی قطار", variable=nav_orientation_var, value="row").pack(side="left", padx=5)
+        ttk.Radiobutton(layout_row, text="Vertical column / عمودی کالم", variable=nav_orientation_var, value="column").pack(side="left", padx=5)
+        def reset_wallpaper():
+            wallpaper_path_var.set("")
+            wallpaper_trans_var.set(68)
+            transparency_value.configure(text="68%")
+            self._refresh_page_wallpaper(parent, "", 68)
+        def save_visual_settings():
+            selected_path = wallpaper_path_var.get().strip()
+            if selected_path and not os.path.isfile(selected_path):
+                messagebox.showerror("Image not found / تصویر نہیں ملی", "Choose an existing image file or reset to default.", parent=self.root)
+                return
+            try:
+                trans_value = max(0, min(100, int(wallpaper_trans_var.get())))
+            except (ValueError, tk.TclError):
+                messagebox.showerror("Invalid transparency / غلط شفافیت", "Choose a value from 0 to 100.", parent=self.root)
+                return
+            if selected_path and os.path.normcase(os.path.realpath(selected_path)) == os.path.normcase(os.path.realpath(DEFAULT_WALLPAPER_IMAGE)):
+                selected_path = ""
+            if nav_orientation_var.get() not in ("row", "column"):
+                nav_orientation_var.set("row")
+            selected_mode = theme_mode_var.get().strip().lower()
+            if selected_mode not in ("light", "dark"):
+                selected_mode = "light"
+            values = {"background_image_path": selected_path, "background_transparency": str(trans_value),
+                      "nav_orientation": nav_orientation_var.get(), "theme_mode": selected_mode,
+                      "wallpaper_enabled": "1" if wallpaper_on_var.get() else "0"}
+            self.db.conn.executemany("INSERT INTO app_settings(setting_key,setting_value) VALUES(?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value", values.items())
+            self.db.conn.commit(); self.settings.update(values)
+            self._il_button_texture_cache = LRUCache(160)
+            self._il_button_source_cache = LRUCache(24)
+            self._il_workspace_wallpaper_cache = LRUCache(8)
+            previous_page = getattr(self, "active_nav_label", None)
+            self._apply_theme_palette()
+            self.style()
+            self.dashboard()
+            self._refresh_page_button_styles(force=True)
+            self._refresh_active_header_wallpaper()
+            if previous_page and previous_page in getattr(self, "nav_button_refs", {}):
+                initial = "🏠 Dashboard" if (self.user or {}).get("role") == "admin" else "👨‍🎓 My Students"
+                if previous_page != initial:
+                    self.root.after_idle(lambda lab=previous_page: self.nav_button_refs.get(lab).invoke()
+                                         if self.nav_button_refs.get(lab) is not None else None)
+        visual_actions = ttk.Frame(appearance_box)
+        visual_actions.pack(anchor="w", pady=(8, 0))
+        ttk.Button(visual_actions, text="Save & Apply Appearance / محفوظ کریں", style="Accent.TButton", command=save_visual_settings).pack(side="left", padx=(0, 8))
+        ttk.Button(visual_actions, text="Reset wallpaper / ڈیفالٹ پس منظر", command=reset_wallpaper).pack(side="left")
+        smart_label(ttk.Label, appearance_box, text="The green stationery photo is the default. Transparency is previewed live; save stores your choice in this database only. / سبز اسٹیشنری والی تصویر ڈیفالٹ ہے۔ شفافیت فوراً دیکھی جا سکتی ہے؛ محفوظ کرنے سے ترتیب اسی ڈیٹابیس میں رہے گی۔", style="Sub.TLabel", wraplength=1000).pack(anchor="w", pady=(6, 0))
+
+        idle_box = ttk.LabelFrame(parent, text="Security / سکیورٹی", padding=12)
+        idle_box.pack(fill="x", pady=(10, 0))
+        idle_var = tk.StringVar(value=str(self._read_idle_timeout()))
+        smart_label(ttk.Label, idle_box, text="Automatic logout after idle minutes / غیر فعالیت کے بعد خودکار لاگ آؤٹ (منٹ)").grid(row=0, column=0, sticky="w", padx=6, pady=5)
+        ttk.Spinbox(idle_box, from_=0, to=240, increment=1, textvariable=idle_var, width=7).grid(row=0, column=1, sticky="w", padx=6, pady=5)
+        smart_label(ttk.Label, idle_box, text="0 = off; dialogs are never interrupted. / صفر = بند؛ کھلا ڈائیلاگ ہونے پر لاگ آؤٹ نہیں ہوگا۔", style="Sub.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", padx=6, pady=(0,5))
+        def save_idle_timeout():
+            try:
+                minutes = int(idle_var.get().strip())
+                if not 0 <= minutes <= 240:
+                    raise ValueError
+            except (ValueError, TypeError):
+                messagebox.showerror("Invalid timeout / غلط وقت", "Enter a whole number from 0 to 240. / 0 سے 240 تک مکمل منٹ درج کریں۔", parent=self.root)
+                return
+            self._save_setting("idle_timeout_minutes", minutes)
+            self._idle_timeout_minutes = minutes
+            self._start_idle_logout()
+            messagebox.showinfo("Saved / محفوظ", "Automatic logout setting saved. / خودکار لاگ آؤٹ کی ترتیب محفوظ ہو گئی۔", parent=self.root)
+        ttk.Button(idle_box, text="Save Security Setting / سکیورٹی محفوظ کریں", style="Accent.TButton", command=save_idle_timeout).grid(row=0, column=2, rowspan=2, padx=10, pady=5)
+
+        # Attendance approval is a local, per-database policy. Default ON to preserve
+        # the existing safer workflow; OFF allows teacher-submitted attendance to
+        # be saved as approved without changing administrator-entered attendance.
+        attendance_box = ttk.LabelFrame(parent, text="Attendance workflow / حاضری کا طریقہ", padding=12)
+        attendance_box.pack(fill="x", pady=(10, 0))
+        approval_value = str(self.settings.get("require_attendance_approval", "1")).strip().lower()
+        require_approval_var = tk.BooleanVar(value=approval_value not in ("0", "false", "off", "no", "disabled"))
+        ttk.Checkbutton(
+            attendance_box,
+            text="Require administrator approval for teacher-marked attendance / استاد کی حاضری کے لیے ایڈمن کی منظوری ضروری ہو",
+            variable=require_approval_var,
+        ).pack(anchor="w", padx=6, pady=(2, 5))
+        smart_label(
+            ttk.Label, attendance_box,
+            text=(
+                "ON: teacher attendance remains Pending until an administrator reviews it. OFF: new teacher attendance is saved as approved. Existing pending records stay in the review queue. / "
+                "آن: استاد کی حاضری ایڈمن کی منظوری تک زیرِ التوا رہے گی۔ آف: استاد کی نئی حاضری خود منظور ہو جائے گی۔ پہلے سے زیرِ التوا ریکارڈ منظوری کی فہرست میں رہیں گے۔"
+            ),
+            style="Sub.TLabel", wraplength=1000
+        ).pack(anchor="w", padx=6, pady=(0, 8))
+
+        def save_attendance_approval_setting():
+            enabled = bool(require_approval_var.get())
+            try:
+                self._save_setting("require_attendance_approval", "1" if enabled else "0")
+                self.settings = self._read_settings()
+                saved = str(self.settings.get("require_attendance_approval", "1")).strip().lower() not in ("0", "false", "off", "no", "disabled")
+                if saved != enabled:
+                    raise sqlite3.DatabaseError("Saved attendance policy did not match the selected value.")
+            except Exception as exc:
+                messagebox.showerror(
+                    "Could not save / محفوظ نہیں ہوا",
+                    f"Attendance policy could not be saved in the active database:\n{exc}\n\nActive database: {getattr(self.db, 'path', 'unknown')}",
+                    parent=self.root
+                )
+                return
+            if enabled:
+                message = (
+                    "Approval is ON: NEW teacher attendance submissions will be pending for admin review. "
+                    "This does not automatically approve existing pending records."
+                )
+            else:
+                message = (
+                    "Approval is OFF: NEW teacher attendance submissions will be saved as approved. "
+                    "Existing pending records still need review."
+                )
+            messagebox.showinfo("Attendance setting saved / حاضری کی ترتیب محفوظ", message, parent=self.root)
+
+        ttk.Button(
+            attendance_box, text="Open Pending Attendance Review / زیرِ التوا حاضری منظور کریں",
+            command=lambda: self.show_page(parent, lambda p: self.pending_attendance_page(p))
+        ).pack(anchor="w", padx=6, pady=(6, 2))
+
+        ttk.Button(
+            attendance_box, text="Save Attendance Setting / حاضری کی ترتیب محفوظ کریں",
+            style="Accent.TButton", command=save_attendance_approval_setting
+        ).pack(anchor="w", padx=6, pady=(0, 2))
+
+    def _choose_color(self, variable):
+        try: initial=variable.get()
+        except Exception: initial="#0F7457"
+        chosen=colorchooser.askcolor(color=initial,parent=self.root,title="Choose color")
+        if chosen and chosen[1]: variable.set(chosen[1].upper())
+
+    def graphs_page(self, parent):
+        self.page_title(parent, "📊 Graphs & Analytics / گرافس اور تجزیہ", "Visual summaries from saved records. Currency totals remain separate.")
+        top = ttk.Frame(parent); top.pack(fill="x", pady=(4, 8))
+        self._dashboard_bar_chart(top, "👨‍🎓 Students by Course / کورس کے لحاظ سے طلبہ",
+            "SELECT COALESCE(NULLIF(course,''),'Not assigned') period, COUNT(*) n FROM students GROUP BY course ORDER BY n DESC").pack(side="left", fill="both", expand=True, padx=(0, 6))
+        self._dashboard_bar_chart(top, "🆕 Monthly Admissions / ماہانہ داخلے",
+            "SELECT substr(admission_date,1,7) period, COUNT(*) n FROM students WHERE admission_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' GROUP BY substr(admission_date,1,7) ORDER BY period DESC LIMIT 6", reverse=True).pack(side="left", fill="both", expand=True, padx=(6, 0))
+        middle = ttk.Frame(parent); middle.pack(fill="x", pady=8)
+        self._dashboard_bar_chart(middle, "✅ Attendance Status / حاضری کی صورتحال",
+            "SELECT COALESCE(NULLIF(status,''),'Unknown') period, COUNT(*) n FROM attendance GROUP BY COALESCE(NULLIF(status,''),'Unknown') ORDER BY n DESC").pack(side="left", fill="both", expand=True, padx=(0, 6))
+        fee_box = ttk.Frame(middle); fee_box.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        month = datetime.now().strftime("%Y-%m")
+        monthly_chart = self._fee_amount_chart(fee_box, "💰 Monthly Fee Collection / ماہانہ فیس وصولی")
+        status_chart = self._fee_amount_chart(fee_box, "🧾 Fee Status / فیس کی صورتحال")
+        monthly_chart.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        status_chart.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        self._refresh_fee_charts(monthly_chart, status_chart, month)
+
+    def _dashboard_bar_chart(self, parent, title, sql, reverse=False):
+        box = ttk.LabelFrame(parent, text=title, padding=10)
+        canvas = tk.Canvas(box, bg=CARD_BG, height=205, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        try:
+            rows = self.db.conn.execute(sql).fetchall()
+        except Exception:
+            rows = []
+        if reverse:
+            rows = list(reversed(rows))
+        if not rows:
+            canvas.create_text(180, 85, text="No recorded data yet / ابھی ریکارڈ موجود نہیں",
+                               fill=MUTED, font=(UI_FONT, 10), justify="center")
+            return box
+        max_n = max(int(r["n"] or 0) for r in rows) or 1
+        for idx, row in enumerate(rows):
+            y = 12 + idx * 29
+            label = str(row["period"] or "Unknown")
+            if len(label) > 19:
+                label = label[:18] + "…"
+            canvas.create_text(4, y + 8, text=label, anchor="w", fill=DARK,
+                               font=(UI_FONT, 9))
+            x0 = 150
+            available = 230
+            width = max(3, int(available * int(row["n"] or 0) / max_n))
+            canvas.create_rectangle(x0, y, x0 + width, y + 17, fill=GREEN, outline="")
+            canvas.create_text(x0 + width + 6, y + 8, text=str(row["n"]), anchor="w",
+                               fill=DARK, font=(UI_FONT, 9, "bold"))
+        return box
+
+    def form_dialog(self, title, fields, on_save, combos=None):
+        """Responsive form dialog with a scrollable field area and fixed Save button."""
+        combos = combos or {}
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.configure(bg=CARD_BG)
+        win.transient(self.root)
+        win.grab_set()
+
+        shell = ttk.Frame(win)
+        shell.pack(fill="both", expand=True)
+        field_shell = ttk.Frame(shell)
+        field_shell.pack(fill="both", expand=True)
+        canvas = tk.Canvas(field_shell, bg=CARD_BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(field_shell, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        body = ttk.Frame(canvas, padding=18)
+        body_window = canvas.create_window((0, 0), window=body, anchor="nw")
+        body.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(body_window, width=max(1, e.width)))
+
+        entries = {}
+        for i, (key, label, default) in enumerate(fields):
+            smart_label(ttk.Label, body, text=label).grid(row=i, column=0, sticky="w", padx=6, pady=6)
+            if key in combos:
+                widget = ttk.Combobox(body, values=combos[key], state="readonly", width=1)
+                widget.set(default or (combos[key][0] if combos[key] else ""))
+            else:
+                widget = ttk.Entry(body, width=1)
+                if default is not None:
+                    widget.insert(0, str(default))
+            widget.grid(row=i, column=1, sticky="ew", padx=6, pady=6)
+            entries[key] = widget
+        body.grid_columnconfigure(1, weight=1)
+
+        footer = ttk.Frame(shell, padding=(18, 8))
+        footer.pack(side="bottom", fill="x")
+        ttk.Separator(footer, orient="horizontal").pack(fill="x", pady=(0, 8))
+        def save():
+            values = {k: w.get().strip() for k, w in entries.items()}
+            if on_save(values, win):
+                win.destroy()
+        ttk.Button(footer, text="Save / محفوظ کریں", style="Accent.TButton", command=save).pack(anchor="e")
+
+        # Wheel scrolling works inside the dialog; focus remains in editable fields.
+        def wheel(event):
+            try:
+                delta = int(getattr(event, "delta", 0) or 0)
+                if delta:
+                    units = -int(delta / 120) or (-1 if delta > 0 else 1)
+                    canvas.yview_scroll(units, "units")
+            except (tk.TclError, TypeError, ValueError):
+                pass
+            return "break"
+        def bind_wheel_to_form(widget):
+            # Bind directly to form controls too, so dialogs remain scrollable
+            # even before the main dashboard's global wheel bindings are installed.
+            widget.bind("<MouseWheel>", wheel, add="+")
+            widget.bind("<Button-4>", lambda e: (canvas.yview_scroll(-1, "units"), "break")[1], add="+")
+            widget.bind("<Button-5>", lambda e: (canvas.yview_scroll(1, "units"), "break")[1], add="+")
+            for child in widget.winfo_children():
+                bind_wheel_to_form(child)
+        bind_wheel_to_form(body)
+        canvas.bind("<Button-4>", lambda e: (canvas.yview_scroll(-1, "units"), "break")[1])
+        canvas.bind("<Button-5>", lambda e: (canvas.yview_scroll(1, "units"), "break")[1])
+
+        win.update_idletasks()
+        screen_w = max(640, win.winfo_screenwidth() - 40)
+        screen_h = max(420, win.winfo_screenheight() - 90)
+        req_w = min(screen_w, max(620, body.winfo_reqwidth() + 42))
+        req_h = min(screen_h, max(360, body.winfo_reqheight() + footer.winfo_reqheight() + 8))
+        x = max(10, (win.winfo_screenwidth() - req_w) // 2)
+        y = max(10, (win.winfo_screenheight() - req_h) // 2)
+        win.geometry(f"{req_w}x{req_h}+{x}+{y}")
+
+    def students_page(self, parent):
+        self.page_title(parent, "Student Profiles / طلبہ", "Choose card view or list view. Double-click a student in list view to open the full profile.")
+        chart_row = ttk.Frame(parent); chart_row.pack(fill="x", pady=(0, 8))
+        self._dashboard_bar_chart(chart_row, "Admissions by Course / کورس کے لحاظ سے داخلے",
+            "SELECT COALESCE(NULLIF(course,''),'Not assigned') period, COUNT(*) n FROM students GROUP BY course ORDER BY n DESC").pack(side="left", fill="both", expand=True, padx=(0, 5))
+        self._dashboard_bar_chart(chart_row, "Recent Monthly Admissions / ماہانہ نئے داخلے",
+            "SELECT substr(admission_date,1,7) period, COUNT(*) n FROM students WHERE admission_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]*' GROUP BY substr(admission_date,1,7) ORDER BY period DESC LIMIT 5", reverse=True).pack(side="left", fill="both", expand=True, padx=(5, 0))
+        bar = ttk.Frame(parent); bar.pack(fill="x", pady=6)
+        search = ttk.Entry(bar, width=32); search.pack(side="left", padx=(0, 8))
+        search.insert(0, "Search student name...")
+        view_var = tk.StringVar(value="cards")
+        smart_label(ttk.Label, bar, text="View / منظر:").pack(side="left", padx=(8, 4))
+        ttk.Radiobutton(bar, text="▦ Cards / کارڈز", variable=view_var, value="cards", command=lambda: load(search.get().strip())).pack(side="left", padx=3)
+        ttk.Radiobutton(bar, text="☷ List / فہرست", variable=view_var, value="list", command=lambda: load(search.get().strip())).pack(side="left", padx=3)
+        ttk.Button(bar, text="🔍 Search", command=lambda: load(search.get().strip())).pack(side="left", padx=6)
+        ttk.Button(bar, text="➕ Add Student", style="Accent.TButton", command=self.add_student).pack(side="right")
+        area = ttk.Frame(parent); area.pack(fill="both", expand=True)
+
+        def load(query=""):
+            for child in area.winfo_children(): child.destroy()
+            where_sql = " WHERE full_name LIKE ?" if query and query != "Search student name..." else ""
+            args = (f"%{query}%",) if where_sql else ()
+            if view_var.get() == "list":
+                rows = self.db.conn.execute(
+                    "SELECT id,full_name,course,level,class_time,status FROM students" + where_sql +
+                    " ORDER BY full_name", args).fetchall()
+                if not rows:
+                    smart_label(ttk.Label, area, text="No student records found. Use Add Student to create the first profile.", style="Sub.TLabel").pack(anchor="w", padx=12, pady=20); return
+                tree = self.make_tree(area, ("id","full_name","course","level","class_time","status"), ("ID","Student / طالب علم","Course / کورس","Level / درجہ","Class Time / وقت","Status / حیثیت"))
+                def add_row(r, _index):
+                    tree.insert("", "end", values=(r["id"],r["full_name"],r["course"],r["level"],r["class_time"],r["status"]))
+                self._run_in_batches(tree, rows, add_row, batch_size=120, delay_ms=4)
+                def open_selected(_event=None):
+                    sel=tree.selection()
+                    if sel: self.student_profile(int(tree.item(sel[0],"values")[0]))
+                tree.bind("<Double-1>", open_selected)
+                ttk.Button(area, text="👤 Open Student Profile / پروفائل", command=open_selected).pack(anchor="e", pady=4)
+                return
+
+            total = int(self.db.conn.execute("SELECT COUNT(*) FROM students" + where_sql, args).fetchone()[0] or 0)
+            if total <= 0:
+                smart_label(ttk.Label, area, text="No student records found. Use Add Student to create the first profile.", style="Sub.TLabel").pack(anchor="w", padx=12, pady=20); return
+            canvas=tk.Canvas(area,bg=CARD_BG,highlightthickness=0); vs=ttk.Scrollbar(area,orient="vertical",command=canvas.yview)
+            inner=ttk.Frame(canvas); inner.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.create_window((0,0),window=inner,anchor="nw"); canvas.configure(yscrollcommand=vs.set)
+            canvas.pack(side="left",fill="both",expand=True); vs.pack(side="right",fill="y")
+            for col in range(3): inner.grid_columnconfigure(col,weight=1)
+            def add_card(r, i):
+                card=tk.Frame(inner,bg=PALE,highlightbackground=BORDER,highlightthickness=1,padx=14,pady=12)
+                card.grid(row=i//3,column=i%3,sticky="nsew",padx=7,pady=7)
+                smart_label(tk.Label, card,text="👤  "+(r["full_name"] or "Unnamed student"),bg=PALE,fg=GREEN,font=(UI_FONT,12,"bold"),wraplength=210).pack(anchor="w")
+                for label,value in (("📘 Course",r["course"]),("🎓 Level",r["level"]),("🕒 Class time",r["class_time"]),("● Status",r["status"])):
+                    smart_label(tk.Label, card,text=f"{label}: {value or '—'}",bg=PALE,fg=DARK,font=(UI_FONT,9)).pack(anchor="w",pady=2)
+                tk.Button(card,text="👁 Open Profile / پروفائل",bg=GREEN,fg=WHITE,relief="flat",command=lambda sid=r["id"]:self.student_profile(sid)).pack(anchor="w",pady=(7,0))
+            page_state = {"offset": 0}
+            load_more_button = ttk.Button(inner, text="Load more students / مزید طلبہ دکھائیں")
+            def load_next_cards():
+                offset = page_state["offset"]
+                page_rows = self.db.conn.execute(
+                    "SELECT id,full_name,course,level,class_time,status FROM students" + where_sql +
+                    " ORDER BY full_name LIMIT 18 OFFSET ?", args + (offset,)).fetchall()
+                for idx, row in enumerate(page_rows, start=offset):
+                    add_card(row, idx)
+                page_state["offset"] += len(page_rows)
+                if page_state["offset"] >= total or not page_rows:
+                    load_more_button.grid_remove()
+                else:
+                    load_more_button.configure(text=f"Load next students ({total-page_state['offset']} remaining) / مزید طلبہ")
+                    load_more_button.grid(row=(page_state["offset"] + 2)//3, column=0, columnspan=3, sticky="ew", padx=8, pady=12)
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            load_more_button.configure(command=load_next_cards)
+            load_next_cards()
+        load()
+
+    def add_student(self):
+        fields = [
+            ("full_name", "Student full name *", ""), ("guardian_name", "Parent/guardian", ""),
+            ("phone", "Contact phone (admin only)", ""), ("age", "Age", ""),
+            ("course", "Course", COURSES[0]), ("level", "Level / Grade", LEVELS[0]),
+            ("class_time", "Class time", ""), ("admission_date", "Admission date (YYYY-MM-DD)", datetime.now().strftime("%Y-%m-%d")),
+            ("monthly_fee", "Monthly fee", "0"), ("currency", "Fee currency", "PKR"),
+            ("status", "Status", "Active"), ("email", "Student/guardian email (optional)", "")
+        ]
+        def save(v, win):
+            if not v["full_name"]:
+                messagebox.showwarning("Required", "Student name is required.", parent=win); return False
+            try:
+                fee = float(v["monthly_fee"] or 0)
+                age = int(v["age"]) if v["age"] else None
+            except ValueError:
+                messagebox.showerror("Invalid number", "Age and monthly fee must be numbers.", parent=win); return False
+            self.db.conn.execute("""INSERT INTO students(full_name,guardian_name,phone,course,monthly_fee,currency,status,age,class_time,level,admission_date,email)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (v["full_name"],v["guardian_name"],v["phone"],v["course"],fee,v["currency"],v["status"],age,v["class_time"],v["level"],v["admission_date"],v["email"]))
+            self.db.conn.commit()
+            messagebox.showinfo("Saved", "Student profile saved.", parent=win)
+            if messagebox.askyesno("Assign Slot?", "Would you like to assign a teacher and timetable slot for this student now?", parent=win):
+                self.root.after(100, lambda: self.assign_students())
+            return True
+        self.form_dialog("Add Student / نیا طالب علم", fields, save, {"course": COURSES, "level": LEVELS, "currency": CURRENCIES, "status": STATUSES})
+
+    def student_profile(self, student_id):
+        """Administrator student profile with existing details plus linked class, attendance and learning records."""
+        row = self.db.conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
+        if not row:
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Student Profile / طالب علم کا پروفائل")
+        win.configure(bg=APP_BG)
+        win.transient(self.root)
+        # Open the profile as a centered, normal-sized window rather than maximized.
+        # Size it relative to the usable screen so it also fits smaller displays.
+        try:
+            win.state("normal")
+        except tk.TclError:
+            pass
+        win.update_idletasks()
+        screen_w = max(800, win.winfo_screenwidth())
+        screen_h = max(650, win.winfo_screenheight())
+        profile_w = min(1180, max(820, int(screen_w * 0.88)))
+        profile_h = min(780, max(620, int(screen_h * 0.84)))
+        profile_x = max(0, (screen_w - profile_w) // 2)
+        profile_y = max(0, (screen_h - profile_h) // 2)
+        win.geometry(f"{profile_w}x{profile_h}+{profile_x}+{profile_y}")
+        win.minsize(min(760, profile_w), min(600, profile_h))
+
+        def value(key, fallback="—"):
+            try:
+                val = row[key] if key in row.keys() else None
+            except (KeyError, IndexError, TypeError):
+                val = None
+            return fallback if val is None or str(val).strip() == "" else str(val)
+
+        def ui_text(english, urdu):
+            return urdu if APP_LANGUAGE == "ur" else english
+
+        def display_status(raw_status):
+            status_value = str(raw_status or "—")
+            if APP_LANGUAGE != "ur":
+                return status_value
+            translations = {
+                "paid": "ادا شدہ", "unpaid": "غیر ادا شدہ", "partial": "جزوی ادائیگی",
+                "present": "حاضر", "absent": "غیر حاضر", "active": "فعال",
+                "paused": "عارضی طور پر رکا ہوا", "complete": "مکمل", "inactive": "غیر فعال",
+                "pending": "زیرِ التوا", "approved": "منظور شدہ", "scheduled": "طے شدہ",
+                "extra": "اضافی کلاس", "make-up": "متبادل کلاس", "makeup": "متبادل کلاس",
+            }
+            return translations.get(status_value.strip().lower(), status_value)
+
+        def value_font(text, size=10, weight="normal"):
+            base = (UI_FONT, size, weight)
+            return _font_for_localized_text(str(text), base) or base
+
+        def query_rows(sql, args=("",)):
+            try:
+                return self.db.conn.execute(sql, args).fetchall()
+            except sqlite3.Error:
+                # Some older school databases may not yet contain an optional history table.
+                return []
+
+        def query_one(sql, args=("",)):
+            try:
+                return self.db.conn.execute(sql, args).fetchone()
+            except sqlite3.Error:
+                return None
+
+        status = value("status", "Active")
+        status_key = status.lower()
+        status_color = {
+            "active": "#DDF3E5", "paused": "#FFF0CC", "complete": "#DDE8F8",
+            "inactive": "#F8DFDF", "pending": "#FFF0CC"
+        }.get(status_key, "#EAF4F0")
+
+        # Header: keep the established school-green identity and make the status easy to scan.
+        header = tk.Frame(win, bg=GREEN, padx=18, pady=12)
+        header.pack(fill="x")
+        photo_holder = tk.Frame(header, bg=GREEN)
+        photo_holder.pack(side="left", padx=(0, 12))
+        image_path = row["image_path"] if "image_path" in row.keys() else ""
+        photo_widget = self._make_profile_photo(
+            photo_holder, value("full_name", "Student"), image_path, size=72, background=GREEN)
+        photo_widget.pack()
+
+        def load_student_photo(path):
+            photo_widget._taha_set_profile_image(path)
+
+        def choose_student_photo():
+            source_path = filedialog.askopenfilename(
+                parent=win, title="Select student photo from gallery",
+                filetypes=[("Images", "*.png *.gif *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
+            if not source_path:
+                return
+            target_path = self._profile_image_target("student", student_id)
+            if not self._show_logo_cropper(source_path, target_path):
+                return
+            try:
+                self.db.conn.execute("UPDATE students SET image_path=? WHERE id=?", (target_path, student_id))
+                self.db.conn.commit()
+                load_student_photo(target_path)
+            except sqlite3.Error as exc:
+                messagebox.showerror("Photo not saved", str(exc), parent=win)
+
+        tk.Button(photo_holder, text="Choose Photo / تصویر منتخب کریں", command=choose_student_photo,
+                  bg=CARD_BG, fg=GREEN, activebackground="#EAF4F0", relief="flat",
+                  padx=8, pady=5, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(pady=(6, 0))
+        heading = tk.Frame(header, bg=GREEN)
+        heading.pack(side="left", fill="x", expand=True)
+        smart_label(tk.Label, heading, text=value("full_name", "Unnamed Student"), bg=GREEN,
+                    fg=WHITE, font=(UI_FONT, 17, "bold")).pack(anchor="w")
+        smart_label(tk.Label, heading,
+                    text=ui_text(f"Student ID: {student_id}\nAdministrator profile",
+                                 f"طالب علم نمبر: {student_id}\nایڈمن پروفائل"),
+                    bg=GREEN, fg="#EAF4F0", font=(UI_FONT, 10), justify="left").pack(anchor="w", pady=(4, 0))
+        smart_label(tk.Label, header, text=display_status(status), bg=status_color, fg=GREEN,
+                    font=(UI_FONT, 10, "bold"), padx=12, pady=7).pack(side="right", anchor="n")
+
+        # A robust standard Tk canvas hosts the scrollable profile. Avoid embedding the
+        # custom canvas-drawn RoundCard widget here; its requested-size behaviour can
+        # produce empty-looking windows on some Windows/Tk combinations.
+        area = tk.Frame(win, bg=APP_BG, padx=14, pady=10)
+        area.pack(fill="both", expand=True)
+        canvas = tk.Canvas(area, bg=APP_BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(area, orient="vertical", command=canvas.yview)
+        content = tk.Frame(canvas, bg=APP_BG)
+        content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw", tags="profile_content")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        canvas.bind("<Configure>", lambda event: canvas.itemconfigure(content_window, width=max(1, event.width)))
+
+        def wheel_scroll(event):
+            try:
+                if getattr(event, "delta", 0):
+                    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+                elif getattr(event, "num", None) == 4:
+                    canvas.yview_scroll(-1, "units")
+                elif getattr(event, "num", None) == 5:
+                    canvas.yview_scroll(1, "units")
+            except tk.TclError:
+                pass
+            return "break"
+
+        # Bind wheel scrolling to the profile's own children without altering app-wide bindings.
+        def bind_profile_wheel(widget):
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                widget.bind(seq, wheel_scroll, add="+")
+            for child in widget.winfo_children():
+                bind_profile_wheel(child)
+        bind_profile_wheel(area)
+        bind_profile_wheel(content)
+
+        def create_grid(parent, pad_y=(0, 8)):
+            frame = tk.Frame(parent, bg=APP_BG)
+            frame.pack(fill="x", expand=True, pady=pad_y)
+            return frame
+
+        def add_card(parent, title, icon, items, accent=GREEN, column=0, row_num=0, span=1):
+            """Plain Tk card with restrained accent rule; content stays reliable and resizable."""
+            card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, bd=0)
+            card._taha_grid_meta = (column, row_num, span)
+            top_rule = tk.Frame(card, bg=accent, height=3)
+            top_rule.pack(fill="x")
+            body = tk.Frame(card, bg=CARD_BG, padx=11, pady=9)
+            body.pack(fill="both", expand=True)
+            title_row = tk.Frame(body, bg=CARD_BG)
+            title_row.pack(fill="x", anchor="w", pady=(0, 8))
+            smart_label(tk.Label, title_row, text=f"{icon}  {title}", bg=CARD_BG, fg=accent,
+                        font=(UI_FONT, 10, "bold"), justify="left", wraplength=350).pack(anchor="w")
+            tk.Frame(body, bg=mix(accent, CARD_BG, 0.55) if 'mix' in globals() else BORDER, height=1).pack(fill="x", pady=(0, 6))
+            for label, val in items:
+                if not label:
+                    smart_label(tk.Label, body, text=str(val), bg=CARD_BG, fg=MUTED,
+                                font=(UI_FONT, 8), justify="left", anchor="w", wraplength=350).pack(fill="x", anchor="w", pady=2)
+                    continue
+                line = tk.Frame(body, bg=CARD_BG)
+                line.pack(fill="x", anchor="w", pady=2)
+                smart_label(tk.Label, line, text=str(label), bg=CARD_BG, fg=MUTED,
+                            font=(UI_FONT, 8, "bold"), anchor="w", justify="left", wraplength=350).pack(fill="x", anchor="w")
+                # Use a normal label for record values so a bilingual font pass never
+                # strips a real English/Urdu name, note, or teacher name from the data.
+                tk.Label(line, text=str(val), bg=CARD_BG, fg=DARK,
+                         font=value_font(val, 9), anchor="w", justify="left",
+                         wraplength=350).pack(fill="x", anchor="w", pady=(1, 0))
+            card._taha_body = body
+            bind_profile_wheel(card)
+            return card
+
+        def layout_cards(frame, widgets, event=None):
+            try:
+                width = max(frame.winfo_width(), frame.winfo_reqwidth())
+                if width < 100:
+                    width = canvas.winfo_width()
+                columns = 3 if width >= 980 else 2 if width >= 600 else 1
+                for col in range(4):
+                    frame.grid_columnconfigure(col, weight=1 if col < columns else 0, uniform="profile_cards")
+                for index, widget in enumerate(widgets):
+                    widget.grid(row=index // columns, column=index % columns, sticky="nsew", padx=6, pady=6)
+            except tk.TclError:
+                pass
+
+        core_cards_frame = create_grid(content, (0, 2))
+
+        try:
+            attend = query_one("""SELECT COUNT(*) AS total,
+                SUM(CASE WHEN lower(COALESCE(status,'')) LIKE '%present%' OR (status LIKE '%حاضر%' AND status NOT LIKE '%غیر حاضر%') THEN 1 ELSE 0 END) AS present_count,
+                SUM(CASE WHEN lower(COALESCE(status,'')) LIKE '%absent%' OR status LIKE '%غیر حاضر%' THEN 1 ELSE 0 END) AS absent_count,
+                SUM(CASE WHEN COALESCE(approved,0)=0 THEN 1 ELSE 0 END) AS pending_count,
+                MAX(class_date) AS latest_date
+                FROM attendance WHERE student_id=?""", (student_id,))
+            attendance_total = int((attend["total"] if attend else 0) or 0)
+            present_count = int((attend["present_count"] if attend else 0) or 0)
+            absent_count = int((attend["absent_count"] if attend else 0) or 0)
+            pending_count = int((attend["pending_count"] if attend else 0) or 0)
+            latest_attendance = (attend["latest_date"] if attend else "") or ui_text("No attendance yet", "ابھی حاضری درج نہیں")
+            attendance_rate = f"{round(100 * present_count / attendance_total)}%" if attendance_total else ui_text("Not available yet", "ابھی دستیاب نہیں")
+        except (sqlite3.Error, TypeError, ValueError, KeyError):
+            attendance_total, present_count, absent_count, pending_count = 0, 0, 0, 0
+            latest_attendance, attendance_rate = "—", "Not available yet"
+
+        schedule_rows = query_rows("""SELECT w.weekday, w.start_time, w.end_time,
+                COALESCE(t.full_name, 'Teacher not assigned') AS teacher_name
+                FROM weekly_class_schedule w LEFT JOIN teachers t ON t.id=w.teacher_id
+                WHERE w.student_id=?
+                ORDER BY CASE lower(w.weekday)
+                    WHEN 'monday' THEN 1 WHEN 'tuesday' THEN 2 WHEN 'wednesday' THEN 3
+                    WHEN 'thursday' THEN 4 WHEN 'friday' THEN 5 WHEN 'saturday' THEN 6
+                    WHEN 'sunday' THEN 7 ELSE 8 END, w.start_time""", (student_id,))
+        schedule_items = []
+        for item in schedule_rows[:10]:
+            interval = f"{item['start_time'] or 'Time not set'}"
+            if item['end_time']:
+                interval += f" to {item['end_time']}"
+            schedule_items.append((item["weekday"] or ui_text("Class day", "کلاس کا دن"),
+                                   f"{interval}\n{ui_text('Teacher', 'استاد')}: {item['teacher_name'] or ui_text('Not assigned', 'متعین نہیں') }"))
+        if not schedule_items:
+            schedule_items = [("", ui_text("No weekly schedule has been saved yet. Add class days and times from the weekly timetable.",
+                                             "ابھی ہفتہ وار شیڈول محفوظ نہیں۔ ہفتہ وار ٹائم ٹیبل میں کلاس کے دن اور اوقات شامل کریں۔"))]
+
+        payment_rows = query_rows("""SELECT payment_date, month, amount, currency, status, notes
+            FROM payments WHERE student_id=? ORDER BY payment_date DESC, id DESC LIMIT 5""", (student_id,))
+        payment_items = []
+        for item in payment_rows:
+            date_label = (item["payment_date"] or item["month"] or ui_text("Payment record", "ادائیگی کا ریکارڈ"))
+            try:
+                amount_label = f"{float(item['amount'] or 0):,.2f} {item['currency'] or 'PKR'}"
+            except (TypeError, ValueError):
+                amount_label = f"{item['amount']} {item['currency'] or 'PKR'}"
+            detail = f"{amount_label}  |  {ui_text('Status', 'حالت')}: {display_status(item['status'] or ui_text('Not set', 'درج نہیں'))}"
+            if item["notes"]:
+                detail += f"\n{item['notes']}"
+            payment_items.append((date_label, detail))
+        if not payment_items:
+            payment_items = [("", ui_text("No payment history is recorded yet. Add payments in Fees & Payments.",
+                                             "ابھی ادائیگیوں کا ریکارڈ موجود نہیں۔ فیس اور ادائیگیوں کے حصے میں اندراج کریں۔"))]
+
+        progress_rows = query_rows("""SELECT entry_date, course, level, lesson, score, notes
+            FROM progress WHERE student_id=? ORDER BY entry_date DESC, id DESC LIMIT 5""", (student_id,))
+        progress_items = []
+        for item in progress_rows:
+            date_label = item["entry_date"] or ui_text("Learning record", "تعلیمی ریکارڈ")
+            title_parts = [str(item[k]) for k in ("course", "level", "lesson") if item[k] not in (None, "")]
+            detail = " — ".join(title_parts) if title_parts else ui_text("Progress updated", "پیش رفت اپڈیٹ ہوئی")
+            if item["score"] not in (None, ""):
+                detail += f"\n{ui_text('Score', 'اسکور')}: {item['score']}"
+            if item["notes"]:
+                detail += f"\n{item['notes']}"
+            progress_items.append((date_label, detail))
+        if not progress_items:
+            progress_items = [("", ui_text("No learning progress entries yet. Add a progress record from the Progress section.",
+                                             "ابھی تعلیمی پیش رفت درج نہیں۔ Progress کے حصے میں ریکارڈ شامل کریں۔"))]
+
+        quran_rows = query_rows("""SELECT session_date, record_type, juz_number, surah, ayah_from, ayah_to,
+                lesson_number, quality, notes FROM quran_progress WHERE student_id=?
+                ORDER BY session_date DESC, id DESC LIMIT 5""", (student_id,))
+        quran_items = []
+        for item in quran_rows:
+            detail_parts = [str(item["record_type"]) if item["record_type"] else ui_text("Quran lesson", "قرآن کا سبق")]
+            if item["surah"]:
+                verses = f"{item['surah']}"
+                if item["ayah_from"] or item["ayah_to"]:
+                    verses += f" ({ui_text('Ayahs', 'آیات')} {item['ayah_from'] or '?'} {ui_text('to', 'تا')} {item['ayah_to'] or '?'})"
+                detail_parts.append(verses)
+            if item["juz_number"] not in (None, ""):
+                detail_parts.append(f"{ui_text('Juz', 'پارہ')} {item['juz_number']}")
+            if item["lesson_number"]:
+                detail_parts.append(f"{ui_text('Lesson', 'سبق')} {item['lesson_number']}")
+            detail = "\n".join(detail_parts)
+            if item["quality"]:
+                detail += f"\n{ui_text('Quality', 'معیار')}: {item['quality']}"
+            if item["notes"]:
+                detail += f"\n{item['notes']}"
+            quran_items.append((item["session_date"] or ui_text("Quran progress", "قرآنی پیش رفت"), detail))
+        if not quran_items:
+            quran_items = [("", ui_text("No Quran progress has been recorded yet. Add a record in Quran Progress.",
+                                          "ابھی قرآنی پیش رفت درج نہیں۔ قرآنی پیش رفت کے حصے میں ریکارڈ شامل کریں۔"))]
+
+        session_rows = query_rows("""SELECT session_date, start_time, end_time, session_type, status, notes
+            FROM class_sessions WHERE student_id=? ORDER BY session_date DESC, start_time DESC, id DESC LIMIT 5""", (student_id,))
+        session_items = []
+        for item in session_rows:
+            times = str(item["start_time"] or ui_text("Time not set", "وقت درج نہیں"))
+            if item["end_time"]:
+                times += f" to {item['end_time']}"
+            session_type = display_status(item['session_type'] or ui_text('Class', 'کلاس'))
+            detail = f"{session_type}\n{times}\n{ui_text('Status', 'حالت')}: {display_status(item['status'] or ui_text('Not set', 'درج نہیں'))}"
+            if item["notes"]:
+                detail += f"\n{item['notes']}"
+            session_items.append((item["session_date"] or ui_text("Scheduled class", "طے شدہ کلاس"), detail))
+        if not session_items:
+            session_items = [("", ui_text("No extra or make-up classes are recorded yet.",
+                                            "ابھی اضافی یا متبادل کلاسوں کا ریکارڈ موجود نہیں۔"))]
+
+        # The grid adapts to available width; the cards remain ordinary Tk frames for reliability.
+        def layout_cards(frame, widgets, _event=None):
+            """Lay cards out using the visible content width, not their requested width."""
+            try:
+                width = int(canvas.winfo_width()) - 36
+                if width < 200:
+                    width = int(frame.winfo_width())
+                if width < 200:
+                    return
+                # Three columns only when each can remain comfortably readable.
+                columns = 3 if width >= 980 else 2 if width >= 600 else 1
+                for col in range(4):
+                    frame.grid_columnconfigure(col, weight=1 if col < columns else 0,
+                                               uniform="profile_cards" if col < columns else "")
+                for index, widget in enumerate(widgets):
+                    widget.grid(row=index // columns, column=index % columns,
+                                sticky="nsew", padx=6, pady=6)
+                    # Keep labels wrapped to the actual card width as the window resizes.
+                    def adjust_wrap(event, card=widget):
+                        if event.width < 100:
+                            return
+                        wrap = max(150, event.width - 36)
+                        def visit(child):
+                            try:
+                                if child.winfo_class() == "Label" and int(child.cget("wraplength") or 0) > 0:
+                                    child.configure(wraplength=wrap)
+                            except (tk.TclError, ValueError, TypeError):
+                                pass
+                            for sub in child.winfo_children():
+                                visit(sub)
+                        visit(card)
+                    widget.bind("<Configure>", adjust_wrap, add="+")
+                for row_num in range((len(widgets) + columns - 1) // columns):
+                    frame.grid_rowconfigure(row_num, weight=1)
+            except tk.TclError:
+                pass
+
+        core_cards = [
+            add_card(core_cards_frame, "Academic Details / تعلیمی معلومات", "▣", [
+                ("Course / کورس", value("course")), ("Level / Grade / درجہ", value("level")),
+                ("Class time / وقت", value("class_time")), ("Admission date / تاریخِ داخلہ", value("admission_date")),
+                ("Age / عمر", value("age")),
+            ], GREEN),
+            add_card(core_cards_frame, "Parent & Contact / سرپرست اور رابطہ", "♙", [
+                ("Parent / Guardian / والدین یا سرپرست", value("guardian_name")),
+                ("Contact phone (admin only) / رابطہ نمبر (صرف ایڈمن)", value("phone")),
+                ("Email / ای میل", value("email")),
+            ], "#2F7F8F"),
+            add_card(core_cards_frame, "Fee Information / فیس", "¤", [
+                ("Monthly fee / ماہانہ فیس", f"{value('monthly_fee', '0')} {value('currency', 'PKR')}"),
+                ("Student status / طالب علم کی حالت", display_status(status)),
+                ("Student ID / شناختی نمبر", str(student_id)),
+            ], "#B18A2B"),
+        ]
+        core_cards_frame.bind("<Configure>", lambda e: layout_cards(core_cards_frame, core_cards, e))
+
+        study_heading = tk.Frame(content, bg=APP_BG)
+        study_heading.pack(fill="x", padx=6, pady=(8, 1))
+        smart_label(tk.Label, study_heading, text="Class and learning records / کلاس اور تعلیمی ریکارڈ",
+                    bg=APP_BG, fg=DARK, font=(UI_FONT, 12, "bold")).pack(anchor="w")
+        smart_label(tk.Label, study_heading,
+                    text=ui_text("Saved timetable, attendance, fee payments and learning history. Empty sections explain where to add records.",
+                                 "محفوظ شدہ ٹائم ٹیبل، حاضری، فیس کی ادائیگیاں اور تعلیمی تاریخ۔ خالی حصوں میں ریکارڈ شامل کرنے کی رہنمائی ہے۔"),
+                    bg=APP_BG, fg=MUTED, font=(UI_FONT, 9), wraplength=900, justify="left").pack(anchor="w", pady=(3, 0))
+
+        detail_frame = create_grid(content, (0, 2))
+        detail_cards = [
+            add_card(detail_frame, "Weekly class schedule / ہفتہ وار شیڈول", "◷", schedule_items, GREEN),
+            add_card(detail_frame, "Attendance overview / حاضری", "✓", [
+                ("Total attendance records / حاضری کے کل اندراجات", str(attendance_total)),
+                ("Present / حاضر", str(present_count)),
+                ("Absent / غیر حاضر", str(absent_count)),
+                ("Awaiting admin approval / ایڈمن کی منظوری باقی", str(pending_count)),
+                ("Attendance rate / حاضری کی شرح", attendance_rate),
+                ("Latest attendance date / آخری حاضری کی تاریخ", latest_attendance),
+            ], "#2F7F8F"),
+            add_card(detail_frame, "Recent payments / حالیہ ادائیگیاں", "¤", payment_items, "#B18A2B"),
+            add_card(detail_frame, "Learning progress / تعلیمی پیش رفت", "✦", progress_items, GREEN),
+            add_card(detail_frame, "Quran progress / قرآنی پیش رفت", "۞", quran_items, GREEN),
+            add_card(detail_frame, "Extra and make-up classes / اضافی کلاسیں", "◷", session_items, "#2F7F8F"),
+        ]
+        detail_frame.bind("<Configure>", lambda e: layout_cards(detail_frame, detail_cards, e))
+
+        notes = value("notes", "")
+        notes_frame = tk.Frame(content, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, bd=0)
+        notes_frame.pack(fill="x", padx=6, pady=(4, 8))
+        tk.Frame(notes_frame, bg="#B18A2B", height=3).pack(fill="x")
+        notes_body = tk.Frame(notes_frame, bg=CARD_BG, padx=16, pady=12)
+        notes_body.pack(fill="x")
+        bind_profile_wheel(notes_frame)
+        smart_label(tk.Label, notes_body, text="Additional notes / اضافی نوٹس", bg=CARD_BG, fg=GREEN,
+                    font=(UI_FONT, 10, "bold")).pack(anchor="w")
+        smart_label(tk.Label, notes_body,
+                    text=notes if notes.strip() else "No additional notes saved. Use Edit Profile to add notes.",
+                    bg=CARD_BG, fg=DARK if notes.strip() else MUTED, justify="left",
+                    wraplength=900, font=(UI_FONT, 10)).pack(fill="x", anchor="w", pady=(6, 0))
+
+        footer = tk.Frame(win, bg=CARD_BG, padx=16, pady=10, highlightbackground=BORDER, highlightthickness=1)
+        footer.pack(fill="x", side="bottom")
+        tk.Button(footer, text="✎  Edit Profile / پروفائل تبدیل کریں",
+                  bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER, activeforeground=WHITE,
+                  relief="flat", padx=14, pady=8, font=(UI_FONT, 10, "bold"), cursor="hand2",
+                  command=lambda: edit_profile()).pack(side="left", padx=(0, 8))
+        tk.Button(footer, text="Close / بند کریں", bg="#EEF2EF", fg=DARK, activebackground=BORDER,
+                  relief="flat", padx=17, pady=8, font=(UI_FONT, 10), cursor="hand2",
+                  command=win.destroy).pack(side="right")
+
+        def edit_profile():
+            current = self.db.conn.execute("SELECT * FROM students WHERE id=?", (student_id,)).fetchone()
+            if not current:
+                return
+            fields = [
+                ("full_name", "Student full name *", current["full_name"]),
+                ("guardian_name", "Parent / Guardian", current["guardian_name"]),
+                ("phone", "Contact phone (admin only)", current["phone"]),
+                ("age", "Age", current["age"]),
+                ("course", "Course", current["course"]),
+                ("level", "Level / Grade", current["level"]),
+                ("class_time", "Class time", current["class_time"]),
+                ("admission_date", "Admission date (YYYY-MM-DD)", current["admission_date"]),
+                ("monthly_fee", "Monthly fee", current["monthly_fee"]),
+                ("currency", "Fee currency", current["currency"] or "PKR"),
+                ("status", "Status", current["status"] or "Active"),
+                ("email", "Student / guardian email", current["email"]),
+                ("notes", "Notes", current["notes"]),
+            ]
+            def save_profile(v, dialog):
+                if not v["full_name"]:
+                    messagebox.showwarning("Required", "Student name is required.", parent=dialog)
+                    return False
+                try:
+                    fee = float(v["monthly_fee"] or 0)
+                    age = int(v["age"]) if v["age"] else None
+                except ValueError:
+                    messagebox.showerror("Invalid value", "Age must be a whole number and fee must be numeric.", parent=dialog)
+                    return False
+                self.db.conn.execute("""UPDATE students SET full_name=?, guardian_name=?, phone=?, age=?,
+                    course=?, level=?, class_time=?, admission_date=?, monthly_fee=?, currency=?, status=?, email=?, notes=?
+                    WHERE id=?""", (v["full_name"], v["guardian_name"], v["phone"], age,
+                    v["course"], v["level"], v["class_time"], v["admission_date"], fee,
+                    v["currency"], v["status"], v["email"], v["notes"], student_id))
+                self.db.conn.commit()
+                win.destroy()
+                self.student_profile(student_id)
+                return True
+            self.form_dialog("Edit Student Profile / پروفائل میں ترمیم", fields, save_profile,
+                             {"course": COURSES, "level": LEVELS, "currency": CURRENCIES,
+                              "status": ["Active", "Paused", "Complete", "Inactive", "Pending"]})
+
+        # First layout after widgets receive their real dimensions; no database or schema changes.
+        bind_profile_wheel(content)
+        win.update_idletasks()
+        canvas.itemconfigure(content_window, width=max(1, canvas.winfo_width()))
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        layout_cards(core_cards_frame, core_cards)
+        layout_cards(detail_frame, detail_cards)
+        canvas.yview_moveto(0)
+
+        def settle_profile_layout():
+            try:
+                canvas.itemconfigure(content_window, width=max(1, canvas.winfo_width()))
+                canvas.configure(scrollregion=canvas.bbox("all"))
+                layout_cards(core_cards_frame, core_cards)
+                layout_cards(detail_frame, detail_cards)
+                canvas.yview_moveto(0)
+            except tk.TclError:
+                pass
+        win.after_idle(settle_profile_layout)
+        win.after(120, settle_profile_layout)
+
+    def teachers_page(self, parent):
+        self.page_title(parent, "Teachers / اساتذہ", "Choose card view or list view. Teacher contact details are visible to administrators only.")
+        top=ttk.Frame(parent); top.pack(fill="x",pady=6)
+        search=ttk.Entry(top,width=30); search.pack(side="left",padx=(0,8)); search.insert(0,"Search teacher name...")
+        view_var=tk.StringVar(value="list")
+        smart_label(ttk.Label, top,text="View / منظر:").pack(side="left",padx=(8,4))
+        ttk.Radiobutton(top,text="▦ Cards / کارڈز",variable=view_var,value="cards",command=lambda:load(search.get().strip())).pack(side="left",padx=3)
+        ttk.Radiobutton(top,text="☷ List / فہرست",variable=view_var,value="list",command=lambda:load(search.get().strip())).pack(side="left",padx=3)
+        ttk.Button(top,text="🔍 Search",command=lambda:load(search.get().strip())).pack(side="left",padx=5)
+        ttk.Button(top,text="👥 Assign Students",command=self.assign_students).pack(side="right",padx=6)
+        ttk.Button(top,text="➕ Add Teacher",style="Accent.TButton",command=self.add_teacher).pack(side="right")
+        area=ttk.Frame(parent); area.pack(fill="both",expand=True)
+        def load(query=""):
+            for child in area.winfo_children(): child.destroy()
+            sql="SELECT * FROM teachers"; args=()
+            if query and query!="Search teacher name...": sql+=" WHERE full_name LIKE ?"; args=(f"%{query}%",)
+            sql+=" ORDER BY full_name"; rows=self.db.conn.execute(sql,args).fetchall()
+            if not rows:
+                smart_label(ttk.Label, area,text="No teacher records found. Use Add Teacher to create the first profile.",style="Sub.TLabel").pack(anchor="w",padx=12,pady=20); return
+            if view_var.get()=="list":
+                tree=self.make_tree(area,("id","full_name","email","status","qualification","experience"),("ID","Teacher / استاد","Email","Status / حیثیت","Qualification / قابلیت","Experience / تجربہ"))
+                def add_row(r, _index):
+                    tree.insert("","end",values=(r["id"],r["full_name"],r["email"],r["status"],r["qualification"],r["experience"]))
+                self._run_in_batches(tree, rows, add_row, batch_size=120, delay_ms=4)
+                def open_selected(_event=None):
+                    sel=tree.selection()
+                    if sel: self.teacher_profile(int(tree.item(sel[0],"values")[0]))
+                tree.bind("<Double-1>",open_selected)
+                ttk.Button(area,text="👤 Open Teacher Profile / پروفائل",command=open_selected).pack(anchor="e",pady=4)
+            else:
+                canvas=tk.Canvas(area,bg=CARD_BG,highlightthickness=0); vs=ttk.Scrollbar(area,orient="vertical",command=canvas.yview)
+                inner=ttk.Frame(canvas); inner.bind("<Configure>",lambda e:canvas.configure(scrollregion=canvas.bbox("all")))
+                canvas.create_window((0,0),window=inner,anchor="nw"); canvas.configure(yscrollcommand=vs.set)
+                canvas.pack(side="left",fill="both",expand=True); vs.pack(side="right",fill="y")
+                def add_card(r, i):
+                    card=tk.Frame(inner,bg=PALE,highlightbackground="#DCE8E2",highlightthickness=1,padx=14,pady=12)
+                    card.grid(row=i//3,column=i%3,sticky="nsew",padx=7,pady=7)
+                    smart_label(tk.Label, card,text="🧑‍🏫  "+(r["full_name"] or "Unnamed teacher"),bg=PALE,fg=GREEN,font=(UI_FONT,12,"bold"),wraplength=210).pack(anchor="w")
+                    for label,value in (("🎓 Qualification",r["qualification"]),("🗓️ Availability",r["availability"]),("● Status",r["status"])):
+                        smart_label(tk.Label, card,text=f"{label}: {value or '—'}",bg=PALE,fg=DARK,font=(UI_FONT,9),wraplength=230,justify="left").pack(anchor="w",pady=2)
+                    tk.Button(card,text="👁 Open Profile / پروفائل",bg=GREEN,fg=WHITE,relief="flat",command=lambda tid=r["id"]:self.teacher_profile(tid)).pack(anchor="w",pady=(7,0))
+                self._run_in_batches(inner, rows, add_card, batch_size=4, delay_ms=3)
+                for col in range(3): inner.grid_columnconfigure(col,weight=1)
+        load()
+
+    def teacher_profile(self, teacher_id):
+        """Administrator-only teacher profile; resilient to older database schemas."""
+        try:
+            teacher = self.db.conn.execute("SELECT * FROM teachers WHERE id=?", (teacher_id,)).fetchone()
+            if not teacher:
+                messagebox.showwarning("Teacher not found", "This teacher record could not be found.")
+                return
+            data = dict(teacher)
+            def val(key, default="—"):
+                value = data.get(key, default)
+                return default if value is None or str(value).strip() == "" else str(value)
+
+            win = tk.Toplevel(self.root)
+            win.title("Teacher Profile / استاد کا پروفائل")
+            win.configure(bg=APP_BG)
+            win.transient(self.root)
+            win.geometry("980x720")
+            win.minsize(780, 600)
+
+            header = tk.Frame(win, bg=GREEN, padx=20, pady=16)
+            header.pack(fill="x")
+            photo_holder = tk.Frame(header, bg=GREEN)
+            photo_holder.pack(side="left", padx=(0, 12))
+            photo_widget = self._make_profile_photo(photo_holder, val("full_name", "Teacher"),
+                                                    val("image_path", ""), size=94, background=GREEN)
+            photo_widget.pack()
+            def load_photo(path):
+                photo_widget._taha_set_profile_image(path)
+            def choose_photo():
+                source_path = filedialog.askopenfilename(parent=win, title="Select teacher photo from gallery",
+                    filetypes=[("Image files", "*.png *.gif *.jpg *.jpeg *.bmp *.webp"), ("All files", "*.*")])
+                if not source_path:
+                    return
+                target_path = self._profile_image_target("teacher", teacher_id)
+                if not self._show_logo_cropper(source_path, target_path):
+                    return
+                try:
+                    cols = {r[1] for r in self.db.conn.execute("PRAGMA table_info(teachers)").fetchall()}
+                    if "image_path" not in cols:
+                        self.db.conn.execute("ALTER TABLE teachers ADD COLUMN image_path TEXT DEFAULT ''")
+                    self.db.conn.execute("UPDATE teachers SET image_path=? WHERE id=?", (target_path, teacher_id))
+                    self.db.conn.commit()
+                    data["image_path"] = target_path
+                    load_photo(target_path)
+                except Exception as exc:
+                    messagebox.showerror("Photo not saved", str(exc), parent=win)
+            tk.Button(photo_holder, text="Choose Photo / تصویر منتخب کریں", command=choose_photo,
+                      bg=CARD_BG, fg=GREEN, relief="flat", cursor="hand2").pack(pady=(6, 0))
+
+            title_box = tk.Frame(header, bg=GREEN)
+            title_box.pack(side="left", fill="x", expand=True)
+            smart_label(tk.Label, title_box, text=val("full_name", "Teacher"), bg=GREEN, fg=WHITE,
+                     font=(UI_BOLD_FONT, 20, "bold")).pack(anchor="w")
+            smart_label(tk.Label, title_box, text=f"Teacher ID: {teacher_id}  •  Administrator Profile",
+                     bg=GREEN, fg="#EAF4F0", font=(UI_FONT, 10)).pack(anchor="w", pady=(5, 0))
+            status = val("status", "Pending")
+            smart_label(tk.Label, header, text=f"● {status}", bg=SOFT_GREEN, fg=GREEN,
+                     font=(UI_BOLD_FONT, 10, "bold"), padx=12, pady=8).pack(side="right", anchor="n")
+
+            body = ttk.Frame(win, padding=14)
+            body.pack(fill="both", expand=True)
+            canvas = tk.Canvas(body, bg=APP_BG, highlightthickness=0)
+            scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+            canvas.configure(yscrollcommand=scrollbar.set)
+            scrollbar.pack(side="right", fill="y")
+            canvas.pack(side="left", fill="both", expand=True)
+            content = tk.Frame(canvas, bg=APP_BG)
+            canvas_window = canvas.create_window((0, 0), window=content, anchor="nw")
+            content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.bind("<Configure>", lambda e: canvas.itemconfigure(canvas_window, width=e.width))
+
+            def section(parent, title, rows, accent=GREEN):
+                card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
+                card.pack(fill="x", expand=True, padx=4, pady=6)
+                tk.Frame(card, bg=accent, height=4).pack(fill="x")
+                smart_label(tk.Label, card, text=title, bg=CARD_BG, fg=GREEN,
+                         font=(UI_BOLD_FONT, 12, "bold"), padx=14, pady=10).pack(anchor="w")
+                grid = tk.Frame(card, bg=CARD_BG, padx=10, pady=8)
+                grid.pack(fill="x", expand=True)
+                for i, (label, value) in enumerate(rows):
+                    cell = tk.Frame(grid, bg=PALE, padx=10, pady=8)
+                    cell.grid(row=i // 2, column=i % 2, sticky="nsew", padx=4, pady=4)
+                    grid.grid_columnconfigure(i % 2, weight=1, uniform="teacher_detail")
+                    smart_label(tk.Label, cell, text=label, bg=PALE, fg=MUTED,
+                             font=(UI_BOLD_FONT, 9, "bold")).pack(anchor="w")
+                    smart_label(tk.Label, cell, text=value if value else "—", bg=PALE, fg=DARK,
+                             font=(UI_FONT, 11), wraplength=360, justify="left").pack(anchor="w", pady=(3, 0))
+
+            section(content, "📘 Professional Details / پیشہ ورانہ معلومات", [
+                ("📧 Email / ای میل", val("email")),
+                ("🎓 Qualification / قابلیت", val("qualification")),
+                ("🧑‍🏫 Experience / تجربہ", val("experience")),
+                ("🗓️ Availability / دستیاب اوقات", val("availability")),
+                ("🟢 Status / حیثیت", status),
+            ])
+            section(content, "🔒 Administrator-only Contact / صرف ایڈمن کے لیے رابطہ", [
+                ("📞 Phone / فون", val("phone")),
+            ], accent=GOLD)
+            try:
+                assigned = self.db.conn.execute("""SELECT s.full_name FROM students s
+                    JOIN teacher_students ts ON ts.student_id=s.id
+                    WHERE ts.teacher_id=? ORDER BY s.full_name""", (teacher_id,)).fetchall()
+                assigned_names = ", ".join(r["full_name"] for r in assigned) or "No students assigned"
+                assigned_count = len(assigned)
+            except sqlite3.Error:
+                assigned_names, assigned_count = "Assignment records unavailable", 0
+            section(content, "👥 Assigned Students / منسلک طلبہ", [
+                ("Number of students / طلبہ کی تعداد", str(assigned_count)),
+                ("Student names / طلبہ کے نام", assigned_names),
+            ])
+            footer = ttk.Frame(win, padding=12)
+            footer.pack(fill="x")
+            ttk.Button(footer, text="🔐 Create / Reset Teacher Login",
+                command=lambda tid=teacher_id, email=val("email", ""): self.create_user_dialog(
+                    "teacher", teacher_id=tid, suggested="" if email == "—" else email)).pack(side="left", padx=5)
+            ttk.Button(footer, text="✖ Close", command=win.destroy).pack(side="right", padx=5)
+        except Exception as exc:
+            try:
+                messagebox.showerror("Teacher Profile Error", f"Could not display teacher profile.\n\n{exc}", parent=self.root)
+            except Exception:
+                messagebox.showerror("Teacher Profile Error", str(exc))
+
+    def assign_students(self):
+        """Interactive teacher-student assignment dialog with live free-slot picker."""
+        teachers = self.db.conn.execute("SELECT id, full_name, availability FROM teachers WHERE status='Active' ORDER BY full_name").fetchall()
+        if not teachers:
+            teachers = self.db.conn.execute("SELECT id, full_name, availability FROM teachers ORDER BY full_name").fetchall()
+        students = self.db.conn.execute("SELECT id, full_name, class_time, course FROM students WHERE status='Active' ORDER BY full_name").fetchall()
+        if not students:
+            students = self.db.conn.execute("SELECT id, full_name, class_time, course FROM students ORDER BY full_name").fetchall()
+        if not teachers or not students:
+            messagebox.showwarning("Records needed / ریکارڈ درکار ہے", "Add at least one teacher and one student first.", parent=self.root)
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Assign Teacher & Class Slot / استاد اور وقت متعین کریں")
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win.geometry(f"{min(900, sw - 80)}x{min(680, sh - 120)}")
+        win.minsize(700, 520)
+        win.configure(bg=CARD_BG)
+        win.transient(self.root)
+        win.grab_set()
+
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+
+        smart_label(ttk.Label, body, text="Assign Student to Teacher & Reserve Slot", style="Title.TLabel").pack(anchor="w")
+        smart_label(ttk.Label, body, text="Select teacher and student, then choose an available weekly slot. This assigns the student, sets their class time, and updates the weekly timetable in one step.", style="Sub.TLabel", wraplength=760).pack(anchor="w", pady=(2, 10))
+
+        top_grid = ttk.Frame(body)
+        top_grid.pack(fill="x", pady=(0, 10))
+
+        smart_label(ttk.Label, top_grid, text="Teacher / استاد").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+        teacher_box = ttk.Combobox(top_grid, state="readonly", width=34,
+                                   values=[f"{r['id']} - {r['full_name']}" for r in teachers])
+        teacher_box.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+        teacher_box.current(0)
+
+        smart_label(ttk.Label, top_grid, text="Student / طالب علم").grid(row=0, column=2, sticky="w", padx=(16, 6), pady=4)
+        student_box = ttk.Combobox(top_grid, state="readonly", width=34,
+                                   values=[f"{r['id']} - {r['full_name']}" for r in students])
+        student_box.grid(row=0, column=3, sticky="w", padx=6, pady=4)
+        student_box.current(0)
+
+        # Button bar is packed FIRST (bottom) so it can never be pushed out of view.
+        btn_row = ttk.Frame(body)
+        btn_row.pack(side="bottom", fill="x", pady=(10, 0))
+        assign_btn = ttk.Button(btn_row, text="✔ Assign Student to Selected Slot / منتخب وقت پر تفویض کریں",
+                                style="Accent.TButton", command=lambda: save_assignment())
+        assign_btn.pack(side="left")
+        ttk.Button(btn_row, text="Close / بند کریں", style="Secondary.TButton", command=win.destroy).pack(side="right")
+        hint_lbl = ttk.Label(body, text="Tip: select an AVAILABLE row, then press Assign (or double-click the row).", style="Sub.TLabel")
+        hint_lbl.pack(side="bottom", anchor="w", pady=(6, 0))
+
+        tree_frame = ttk.Frame(body)
+        tree_frame.pack(fill="both", expand=True, pady=6)
+        cols = ("slot", "status", "booked_by")
+        stree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=10, selectmode="browse")
+        stree.heading("slot", text="Day and Time Slot / دن اور وقت")
+        stree.heading("status", text="Availability / صورتحال")
+        stree.heading("booked_by", text="Booked By / متعین طالب علم")
+        stree.column("slot", width=220)
+        stree.column("status", width=140)
+        stree.column("booked_by", width=240)
+        sb = ttk.Scrollbar(tree_frame, orient="vertical", command=stree.yview)
+        stree.configure(yscrollcommand=sb.set)
+        stree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        _dark_card = on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF"
+        stree.tag_configure("available", **row_tag_opts("available"))
+        stree.tag_configure("current", **row_tag_opts("current"))
+        stree.tag_configure("booked", **row_tag_opts("booked"))
+        stree.tag_configure("off", **row_tag_opts("off"))
+
+        only_free_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="Show only available free slots / صرف خالی اوقات دکھائیں",
+                        variable=only_free_var, command=lambda: refresh_slots()).pack(anchor="w", pady=(2, 6))
+
+        def refresh_slots(_e=None):
+            stree.delete(*stree.get_children())
+            try:
+                tid = int(teacher_box.get().split(" - ", 1)[0])
+                sid = int(student_box.get().split(" - ", 1)[0])
+            except (ValueError, IndexError):
+                return
+            all_slots = self._get_teacher_slots(tid, sid)
+            only_free = only_free_var.get()
+            for s in all_slots:
+                status = s["status"]
+                if only_free and status != "AVAILABLE" and status != "CURRENT SLOT":
+                    continue
+                tag = "available" if status == "AVAILABLE" else ("current" if status == "CURRENT SLOT" else ("booked" if status == "BOOKED" else "off"))
+                stree.insert("", "end", values=(s["slot"], status, s["booked_by"]), tags=(tag,))
+
+        teacher_box.bind("<<ComboboxSelected>>", refresh_slots)
+        student_box.bind("<<ComboboxSelected>>", refresh_slots)
+        refresh_slots()
+
+        def save_assignment():
+            selected = stree.selection()
+            if not selected:
+                messagebox.showwarning("Select Slot / وقت چنیں", "Please select a time slot from the list.", parent=win)
+                return
+            vals = stree.item(selected[0], "values")
+            slot, status, booked_by = vals[0], vals[1], vals[2]
+            if status not in ("AVAILABLE", "CURRENT SLOT"):
+                messagebox.showwarning("Slot Not Available / وقت دستیاب نہیں", f"This slot is {status} ({booked_by}). Please choose an available green slot.", parent=win)
+                return
+            try:
+                tid = int(teacher_box.get().split(" - ", 1)[0])
+                sid = int(student_box.get().split(" - ", 1)[0])
+            except (ValueError, IndexError):
+                return
+            parts = slot.split(" ", 1)
+            day = parts[0]
+            start = parts[1] if len(parts) > 1 else ""
+            end = self._calculate_end_time(start, 45)
+
+            try:
+                self.db.conn.execute("UPDATE students SET class_time=? WHERE id=?", (slot, sid))
+                self.db.conn.execute("INSERT OR IGNORE INTO teacher_students(teacher_id, student_id) VALUES(?,?)", (tid, sid))
+                self.db.conn.execute("DELETE FROM weekly_class_schedule WHERE student_id=? AND weekday=?", (sid, day))
+                self.db.conn.execute("INSERT INTO weekly_class_schedule(student_id, teacher_id, weekday, start_time, end_time, created_at) VALUES(?,?,?,?,?,?)",
+                                     (sid, tid, day, start, end, timestamp()))
+                self.db.conn.commit()
+                messagebox.showinfo("Assigned Successfully / کامیابی سے تفویض", f"Student assigned to teacher.\nSlot: {slot}\nWeekly timetable and class schedule updated.", parent=win)
+                win.destroy()
+            except Exception as exc:
+                messagebox.showerror("Assignment Error", str(exc), parent=win)
+
+        stree.bind("<Double-1>", lambda _e: save_assignment())
+
+    def add_teacher(self):
+        fields = [
+            ("full_name", "Teacher full name *", ""), ("email", "Email / username", ""),
+            ("phone", "Phone (admin only)", ""), ("qualification", "Qualifications", ""),
+            ("experience", "Experience", ""), ("availability", "Available class times", ""),
+            ("status", "Status", "Active")
+        ]
+        def save(v, win):
+            if not v["full_name"]:
+                messagebox.showwarning("Required", "Teacher name is required.", parent=win); return False
+            cur = self.db.conn.execute("INSERT INTO teachers(full_name,email,phone,qualification,experience,availability,status) VALUES(?,?,?,?,?,?,?)",
+                (v["full_name"],v["email"],v["phone"],v["qualification"],v["experience"],v["availability"],v["status"]))
+            self.db.conn.commit()
+            tid = cur.lastrowid
+            if messagebox.askyesno("Create login?", "Create a teacher login account now?", parent=win):
+                self.create_user_dialog("teacher", teacher_id=tid, suggested=v["email"])
+            messagebox.showinfo("Saved", "Teacher record saved.", parent=win)
+            return True
+        self.form_dialog("Add Teacher / نیا استاد", fields, save, {"status": STATUSES})
+
+    def create_user_dialog(self, role, teacher_id=None, student_id=None, suggested=""):
+        # Current release supports admin-managed teacher logins only. Legacy
+        # student account records remain in the DB but cannot be newly created.
+        if str(role or "").strip().lower() != "teacher" or not teacher_id:
+            messagebox.showwarning(
+                "Teacher account only / صرف استاد کا اکاؤنٹ",
+                "Only an administrator can create a login linked to a teacher record. Student login is not included in this release.",
+                parent=self.root)
+            return
+        win = tk.Toplevel(self.root); win.title("Create login account"); win.configure(bg=CARD_BG); win.transient(self.root); win.grab_set()
+        body = ttk.Frame(win, padding=18); body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text=f"Create {role.title()} Login", style="Title.TLabel").grid(row=0,column=0,columnspan=2,sticky="w",pady=(0,12))
+        uname = self.field(body, "Username", 1, suggested)
+        pw = self.field(body, "Password (at least 12 characters)", 2, "", show="*")
+        confirm = self.field(body, "Confirm password", 3, "", show="*")
+        def toggle(entry, button):
+            showing = entry.cget("show") == ""
+            entry.configure(show="*" if showing else "")
+            button.configure(text="Show" if showing else "Hide")
+        show_pw = ttk.Button(body, text="Show", width=7, command=lambda: toggle(pw, show_pw))
+        show_pw.grid(row=2, column=2, sticky="w", padx=(0, 8), pady=7)
+        show_confirm = ttk.Button(body, text="Show", width=7, command=lambda: toggle(confirm, show_confirm))
+        show_confirm.grid(row=3, column=2, sticky="w", padx=(0, 8), pady=7)
+        active = tk.IntVar(value=1)
+        ttk.Checkbutton(body, text="Account active", variable=active).grid(row=4,column=1,sticky="w",padx=8,pady=6)
+        def save():
+            if not uname.get().strip() or len(pw.get()) < 12:
+                messagebox.showwarning("Check details", "Username is required and password must be at least 12 characters.", parent=win); return
+            if pw.get() != confirm.get():
+                messagebox.showwarning("Password mismatch", "The two passwords do not match.", parent=win); return
+            try:
+                self.db.conn.execute("INSERT INTO users(username,password_hash,role,teacher_id,student_id,active,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (uname.get().strip(),password_hash(pw.get()),role,teacher_id,student_id,active.get(),timestamp()))
+                self.db.conn.commit()
+                messagebox.showinfo("Created", f"{role.title()} account created. Share the login securely.", parent=win)
+                win.destroy()
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Username exists", "That username is already in use.", parent=win)
+        ttk.Button(body, text="Create Account", style="Accent.TButton", command=save).grid(row=5,column=1,sticky="e",pady=12)
+        uname.bind("<Return>", lambda _e: (pw.focus_set(), "break")[1])
+        pw.bind("<Return>", lambda _e: (confirm.focus_set(), "break")[1])
+        confirm.bind("<Return>", lambda _e: (save(), "break")[1])
+        win.update_idletasks(); win.geometry(f"+{self.root.winfo_rootx()+120}+{self.root.winfo_rooty()+100}")
+
+    def _run_in_batches(self, widget, items, add_item, batch_size=40, delay_ms=6):
+        """Populate a list/card/table in small UI-thread batches so older PCs stay responsive."""
+        total = len(items)
+        if total <= 0:
+            return
+        index = 0
+        batch_size = max(1, int(batch_size))
+        delay_ms = max(1, int(delay_ms))
+
+        def add_batch():
+            nonlocal index
+            try:
+                if not widget.winfo_exists():
+                    return
+                stop = min(total, index + batch_size)
+                while index < stop:
+                    add_item(items[index], index)
+                    index += 1
+                if index < total and widget.winfo_exists():
+                    self.root.after(delay_ms, add_batch)
+            except tk.TclError:
+                # The user changed tabs or started a new search; the old view is gone.
+                return
+
+        self.root.after_idle(add_batch)
+
+    def make_tree(self, parent, columns, headings):
+        wrap = ttk.Frame(parent); wrap.pack(fill="both", expand=True, pady=8)
+        tree = ttk.Treeview(wrap, columns=columns, show="headings", style="Treeview")
+        is_urdu_mode = APP_LANGUAGE == "ur"
+        monetary_keys = ("due", "paid", "balance", "amount", "fee", "monthly_fee")
+        for c, h in zip(columns, headings):
+            c_lower = c.lower()
+            h_lower = h.lower()
+            is_money = any(mk in c_lower or mk in h_lower for mk in monetary_keys)
+            if is_money:
+                align = "e"
+            elif c_lower in ("id", "student_id", "month", "status", "currency", "date", "class_date", "payment_date"):
+                align = "center"
+            else:
+                align = "e" if is_urdu_mode else "w"
+            tree.heading(c, text=h, anchor=align)
+            tree.column(c, width=120 if is_money else 140, minwidth=60, anchor=align, stretch=True)
+        # Semantic color tags
+        tree.tag_configure("paid", **row_tag_opts("paid"))
+        tree.tag_configure("present", **row_tag_opts("present"))
+        # Plain data rows (e.g. Active students) are always black on light cards, white on dark ones.
+        _row_text = "#FFFFFF" if on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF" else "#000000"
+        tree.tag_configure("active", **row_tag_opts("active"))
+        tree.tag_configure("partial", **row_tag_opts("partial"))
+        tree.tag_configure("pending", **row_tag_opts("pending"))
+        tree.tag_configure("late", **row_tag_opts("late"))
+        tree.tag_configure("unpaid", **row_tag_opts("unpaid"))
+        tree.tag_configure("absent", **row_tag_opts("absent"))
+        tree.tag_configure("overdue", **row_tag_opts("overdue"))
+        tree.tag_configure("leave", **row_tag_opts("leave"))
+        vs = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
+        hs = ttk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
+        tree.grid(row=0,column=0,sticky="nsew"); vs.grid(row=0,column=1,sticky="ns"); hs.grid(row=1,column=0,sticky="ew")
+        wrap.grid_rowconfigure(0,weight=1); wrap.grid_columnconfigure(0,weight=1)
+        return tree
+
+    def timetable_page(self, parent):
+        self.page_title(parent, "Class Timetable / کلاسوں کا ٹائم ٹیبل",
+                        "Monthly and weekly calendar. Select a class to open its details.")
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", pady=5)
+        self.calendar_anchor = getattr(self, "calendar_anchor", date.today().replace(day=1))
+        self.calendar_mode = getattr(self, "calendar_mode", "month")
+        ttk.Button(bar, text="Allocate Regular Time / مستقل وقت", style="Accent.TButton",
+                   command=lambda: self.allocate_class_time(parent)).pack(side="right", padx=3)
+        ttk.Button(bar, text="Weekly Schedule / ہفتہ وار شیڈول", style="Accent.TButton",
+                   command=lambda: self.manage_weekly_schedule(parent)).pack(side="right", padx=3)
+        ttk.Button(bar, text="Add Extra / Make-up Class", 
+                   command=lambda: self.add_class_session(parent)).pack(side="right", padx=3)
+        ttk.Button(bar, text="Daily View", command=lambda: self.set_calendar_mode(parent, "day")).pack(side="left", padx=3)
+        ttk.Button(bar, text="Weekly View", command=lambda: self.set_calendar_mode(parent, "week")).pack(side="left", padx=3)
+        ttk.Button(bar, text="Monthly View", command=lambda: self.set_calendar_mode(parent, "month")).pack(side="left", padx=3)
+        # Keep the calendar at its natural content height. Expanding it vertically
+        # inside the scrollable page caused month rows and attendance bubbles to
+        # stretch as the viewport/scroll position changed. The outer page handles scrolling.
+        self.calendar_area = ttk.Frame(parent)
+        self.calendar_area.pack(fill="x", expand=False, pady=5)
+        self.render_class_calendar(parent)
+
+    def set_calendar_mode(self, parent, mode):
+        self.calendar_mode = mode
+        self.render_class_calendar(parent)
+
+    def _regular_classes_for_date(self, day):
+        weekday = day.strftime("%A")
+        cache = getattr(self, "_calendar_weekday_cache", None)
+        if cache is not None and weekday in cache:
+            return [dict(item, date=day.isoformat()) for item in cache[weekday]]
+        result=[]
+        # New multi-day schedule records (preferred when present).
+        rows = self.db.conn.execute("""SELECT w.id,w.student_id,w.teacher_id,w.weekday,w.start_time,w.end_time,
+                    s.full_name,s.course,s.level,s.status,COALESCE(t.full_name,'Not assigned') AS teacher_name
+            FROM weekly_class_schedule w JOIN students s ON s.id=w.student_id
+            LEFT JOIN teachers t ON t.id=w.teacher_id
+            WHERE w.weekday=? AND s.status='Active' ORDER BY w.start_time,s.full_name""",(weekday,)).fetchall()
+        scheduled_students=set()
+        for r in rows:
+            scheduled_students.add(r['student_id'])
+            result.append({"kind":"regular","id":r['id'],"student_id":r['student_id'],"student":r['full_name'],
+                "course":r['course'] or '',"level":r['level'] or '',"teacher":r['teacher_name'],
+                "date":day.isoformat(),"start":r['start_time'] or '',"end":r['end_time'] or '',
+                "type":"Regular class","status":r['status'] or 'Active',"notes":"Weekly timetable entry"})
+        # Backward compatibility: show legacy single class_time only for students without new schedule rows.
+        legacy = self.db.conn.execute("""SELECT s.id,s.full_name,s.course,s.level,s.class_time,s.status,
+                    COALESCE(GROUP_CONCAT(t.full_name, ', '), 'Not assigned') AS teacher_names
+            FROM students s LEFT JOIN teacher_students ts ON ts.student_id=s.id
+            LEFT JOIN teachers t ON t.id=ts.teacher_id
+            WHERE COALESCE(s.class_time,'')<>'' AND s.status='Active'
+            GROUP BY s.id ORDER BY s.class_time,s.full_name""").fetchall()
+        for r in legacy:
+            if r['id'] in scheduled_students: continue
+            slot=(r['class_time'] or '').strip()
+            if slot.lower().startswith(weekday.lower()+' '):
+                result.append({"kind":"regular","id":r['id'],"student_id":r['id'],"student":r['full_name'],
+                    "course":r['course'] or '',"level":r['level'] or '',"teacher":r['teacher_names'],
+                    "date":day.isoformat(),"start":slot[len(weekday):].strip(),"end":"",
+                    "type":"Regular class","status":r['status'] or 'Active',"notes":"Legacy regular weekly timetable entry"})
+        if cache is not None:
+            cache[weekday] = [dict(item, date="") for item in result]
+        return result
+
+    def manage_weekly_schedule(self, parent=None):
+        students=self.db.conn.execute("SELECT id,full_name FROM students WHERE status='Active' ORDER BY full_name").fetchall()
+        teachers=self.db.conn.execute("SELECT id,full_name,availability FROM teachers WHERE status='Active' ORDER BY full_name").fetchall()
+        if not students or not teachers:
+            messagebox.showwarning("Records needed","Add at least one active student and teacher first.",parent=self.root)
+            return
+        win=tk.Toplevel(self.root); win.title("Weekly Class Schedule / ہفتہ وار شیڈول"); win.geometry("760x650"); win.minsize(650,560); win.transient(self.root); win.grab_set()
+        body=ttk.Frame(win,padding=14); body.pack(fill='both',expand=True)
+        smart_label(ttk.Label,body,text="Assign one student multiple weekdays. Choose a day and time, then add it; repeat for each class day.",style="Sub.TLabel",wraplength=700).pack(anchor='w',pady=(0,10))
+        form=ttk.Frame(body); form.pack(fill='x')
+        smart_label(ttk.Label,form,text="Student").grid(row=0,column=0,sticky='w',padx=4,pady=5)
+        sb=ttk.Combobox(form,state='readonly',values=[f"{r['id']} - {r['full_name']}" for r in students],width=35); sb.grid(row=0,column=1,sticky='ew',padx=4,pady=5); sb.current(0)
+        smart_label(ttk.Label,form,text="Teacher").grid(row=1,column=0,sticky='w',padx=4,pady=5)
+        tb=ttk.Combobox(form,state='readonly',values=[f"{r['id']} - {r['full_name']}" for r in teachers],width=35); tb.grid(row=1,column=1,sticky='ew',padx=4,pady=5); tb.current(0)
+        smart_label(ttk.Label,form,text="Weekday").grid(row=2,column=0,sticky='w',padx=4,pady=5)
+        days=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        db=ttk.Combobox(form,state='readonly',values=days,width=20); db.grid(row=2,column=1,sticky='w',padx=4,pady=5); db.current(0)
+        smart_label(ttk.Label,form,text="Start time (e.g. 03:00 PM)").grid(row=3,column=0,sticky='w',padx=4,pady=5)
+        st=tk.StringVar(value='03:00 PM'); se=ttk.Entry(form,textvariable=st,width=22); se.grid(row=3,column=1,sticky='w',padx=4,pady=5)
+        smart_label(ttk.Label,form,text="End time (e.g. 03:30 PM)").grid(row=4,column=0,sticky='w',padx=4,pady=5)
+        et=tk.StringVar(value='03:30 PM'); ttk.Entry(form,textvariable=et,width=22).grid(row=4,column=1,sticky='w',padx=4,pady=5)
+        form.grid_columnconfigure(1,weight=1)
+        tree=self.make_tree(body,('id','day','start','end','teacher'),('ID','Weekday','Start','End','Teacher'))
+        def selected_ids():
+            try: return int(sb.get().split(' - ',1)[0]),int(tb.get().split(' - ',1)[0])
+            except (ValueError,IndexError): return None,None
+        def refresh():
+            tree.delete(*tree.get_children()); sid,_=selected_ids()
+            if sid is None:return
+            rows=self.db.conn.execute("""SELECT w.id,w.weekday,w.start_time,w.end_time,COALESCE(t.full_name,'Not assigned') teacher_name
+                FROM weekly_class_schedule w LEFT JOIN teachers t ON t.id=w.teacher_id WHERE w.student_id=?
+                ORDER BY CASE w.weekday WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,w.start_time""",(sid,)).fetchall()
+            for r in rows: tree.insert('', 'end', values=(r['id'],r['weekday'],r['start_time'],r['end_time'],r['teacher_name']))
+        def add():
+            sid,tid=selected_ids()
+            if sid is None:return
+            day=db.get().strip(); start=st.get().strip(); end=et.get().strip()
+            def mins(value):
+                return datetime.strptime(value,'%I:%M %p').hour*60+datetime.strptime(value,'%I:%M %p').minute
+            try: a,b=mins(start),mins(end)
+            except ValueError:
+                messagebox.showerror('Invalid time','Use time format like 03:00 PM.',parent=win);return
+            if b<=a: messagebox.showerror('Invalid duration','End time must be after start time.',parent=win);return
+            # Teacher's explicit availability is enforced when it uses the documented comma-separated slot format.
+            tr=next((x for x in teachers if x['id']==tid),None); availability=(tr['availability'] or '').strip() if tr else ''
+            avail={x.strip() for x in availability.split(',') if x.strip()}
+            slot=f'{day} {start}'
+            if any(x.startswith(tuple(days)) for x in avail) and slot not in avail:
+                messagebox.showerror('Teacher unavailable',f"{slot} is not listed in this teacher's availability.",parent=win);return
+            for row in self.db.conn.execute("""SELECT w.student_id,w.teacher_id,w.start_time,w.end_time,s.full_name FROM weekly_class_schedule w JOIN students s ON s.id=w.student_id WHERE w.weekday=?""",(day,)).fetchall():
+                try: oa=mins(row['start_time']); ob=mins(row['end_time']) if row['end_time'] else oa+30
+                except ValueError: continue
+                if a<ob and oa<b and (row['student_id']==sid or (row['teacher_id']==tid)):
+                    who='student' if row['student_id']==sid else 'teacher'
+                    messagebox.showerror('Schedule conflict',f'This {who} already has an overlapping class with {row["full_name"]} on {day}.',parent=win);return
+            # Check dated extra/make-up sessions against the recurring slot for the selected weekday.
+            dated=self.db.conn.execute("""SELECT cs.student_id,cs.teacher_id,cs.session_date,cs.start_time,cs.end_time,s.full_name FROM class_sessions cs JOIN students s ON s.id=cs.student_id WHERE strftime('%w',cs.session_date)=? AND cs.status<>'Cancelled'""",(str((days.index(day)+1)%7),)).fetchall()
+            for row in dated:
+                try: oa=mins(row['start_time']); ob=mins(row['end_time']) if row['end_time'] else oa+30
+                except ValueError: continue
+                if a<ob and oa<b and (row['student_id']==sid or row['teacher_id']==tid):
+                    messagebox.showerror('Schedule conflict',f'Conflicts with a dated extra/make-up session for {row["full_name"]} ({row["session_date"]}).',parent=win);return
+            try:
+                self.db.conn.execute("INSERT INTO weekly_class_schedule(student_id,teacher_id,weekday,start_time,end_time,created_at) VALUES(?,?,?,?,?,?)",(sid,tid,day,start,end,timestamp()))
+                self.db.conn.execute("INSERT OR IGNORE INTO teacher_students(teacher_id,student_id) VALUES(?,?)",(tid,sid))
+                # Maintain legacy field as a compatibility hint for old screens, without replacing multiple-day records.
+                self.db.conn.execute("UPDATE students SET class_time=? WHERE id=? AND COALESCE(class_time,'')=''",(slot,sid))
+                self.db.conn.commit()
+            except sqlite3.IntegrityError:
+                messagebox.showerror('Already added','This student already has this weekday and start time.',parent=win);return
+            refresh()
+            if parent is not None and parent.winfo_exists(): self.render_class_calendar(parent)
+        def delete():
+            chosen=tree.selection()
+            if not chosen: messagebox.showwarning('Select a class','Select a weekly class to remove.',parent=win);return
+            rid=int(tree.item(chosen[0],'values')[0])
+            if not messagebox.askyesno('Remove weekly class','Remove this recurring weekly class?',parent=win):return
+            self.db.conn.execute('DELETE FROM weekly_class_schedule WHERE id=?',(rid,)); self.db.conn.commit(); refresh()
+            if parent is not None and parent.winfo_exists(): self.render_class_calendar(parent)
+        buttons=ttk.Frame(body); buttons.pack(fill='x',pady=8)
+        ttk.Button(buttons,text='Add weekday / دن شامل کریں',style='Accent.TButton',command=add).pack(side='left')
+        ttk.Button(buttons,text='Remove selected / منتخب کلاس حذف کریں',command=delete).pack(side='left',padx=8)
+        ttk.Button(buttons,text='Close',command=win.destroy).pack(side='right')
+        sb.bind('<<ComboboxSelected>>',lambda _e:refresh()); refresh()
+
+    def _sessions_for_date(self, day):
+        cache = getattr(self, "_calendar_sessions_cache", None)
+        cache_key = day.isoformat()
+        if cache is not None and cache_key in cache:
+            return [dict(item) for item in cache[cache_key]]
+        rows=self.db.conn.execute("""SELECT cs.*,s.full_name AS student,s.course,s.level,
+                    COALESCE(t.full_name,'Not assigned') AS teacher
+            FROM class_sessions cs JOIN students s ON s.id=cs.student_id
+            LEFT JOIN teachers t ON t.id=cs.teacher_id
+            WHERE cs.session_date=? ORDER BY cs.start_time,s.full_name""",(day.isoformat(),)).fetchall()
+        result=[]
+        for r in rows:
+            result.append({"kind":"session","id":r['id'],"student_id":r['student_id'],"student":r['student'],
+                "course":r['course'] or '',"level":r['level'] or '',"teacher":r['teacher'],"date":r['session_date'],
+                "start":r['start_time'] or '',"end":r['end_time'] or '',"type":r['session_type'] or 'Extra',
+                "status":r['status'] or 'Scheduled',"notes":r['notes'] or ''})
+        if cache is not None:
+            cache[cache_key] = [dict(item) for item in result]
+        return result
+
+    def _classes_for_date(self, day):
+        # Extra and make-up sessions are separate records and must not hide a regular timetable entry.
+        regular = self._regular_classes_for_date(day)
+        dated = self._sessions_for_date(day)
+        return sorted(regular + dated, key=lambda x: (x['start'].lower(), x['student'].lower(), x['kind']))
+
+    def _class_attendance_status(self, item):
+        """Read attendance once per student/date during a calendar render.
+
+        Calendar cards and their attendance controls both request this value.
+        A short-lived render cache avoids duplicate SQLite queries without
+        keeping stale attendance data after the calendar is refreshed.
+        """
+        key = (item.get('student_id'), item.get('date'))
+        cache = getattr(self, "_calendar_attendance_cache", None)
+        if cache is not None and key in cache:
+            return cache[key]
+        row = self.db.conn.execute(
+            "SELECT status FROM attendance WHERE student_id=? AND class_date=? ORDER BY id DESC LIMIT 1",
+            key
+        ).fetchone()
+        status = row['status'] if row else 'Not marked'
+        if cache is not None:
+            cache[key] = status
+        return status
+
+    def render_class_calendar(self, parent):
+        # Render-local caches avoid repeating the same weekday and session queries across month cells.
+        self._calendar_attendance_cache = {}
+        self._calendar_weekday_cache = {}
+        self._calendar_sessions_cache = {}
+        for child in self.calendar_area.winfo_children(): child.destroy()
+        if self.calendar_mode == 'day':
+            chosen=self.calendar_anchor if isinstance(self.calendar_anchor,date) else date.today()
+            title=chosen.strftime('%A, %d %B %Y')
+            previous=lambda: setattr(self,'calendar_anchor',chosen-timedelta(days=1)) or self.render_class_calendar(parent)
+            following=lambda: setattr(self,'calendar_anchor',chosen+timedelta(days=1)) or self.render_class_calendar(parent)
+        elif self.calendar_mode == 'week':
+            today=self.calendar_anchor if isinstance(self.calendar_anchor,date) else date.today()
+            week_start=today-timedelta(days=today.weekday())
+            title=f"Week of {week_start.strftime('%d %b %Y')}"
+            previous=lambda: setattr(self,'calendar_anchor',week_start-timedelta(days=7)) or self.render_class_calendar(parent)
+            following=lambda: setattr(self,'calendar_anchor',week_start+timedelta(days=7)) or self.render_class_calendar(parent)
+        else:
+            first=self.calendar_anchor.replace(day=1)
+            title=first.strftime('%B %Y')
+            previous=lambda: setattr(self,'calendar_anchor',(first-timedelta(days=1)).replace(day=1)) or self.render_class_calendar(parent)
+            following=lambda: setattr(self,'calendar_anchor',(first.replace(day=calendar.monthrange(first.year,first.month)[1])+timedelta(days=1)).replace(day=1)) or self.render_class_calendar(parent)
+        nav=ttk.Frame(self.calendar_area); nav.pack(fill='x',pady=(0,6))
+        ttk.Button(nav,text='◀ Previous',command=previous).pack(side='left')
+        smart_label(ttk.Label, nav,text=title,style='Title.TLabel').pack(side='left',padx=18)
+        ttk.Button(nav,text='Next ▶',command=following).pack(side='left')
+        ttk.Button(nav,text='Today',command=lambda: (setattr(self,'calendar_anchor',date.today() if self.calendar_mode in ('week','day') else date.today().replace(day=1)),self.render_class_calendar(parent))).pack(side='left',padx=8)
+        smart_label(ttk.Label, self.calendar_area,text='Green = scheduled regular class • Blue = extra/make-up session • Click a class to view details and mark attendance.',style='Sub.TLabel').pack(anchor='w',pady=(0,6))
+        if self.calendar_mode == 'day':
+            wrap=ttk.Frame(self.calendar_area); wrap.pack(fill='x',expand=False)
+            classes=self._classes_for_date(self.calendar_anchor)
+            if not classes:
+                smart_label(ttk.Label, wrap,text='No classes scheduled for this date.',style='Sub.TLabel').pack(anchor='w',pady=8)
+            for c in classes:
+                att=self._class_attendance_status(c)
+                mark={'Present':'✓ Present / حاضر','Absent':'✕ Absent / غیر حاضر','Leave / Class not held':'— Leave / چھٹی','Not marked':'○ Not marked / درج نہیں'}.get(att,att)
+                row=tk.Frame(wrap, bg='#FFFFFF', highlightbackground='#D9E2E7', highlightthickness=1)
+                row.pack(fill='x',pady=5,ipady=5)
+                info=tk.Frame(row,bg='#FFFFFF'); info.pack(side='left',fill='x',expand=True,padx=12,pady=7)
+                smart_label(tk.Label, info,text=c['start'] or 'Time not set',bg='#FFF1E5',fg='#B85C00',
+                         font=(UI_FONT,9,'bold'),padx=8,pady=3).pack(anchor='w')
+                tk.Button(info,text=f"{c['student']}  ({c['course'] or 'Course not set'})",anchor='w',
+                          bg='#FFFFFF',fg='#173D32',activebackground='#EAF4F0',relief='flat',bd=0,
+                          font=(UI_FONT,11,'bold'),cursor='hand2',
+                          command=lambda item=c:self.show_class_details(item,parent)).pack(anchor='w',pady=(4,0))
+                smart_label(tk.Label, row,text='Attendance',bg='#FFFFFF',fg='#64748B',font=(UI_FONT,8)).pack(side='left',padx=(6,2))
+                self._attendance_bubbles(row, c, parent).pack(side='right', padx=10, pady=5)
+        elif self.calendar_mode == 'month':
+            grid=ttk.Frame(self.calendar_area); grid.pack(fill='x',expand=False)
+            for col,name in enumerate(calendar.day_abbr):
+                smart_label(ttk.Label, grid,text=name,anchor='center').grid(row=0,column=col,sticky='nsew',padx=2,pady=2)
+                grid.grid_columnconfigure(col,weight=1,uniform='monthcol')
+            # Calendar rows have a stable minimum size and grow only if actual class
+            # cards need more room; do not distribute spare viewport height among rows.
+            for row in range(1,7): grid.grid_rowconfigure(row,minsize=100)
+            weeks=calendar.Calendar(firstweekday=0).monthdayscalendar(self.calendar_anchor.year,self.calendar_anchor.month)
+            for wi,week in enumerate(weeks, start=1):
+                for ci,num in enumerate(week):
+                    if not num: continue
+                    d=date(self.calendar_anchor.year,self.calendar_anchor.month,num)
+                    classes=self._classes_for_date(d)
+                    cell=ttk.Frame(grid, padding=3, relief='groove')
+                    cell.grid(row=wi,column=ci,sticky='nsew',padx=2,pady=2)
+                    smart_label(ttk.Label, cell,text=str(num),font=(UI_FONT,9,'bold')).pack(anchor='w')
+                    for c in classes[:2]:
+                        card=ttk.Frame(cell); card.pack(fill='x',pady=1)
+                        ttk.Button(card,text=c['student'][:10],command=lambda item=c:self.show_class_details(item,parent)).pack(fill='x')
+                        self._attendance_bubbles(card,c,parent).pack(anchor='w')
+                    if len(classes)>2:
+                        ttk.Button(cell,text=f"+{len(classes)-2} more",command=lambda chosen=d:self.show_day_details(chosen,parent)).pack(anchor='w')
+                    if not classes:
+                        smart_label(ttk.Label, cell,text='—',style='Sub.TLabel').pack(anchor='w')
+        else:
+            grid=ttk.Frame(self.calendar_area); grid.pack(fill='x',expand=False)
+            for col in range(7): grid.grid_columnconfigure(col,weight=1,uniform='weekcol')
+            for col in range(7):
+                d=week_start+timedelta(days=col)
+                daybox=ttk.LabelFrame(grid,text=d.strftime('%a %d %b'),padding=4)
+                daybox.grid(row=0,column=col,sticky='nsew',padx=2,pady=2)
+                classes=self._classes_for_date(d)
+                if not classes: smart_label(ttk.Label, daybox,text='No classes',style='Sub.TLabel').pack(anchor='w',pady=3)
+                for c in classes:
+                    att=self._class_attendance_status(c)
+                    mark={'Present':'✓ Present','Absent':'✕ Absent','Leave / Class not held':'— Leave','Not marked':'○ Not marked'}.get(att,att)
+                    label=f"{c['start']}\n{c['student']}\n{c['type']}\n{mark}"
+                    card=tk.Frame(daybox,bg='#FFFFFF',highlightbackground='#D9E2E7',highlightthickness=1)
+                    card.pack(fill='x',pady=4)
+                    b=tk.Button(card,text=f"{c['start']}\n{c['student']}\n{c['type']}",anchor='w',justify='left',wraplength=125,
+                        bg=('#EAF4F0' if c['kind']=='regular' else '#EAF4F0'),fg=DARK,relief='flat',bd=0,
+                        font=(UI_FONT,9,'bold'),command=lambda item=c:self.show_class_details(item,parent))
+                    b.pack(fill='x',padx=5,pady=(5,2))
+                    self._attendance_bubbles(card, c, parent).pack(anchor='center', pady=(0,4))
+                ttk.Button(daybox,text='View day',command=lambda chosen=d:self.show_day_details(chosen,parent)).pack(fill='x',pady=(5,0))
+
+    def _attendance_bubbles(self, host, item, parent=None):
+        """Professional attendance bubbles; teacher changes are sent for admin approval."""
+        current = self._class_attendance_status(item)
+        bar = tk.Frame(host, bg=host.cget('background') if 'background' in host.keys() else '#FFFFFF')
+        choices = [
+            ('Present', 'P', '#218C52', '#DDF4E7'),
+            ('Absent', 'A', '#D94343', '#FBE4E4'),
+            ('Leave / Class not held', 'L', '#E5A11A', '#FFF1CF'),
+        ]
+        for value, short, color, pale in choices:
+            selected = current == value
+            fill = color if selected else pale
+            text_color = '#FFFFFF' if selected else color
+            bubble = tk.Canvas(bar, width=38, height=38, bg=bar.cget('bg'),
+                               highlightthickness=0, bd=0, cursor='hand2', takefocus=1)
+            bubble.pack(side='left', padx=4, pady=2)
+            idle_image = hover_image = selected_image = None
+            # Supersampling makes the circular attendance controls smoother than
+            # tiny native Canvas ovals, especially on Windows at non-100% display scale.
+            if Image is not None and ImageTk is not None and ImageDraw is not None:
+                try:
+                    image_cache = getattr(self, '_attendance_bubble_image_cache', None)
+                    if image_cache is None:
+                        image_cache = self._attendance_bubble_image_cache = LRUCache(48)
+                    image_key = (str(bar.cget('bg')), color, fill, bool(selected))
+                    cached_images = image_cache.get(image_key)
+                    if cached_images is None:
+                        scale = 3
+                        def render_bubble(bg_color, edge_color, edge_width=1):
+                            side = 38 * scale
+                            image = Image.new('RGBA', (side, side), bar.cget('bg'))
+                            draw = ImageDraw.Draw(image)
+                            inset = 3 * scale
+                            draw.ellipse((inset, inset, side-inset-1, side-inset-1),
+                                         fill=bg_color, outline=edge_color, width=edge_width * scale)
+                            resampling = getattr(Image, 'Resampling', Image)
+                            return ImageTk.PhotoImage(image.resize((38, 38), resampling.BICUBIC), master=self.root)
+                        idle_image = render_bubble(fill, color if selected else '#D8E3DE', 2 if selected else 1)
+                        hover_image = render_bubble(color if not selected else fill, color, 2)
+                        selected_image = render_bubble(color, color, 2)
+                        cached_images = (idle_image, hover_image, selected_image)
+                        image_cache.put(image_key, cached_images)
+                    idle_image, hover_image, selected_image = cached_images
+                    bubble._taha_bubble_images = cached_images
+                    image_item = bubble.create_image(19, 19, image=idle_image)
+                    bubble.create_text(19, 19, text=short, fill=text_color,
+                                       font=(UI_FONT, 10, 'bold'))
+                    bubble.bind('<Enter>', lambda event, w=bubble, it=image_item, im=hover_image: w.itemconfigure(it, image=im))
+                    bubble.bind('<Leave>', lambda event, w=bubble, it=image_item, im=idle_image: w.itemconfigure(it, image=im))
+                except Exception:
+                    idle_image = None
+            if idle_image is None:
+                oval_id = bubble.create_oval(3, 3, 35, 35, fill=fill,
+                                   outline=color if selected else '#D8E3DE', width=2 if selected else 1)
+                bubble.create_text(19, 19, text=short, fill=text_color,
+                                   font=(UI_FONT, 10, 'bold'))
+                bubble.bind('<Enter>', lambda event, w=bubble, oid=oval_id, c=color: w.itemconfigure(oid, outline=c, width=2))
+                bubble.bind('<Leave>', lambda event, w=bubble, oid=oval_id, c=color, sel=selected: w.itemconfigure(oid, outline=(c if sel else '#D8E3DE'), width=(2 if sel else 1)))
+            bubble.bind('<Button-1>', lambda event, v=value, c=item: self._save_attendance_inline(c, v, parent))
+            bubble.bind('<space>', lambda event, v=value, c=item: self._save_attendance_inline(c, v, parent))
+        return bar
+
+    def _save_attendance_inline(self, item, status, parent=None):
+        if self.user.get('role')=='teacher':
+            allowed=self.db.conn.execute('SELECT 1 FROM teacher_students WHERE teacher_id=? AND student_id=?',(self.user.get('teacher_id'),item['student_id'])).fetchone()
+            if not allowed:
+                messagebox.showerror('Not allowed','You can only mark attendance for your assigned students.'); return
+        role = self.user.get('role')
+        tid = self.user.get('teacher_id') if role == 'teacher' else None
+        approved = self._attendance_approved_for_role(role)
+        existing=self.db.conn.execute('SELECT id,teacher_id FROM attendance WHERE student_id=? AND class_date=? ORDER BY id DESC LIMIT 1',(item['student_id'],item['date'])).fetchone()
+        if existing:
+            if role == 'admin': tid=existing['teacher_id']
+            self.db.conn.execute('UPDATE attendance SET status=?,teacher_id=?,approved=? WHERE id=?',(status,tid,approved,existing['id']))
+        else:
+            self.db.conn.execute('INSERT INTO attendance(student_id,class_date,status,teacher_id,approved,notes) VALUES(?,?,?,?,?,?)',(item['student_id'],item['date'],status,tid,approved,''))
+        self.db.conn.commit()
+        if parent is not None and parent.winfo_exists():
+            self.render_class_calendar(parent)
+        if getattr(self,'attendance_area',None) is not None and self.attendance_area.winfo_exists():
+            try: self.render_attendance_calendar(parent)
+            except Exception: pass
+
+    def show_day_details(self, day, parent=None):
+        classes=self._classes_for_date(day)
+        win=tk.Toplevel(self.root); win.title(f"Classes — {day.isoformat()}"); win.geometry('760x430'); win.transient(self.root)
+        body=ttk.Frame(win,padding=12); body.pack(fill='both',expand=True)
+        smart_label(ttk.Label, body,text=f"Classes for {day.strftime('%A, %d %B %Y')}",style='Title.TLabel').pack(anchor='w')
+        tree=self.make_tree(body,('time','student','course','teacher','type','status'),('Time','Student','Course','Teacher','Type','Status'))
+        for c in classes:
+            tree.insert('','end',iid=f"{c['kind']}-{c['id']}",values=(c['start'],c['student'],c['course'],c['teacher'],c['type'],c['status']))
+        def open_selected(_event=None):
+            sel=tree.selection()
+            if not sel:return
+            key=sel[0]; item=next((x for x in classes if f"{x['kind']}-{x['id']}"==key),None)
+            if item:self.show_class_details(item,parent)
+        tree.bind('<Double-1>',open_selected)
+        ttk.Button(body,text='Open selected class details',command=open_selected).pack(anchor='e',pady=8)
+        if not classes: smart_label(ttk.Label, body,text='No classes are scheduled for this date.').pack(anchor='w',pady=8)
+
+    def show_class_details(self, item, parent=None):
+        """Show class information in a compact dialog with a permanently visible attendance action."""
+        win = tk.Toplevel(self.root)
+        win.title('Class Details / کلاس کی تفصیلات')
+        win.configure(bg=APP_BG)
+        win.transient(self.root)
+        win.minsize(590, 500)
+
+        # Keep the dialog at a practical size instead of maximizing it. The detail
+        # section scrolls when needed, while the attendance action remains fixed.
+        screen_w = max(800, win.winfo_screenwidth())
+        screen_h = max(600, win.winfo_screenheight())
+        dialog_w = min(700, screen_w - 80)
+        dialog_h = min(590, screen_h - 100)
+        x = max(10, (screen_w - dialog_w) // 2)
+        y = max(10, (screen_h - dialog_h) // 2 - 15)
+        win.geometry(f'{dialog_w}x{dialog_h}+{x}+{y}')
+
+        # Compact branded heading.
+        header = tk.Frame(win, bg=GREEN, padx=18, pady=13)
+        header.pack(fill='x')
+        smart_label(tk.Label, header, text='Class Details / کلاس کی تفصیلات',
+                    bg=GREEN, fg=WHITE, font=(UI_FONT, 16, 'bold')).pack(anchor='w')
+        smart_label(tk.Label, header, text=str(item.get('student') or ''),
+                    bg=GREEN, fg='#EAF4F0', font=(UI_FONT, 10)).pack(anchor='w', pady=(3, 0))
+
+        # Scrollable information area; actions are deliberately kept outside it.
+        area = tk.Frame(win, bg=APP_BG, padx=12, pady=10)
+        area.pack(fill='both', expand=True)
+        canvas = tk.Canvas(area, bg=APP_BG, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(area, orient='vertical', command=canvas.yview)
+        content = tk.Frame(canvas, bg=APP_BG)
+        content.bind('<Configure>', lambda _e: canvas.configure(scrollregion=canvas.bbox('all')))
+        content_window = canvas.create_window((0, 0), window=content, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side='left', fill='both', expand=True)
+        scrollbar.pack(side='right', fill='y')
+        canvas.bind('<Configure>', lambda event: canvas.itemconfigure(content_window, width=max(1, event.width)))
+
+        details = [
+            ('Student / طالب علم', item.get('student', '—')),
+            ('Course / کورس', item.get('course', '—')),
+            ('Level / درجہ', item.get('level', '—')),
+            ('Teacher / استاد', item.get('teacher', '—')),
+            ('Date / تاریخ', item.get('date', '—')),
+            ('Time / وقت', (str(item.get('start') or '') + ' – ' + str(item.get('end') or '')).strip(' –') or '—'),
+            ('Class type / قسم', item.get('type', '—')),
+            ('Class status / کلاس کی حالت', item.get('status', '—')),
+            ('Notes / نوٹس', item.get('notes') or '—'),
+        ]
+        for col in range(2):
+            content.grid_columnconfigure(col, weight=1, uniform='class_detail_col')
+        for idx, (label, value) in enumerate(details):
+            col, row_index = idx % 2, idx // 2
+            card = tk.Frame(content, bg=CARD_BG, highlightbackground=BORDER,
+                            highlightthickness=1, padx=12, pady=9)
+            card.grid(row=row_index, column=col, sticky='nsew', padx=5, pady=5)
+            smart_label(tk.Label, card, text=label, bg=CARD_BG, fg=MUTED,
+                        font=(UI_FONT, 9, 'bold'), anchor='w').pack(fill='x', anchor='w')
+            smart_label(tk.Label, card, text=str(value or '—'), bg=CARD_BG, fg=DARK,
+                        font=(UI_FONT, 10), anchor='w', justify='left',
+                        wraplength=max(180, (dialog_w - 130) // 2)).pack(fill='x', anchor='w', pady=(3, 0))
+
+        # Fixed footer: the Mark / Change Attendance button cannot scroll out of view.
+        footer = tk.Frame(win, bg=CARD_BG, padx=14, pady=10,
+                          highlightbackground=BORDER, highlightthickness=1)
+        footer.pack(side='bottom', fill='x')
+        attendance_status = self._class_attendance_status(item)
+        status_text = f'Attendance / حاضری: {attendance_status}'
+        smart_label(tk.Label, footer, text=status_text, bg=CARD_BG, fg=DARK,
+                    font=(UI_FONT, 10, 'bold')).pack(side='left', fill='x', expand=True, anchor='w')
+
+        actions = tk.Frame(footer, bg=CARD_BG)
+        actions.pack(side='right')
+        if item.get('kind') == 'session' and self.user.get('role') == 'admin':
+            ttk.Button(actions, text='Edit status / حالت',
+                       command=lambda: self.edit_class_session_status(item, win, parent)).pack(side='left', padx=(0, 8))
+        ttk.Button(actions, text='Mark / Change Attendance — حاضری درج یا تبدیل کریں',
+                   style='Accent.TButton',
+                   command=lambda: self.mark_class_attendance(item, parent, win)).pack(side='left')
+
+        # Focus the dialog without maximising the main application or this window.
+        win.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox('all'))
+        canvas.yview_moveto(0)
+    def edit_class_session_status(self,item,win,parent=None):
+        statuses=['Scheduled','Completed','Cancelled','Missed']
+        current=item['status'] if item['status'] in statuses else 'Scheduled'
+        val=tk.StringVar(value=current)
+        dlg=tk.Toplevel(win); dlg.title('Update session status'); dlg.transient(win); dlg.grab_set()
+        smart_label(ttk.Label, dlg,text='Status').pack(padx=16,pady=(16,4),anchor='w')
+        ttk.Combobox(dlg,textvariable=val,values=statuses,state='readonly').pack(padx=16,fill='x')
+        def save():
+            self.db.conn.execute('UPDATE class_sessions SET status=? WHERE id=?',(val.get(),item['id']))
+            self.db.conn.commit(); dlg.destroy(); win.destroy()
+            if parent is not None and parent.winfo_exists(): self.render_class_calendar(parent)
+        ttk.Button(dlg,text='Save',command=save).pack(padx=16,pady=14,anchor='e')
+
+    def add_class_session(self,parent=None):
+        students=self.db.conn.execute("SELECT id,full_name FROM students ORDER BY full_name").fetchall()
+        teachers=self.db.conn.execute("SELECT id,full_name FROM teachers WHERE status='Active' ORDER BY full_name").fetchall()
+        if not students:
+            messagebox.showwarning('Records needed','Add a student before scheduling a session.'); return
+        student_options=[f"{r['id']} - {r['full_name']}" for r in students]
+        teacher_options=['0 - Not assigned']+[f"{r['id']} - {r['full_name']}" for r in teachers]
+        fields=[('student','Student',student_options[0]),('teacher','Teacher',teacher_options[0]),
+            ('session_date','Date (YYYY-MM-DD)',date.today().isoformat()),('start_time','Start time (e.g. 03:00 PM)',''),
+            ('end_time','End time (optional)',''),('session_type','Class type','Extra'),('status','Status','Scheduled'),('notes','Notes','')]
+        def save(v,win):
+            try:
+                sid=int(v['student'].split(' - ',1)[0]); tid=int(v['teacher'].split(' - ',1)[0]) or None
+                session_day=datetime.strptime(v['session_date'],'%Y-%m-%d').date()
+                start_text=(v.get('start_time') or '').strip()
+                end_text=(v.get('end_time') or '').strip()
+                if not start_text:
+                    raise ValueError('missing start time')
+                def minutes(text):
+                    text=(text or '').strip().upper().replace('.', '')
+                    for fmt in ('%I:%M %p','%I %p','%H:%M'):
+                        try:
+                            dt=datetime.strptime(text,fmt)
+                            return dt.hour*60+dt.minute
+                        except ValueError:
+                            pass
+                    raise ValueError('invalid time')
+                start_min=minutes(start_text)
+                end_min=minutes(end_text) if end_text else start_min+30
+                if end_min <= start_min:
+                    raise ValueError('end time must follow start time')
+            except (ValueError,IndexError):
+                messagebox.showwarning('Check details','Enter a valid date (YYYY-MM-DD), start time (e.g. 03:00 PM), and an end time later than the start time. If end time is omitted, a 30-minute session is assumed.',parent=win); return False
+
+            # Do not allow a student or teacher to be double-booked on the same date.
+            # Existing extra/make-up sessions are checked using time overlap, not only exact text.
+            for existing in self.db.conn.execute("""SELECT cs.*, s.full_name AS student_name,
+                    COALESCE(t.full_name,'') AS teacher_name
+                FROM class_sessions cs JOIN students s ON s.id=cs.student_id
+                LEFT JOIN teachers t ON t.id=cs.teacher_id
+                WHERE cs.session_date=? AND COALESCE(cs.status,'Scheduled') NOT IN ('Cancelled','Missed')""",
+                (session_day.isoformat(),)).fetchall():
+                try:
+                    other_start=minutes(existing['start_time'])
+                    other_end=minutes(existing['end_time']) if (existing['end_time'] or '').strip() else other_start+30
+                except ValueError:
+                    continue
+                overlap=start_min < other_end and other_start < end_min
+                if overlap and (existing['student_id']==sid or (tid is not None and existing['teacher_id']==tid)):
+                    who='student' if existing['student_id']==sid else 'teacher'
+                    name=existing['student_name'] if who=='student' else existing['teacher_name']
+                    messagebox.showerror('Schedule conflict',f'This {who} already has a class at an overlapping time ({name}, {existing["start_time"]}). Choose another time.',parent=win)
+                    return False
+
+            # Check against the student's existing weekly regular class.
+            weekday=session_day.strftime('%A')
+            student_row=self.db.conn.execute('SELECT class_time FROM students WHERE id=?',(sid,)).fetchone()
+            regular_slot=(student_row['class_time'] or '').strip() if student_row else ''
+            if regular_slot.lower().startswith(weekday.lower()+' '):
+                try:
+                    regular_start=minutes(regular_slot[len(weekday):].strip())
+                    if start_min < regular_start+30 and regular_start < end_min:
+                        messagebox.showerror('Schedule conflict','This student already has a regular class during this time. Choose another time.',parent=win)
+                        return False
+                except ValueError:
+                    pass
+
+            # Check the selected teacher's regular weekly timetable as well.
+            if tid is not None:
+                assigned=self.db.conn.execute("""SELECT s.full_name,s.class_time FROM students s
+                    JOIN teacher_students ts ON ts.student_id=s.id
+                    WHERE ts.teacher_id=? AND s.id<>? AND s.status='Active' AND COALESCE(s.class_time,'')<>''""",(tid,sid)).fetchall()
+                for other in assigned:
+                    slot=(other['class_time'] or '').strip()
+                    if not slot.lower().startswith(weekday.lower()+' '):
+                        continue
+                    try:
+                        regular_start=minutes(slot[len(weekday):].strip())
+                    except ValueError:
+                        continue
+                    if start_min < regular_start+30 and regular_start < end_min:
+                        messagebox.showerror('Schedule conflict',f'This teacher already has a regular class with {other["full_name"]} during this time.',parent=win)
+                        return False
+
+            self.db.conn.execute("""INSERT INTO class_sessions(student_id,teacher_id,session_date,start_time,end_time,session_type,status,notes,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""",(sid,tid,session_day.isoformat(),start_text,end_text,v['session_type'],v['status'],v['notes'],timestamp()))
+            self.db.conn.commit(); messagebox.showinfo('Saved','Class session saved.',parent=win)
+            if parent is not None and parent.winfo_exists(): self.render_class_calendar(parent)
+            return True
+        self.form_dialog('Add Extra / Make-up Class',fields,save,{'student':student_options,'teacher':teacher_options,
+            'session_type':['Extra','Make-up','Regular replacement'],'status':['Scheduled','Completed','Cancelled','Missed']})
+
+    def allocate_class_time(self, parent=None):
+        students = self.db.conn.execute("SELECT id,full_name,class_time FROM students ORDER BY full_name").fetchall()
+        teachers = self.db.conn.execute("SELECT id,full_name,availability FROM teachers WHERE status='Active' ORDER BY full_name").fetchall()
+        if not students or not teachers:
+            messagebox.showwarning("Records needed", "Add at least one student and one active teacher first.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Allocate Class Time / کلاس کا وقت مقرر کریں")
+        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win.geometry(f"{min(820, _sw - 80)}x{min(700, _sh - 120)}")
+        win.minsize(650, 520)
+        win.configure(bg=APP_BG)
+        win.transient(self.root)
+        win.grab_set()
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text="Select student and teacher, then select an AVAILABLE time slot.",
+                  style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+        pick = ttk.Frame(body)
+        pick.pack(fill="x")
+        smart_label(ttk.Label, pick, text="Student").grid(row=0, column=0, sticky="w", padx=5, pady=5)
+        student_box = ttk.Combobox(pick, state="readonly", width=30,
+                                   values=[f"{r['id']} - {r['full_name']}" for r in students])
+        student_box.grid(row=0, column=1, sticky="ew", padx=5, pady=5)
+        student_box.current(0)
+        smart_label(ttk.Label, pick, text="Teacher").grid(row=1, column=0, sticky="w", padx=5, pady=5)
+        teacher_box = ttk.Combobox(pick, state="readonly", width=30,
+                                   values=[f"{r['id']} - {r['full_name']}" for r in teachers])
+        teacher_box.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
+        teacher_box.current(0)
+        pick.grid_columnconfigure(1, weight=1)
+        smart_label(ttk.Label, body, text="Teacher availability can be entered as comma-separated slots, e.g. Monday 03:00 PM, Tuesday 04:00 PM. If blank, all unbooked slots are considered available.",
+                  wraplength=700, style="Sub.TLabel").pack(anchor="w", pady=(4, 8))
+        # Buttons are packed first (bottom) so they can never fall outside the window.
+        bottom = ttk.Frame(body)
+        bottom.pack(side="bottom", fill="x", pady=(10, 0))
+        ttk.Button(bottom, text="✔ Save Class Time / محفوظ کریں", style="Accent.TButton",
+                   command=lambda: save_slot()).pack(side="left")
+        ttk.Button(bottom, text="Cancel / منسوخ", style="Secondary.TButton", command=win.destroy).pack(side="right")
+        ttk.Label(body, text="Tip: select an AVAILABLE slot, then press Save (or double-click the slot).",
+                  style="Sub.TLabel").pack(side="bottom", anchor="w", pady=(6, 0))
+        slot_frame = ttk.Frame(body)
+        slot_frame.pack(fill="both", expand=True)
+        slot_tree = ttk.Treeview(slot_frame, columns=("slot", "status"), show="headings", height=10, selectmode="browse")
+        slot_tree.heading("slot", text="Day and time")
+        slot_tree.heading("status", text="Availability")
+        slot_tree.column("slot", width=220)
+        slot_tree.column("status", width=140)
+        sv = ttk.Scrollbar(slot_frame, orient="vertical", command=slot_tree.yview)
+        slot_tree.configure(yscrollcommand=sv.set)
+        slot_tree.pack(side="left", fill="both", expand=True)
+        sv.pack(side="right", fill="y")
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        slots = []
+        for day in days:
+            for hour in range(7, 22):
+                for minute in (0, 30):
+                    h12 = hour % 12 or 12
+                    ampm = "AM" if hour < 12 else "PM"
+                    slots.append(f"{day} {h12:02d}:{minute:02d} {ampm}")
+
+        def refresh_slots(_event=None):
+            slot_tree.delete(*slot_tree.get_children())
+            try:
+                sid = int(student_box.get().split(" - ", 1)[0])
+                tid = int(teacher_box.get().split(" - ", 1)[0])
+            except (ValueError, IndexError):
+                return
+            current = self.db.conn.execute("SELECT class_time FROM students WHERE id=?", (sid,)).fetchone()
+            current_slot = (current["class_time"] or "") if current else ""
+            assigned = self.db.conn.execute("""SELECT s.id,s.full_name,s.class_time FROM students s
+                JOIN teacher_students ts ON ts.student_id=s.id
+                WHERE ts.teacher_id=? AND s.id<>? AND s.status='Active' AND COALESCE(s.class_time,'')<>''""", (tid, sid)).fetchall()
+            booked = {r["class_time"]: r["full_name"] for r in assigned}
+            # A student cannot be assigned a second regular weekly slot while this
+            # version stores only one class_time field per student.
+            if current_slot and current_slot not in booked:
+                booked[current_slot] = '__CURRENT_STUDENT_SLOT__'
+            teacher = next((t for t in teachers if t["id"] == tid), None)
+            availability = (teacher["availability"] or "").strip() if teacher else ""
+            available_set = {x.strip() for x in availability.split(",") if x.strip()}
+            availability_uses_slot_format = any(x in slots for x in available_set)
+            for slot in slots:
+                if slot == current_slot:
+                    status = "CURRENT SLOT"
+                elif slot in booked:
+                    booked_name=booked[slot]
+                    status = ("ALREADY ASSIGNED TO THIS STUDENT" if booked_name == '__CURRENT_STUDENT_SLOT__' else "BOOKED - " + booked_name)
+                elif availability_uses_slot_format and slot not in available_set:
+                    status = "NOT IN AVAILABILITY"
+                else:
+                    status = "AVAILABLE"
+                item = slot_tree.insert("", "end", values=(slot, status))
+                if status == "AVAILABLE" or status == "CURRENT SLOT":
+                    slot_tree.item(item, tags=("available",))
+                else:
+                    slot_tree.item(item, tags=("unavailable",))
+            _dk = on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF"
+            slot_tree.tag_configure("available", **row_tag_opts("available"))
+            slot_tree.tag_configure("unavailable", **row_tag_opts("unavailable"))
+
+        student_box.bind("<<ComboboxSelected>>", refresh_slots)
+        teacher_box.bind("<<ComboboxSelected>>", refresh_slots)
+        refresh_slots()
+
+        def save_slot():
+            selected = slot_tree.selection()
+            if not selected:
+                messagebox.showwarning("Select a slot", "Select a time slot first.", parent=win)
+                return
+            slot, status = slot_tree.item(selected[0], "values")
+            if status not in ("AVAILABLE", "CURRENT SLOT"):
+                messagebox.showwarning("Slot unavailable", "This slot is booked or not listed in the teacher's availability. Choose an available slot.", parent=win)
+                return
+            sid = int(student_box.get().split(" - ", 1)[0])
+            tid = int(teacher_box.get().split(" - ", 1)[0])
+            # Recheck availability immediately before saving to avoid stale selections.
+            conflict = self.db.conn.execute("""SELECT s.full_name FROM students s
+                JOIN teacher_students ts ON ts.student_id=s.id
+                WHERE ts.teacher_id=? AND s.id<>? AND s.status='Active' AND s.class_time=? LIMIT 1""", (tid, sid, slot)).fetchone()
+            if conflict:
+                messagebox.showerror("Slot just booked", f"This teacher's slot has been taken by {conflict['full_name']}. Choose another slot.", parent=win)
+                refresh_slots()
+                return
+            current_teacher = self.db.conn.execute("SELECT availability FROM teachers WHERE id=?", (tid,)).fetchone()
+            availability = (current_teacher["availability"] or "").strip() if current_teacher else ""
+            avail_set = {x.strip() for x in availability.split(",") if x.strip()}
+            if any(x in slots for x in avail_set) and slot not in avail_set:
+                messagebox.showerror("Teacher unavailable", "This time is not in the teacher's listed availability. Update the teacher availability or choose another slot.", parent=win)
+                return
+            parts = slot.split(" ", 1)
+            day = parts[0]
+            start = parts[1] if len(parts) > 1 else ""
+            end = self._calculate_end_time(start, 45)
+            self.db.conn.execute("UPDATE students SET class_time=? WHERE id=?", (slot, sid))
+            self.db.conn.execute("INSERT OR IGNORE INTO teacher_students(teacher_id,student_id) VALUES(?,?)", (tid, sid))
+            try:
+                self.db.conn.execute("DELETE FROM weekly_class_schedule WHERE student_id=? AND weekday=?", (sid, day))
+                self.db.conn.execute("INSERT INTO weekly_class_schedule(student_id,teacher_id,weekday,start_time,end_time,created_at) VALUES(?,?,?,?,?,?)",
+                                     (sid, tid, day, start, end, timestamp()))
+            except Exception:
+                pass
+            self.db.conn.commit()
+            messagebox.showinfo("Saved", f"Class time saved: {slot}\nWeekly timetable schedule updated.", parent=win)
+            win.destroy()
+            if parent is not None and parent.winfo_exists():
+                self.show_page(parent, lambda p: self.timetable_page(p))
+
+        slot_tree.bind("<Double-1>", lambda _e: save_slot())
+
+    def fees_page(self, parent):
+        self.page_title(parent, "Fees & Payments / فیس اور ادائیگیاں",
+                        "Monthly invoices, partial payments, automatically overdue older unpaid invoices, outstanding balances and payment history.")
+        controls = ttk.Frame(parent); controls.pack(fill="x", pady=(2, 4))
+        month_var = tk.StringVar(value=datetime.now().strftime("%Y-%m"))
+        smart_label(ttk.Label, controls, text="Fee month:").pack(side="left", padx=(0,4))
+        ttk.Entry(controls, textvariable=month_var, width=9).pack(side="left", padx=3)
+        ttk.Button(controls, text="Generate Monthly Fees", style="Accent.TButton",
+                   command=lambda: self.generate_monthly_fees(month_var.get().strip(), parent)).pack(side="left", padx=3)
+        smart_label(ttk.Label, controls, text="Status:").pack(side="left", padx=(6,2))
+        status_filter_var = tk.StringVar(value="All / تمام")
+        status_filter = ttk.Combobox(controls, textvariable=status_filter_var, values=("All / تمام", "Paid / ادا شدہ", "Partial / جزوی", "Unpaid / غیر ادا شدہ", "Overdue / واجب الادا"), state="readonly", width=14)
+        status_filter.pack(side="left", padx=3)
+        ttk.Button(controls, text="➕ Record Payment", command=lambda: self.add_payment(parent)).pack(side="left", padx=3)
+        ttk.Button(controls, text="📜 Student Fee History", command=self.student_fee_history).pack(side="left", padx=3)
+
+        message_tools = ttk.Frame(parent)
+        message_tools.pack(fill="x", pady=(0, 6))
+        ttk.Button(message_tools, text="🖨️ Print / Save Receipt", command=lambda: self.receipt_for_selected(tree)).pack(side="left", padx=(0, 4))
+        ttk.Button(message_tools, text="💬 WhatsApp Reminder", command=lambda: self.whatsapp_fee_reminder(tree)).pack(side="left", padx=4)
+        ttk.Button(message_tools, text="📢 Class Notice", command=lambda: self.whatsapp_class_notice(tree)).pack(side="left", padx=4)
+        ttk.Button(message_tools, text="⚠️ Absence Notice", command=lambda: self.whatsapp_absence_notice(tree)).pack(side="left", padx=4)
+        summary = ttk.Frame(parent); summary.pack(fill="x", pady=(5,0))
+        chart_row = ttk.Frame(parent); chart_row.pack(fill="x", pady=(5, 8))
+        monthly_chart = self._fee_amount_chart(chart_row, "Monthly Collection / ماہانہ وصولی")
+        status_chart = self._fee_amount_chart(chart_row, "Selected Month Status / منتخب مہینے کی فیس")
+        monthly_chart.pack(side="left", fill="both", expand=True, padx=(0, 5))
+        status_chart.pack(side="left", fill="both", expand=True, padx=(5, 0))
+        tree = self.make_tree(parent, ("student_id","student","month","due","paid","balance","currency","status"),
+                              ("ID","Student","Month","Fee Due","Paid","Balance","Currency","Status"))
+        def refresh_fee_page(*_):
+            selected_month = month_var.get().strip()
+            selected_status = status_filter_var.get().split(" / ", 1)[0]
+            self._refresh_fee_summary(tree, selected_month, selected_status)
+            self._refresh_fee_charts(monthly_chart, status_chart, selected_month)
+        refresh_fee_page()
+        month_var.trace_add("write", refresh_fee_page)
+        status_filter_var.trace_add("write", refresh_fee_page)
+        # Open the selected invoice's full details on a double-click.
+        tree.bind("<Double-1>", lambda _event: self.open_fee_record_details(tree))
+        smart_label(ttk.Label, parent, text="Double-click a student fee row to open its full details. / مکمل تفصیل کے لیے فیس کے ریکارڈ پر ڈبل کلک کریں۔", style="Sub.TLabel").pack(anchor="w", pady=4)
+        smart_label(ttk.Label, parent, text="Amounts are never converted automatically between currencies; each record keeps its original currency.", style="Sub.TLabel").pack(anchor="w", pady=4)
+
+    def whatsapp_fee_reminder(self, tree):
+        """Open WhatsApp with a ready-to-review fee reminder for the selected invoice.
+
+        The application never sends the message automatically; the user reviews it
+        and presses Send in WhatsApp. No payment or student data is changed here.
+        """
+        if not self.user or self.user.get("role") != "admin":
+            messagebox.showerror("Permission denied", "Only an administrator can prepare fee reminders.", parent=self.root)
+            return
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Select a student", "Select a student fee row first.", parent=self.root)
+            return
+        vals = tree.item(selected[0], "values")
+        try:
+            student_id = int(vals[0])
+            month = str(vals[2]).strip()
+            currency = str(vals[6]).strip().upper()
+        except (ValueError, IndexError, TypeError):
+            messagebox.showerror("Fee reminder", "Could not read the selected fee record.", parent=self.root)
+            return
+
+        student = self.db.conn.execute(
+            "SELECT full_name, guardian_name, phone FROM students WHERE id=?", (student_id,)
+        ).fetchone()
+        if not student:
+            messagebox.showerror("Student not found", "The selected student record no longer exists.", parent=self.root)
+            return
+        phone = normalize_whatsapp_number(student["phone"])
+        if not phone:
+            messagebox.showwarning(
+                "Phone number needed",
+                "This student's phone number is missing or invalid. Open the student profile and enter a number with the country code (for example +923001234567).",
+                parent=self.root,
+            )
+            return
+
+        invoice = self.db.conn.execute(
+            "SELECT amount_due FROM fee_invoices WHERE student_id=? AND month=? AND currency=? ORDER BY id DESC LIMIT 1",
+            (student_id, month, currency),
+        ).fetchone()
+        if not invoice:
+            messagebox.showerror("Invoice not found", "The selected monthly invoice could not be found.", parent=self.root)
+            return
+        paid = self.db.scalar(
+            "SELECT COALESCE(SUM(amount),0) FROM payments WHERE student_id=? AND month=? AND currency=? AND lower(status) NOT IN ('unpaid','void','cancelled')",
+            (student_id, month, currency),
+        )
+        due = float(invoice["amount_due"] or 0)
+        paid = float(paid or 0)
+        balance = max(0.0, due - paid)
+        if balance <= 0.000001:
+            messagebox.showinfo("No outstanding balance", "This invoice is already fully paid. No reminder was opened.", parent=self.root)
+            return
+
+        student_name = str(student["full_name"] or "Student").strip()
+        guardian = str(student["guardian_name"] or "Parent/Guardian").strip()
+        institution = str(getattr(self, "brand_name", "Institute Ledger") or "Institute Ledger").strip()
+        message = (
+            f"Assalamu Alaikum {guardian},\n\n"
+            f"This is a friendly fee reminder from {institution}.\n"
+            f"Student: {student_name}\n"
+            f"Fee month: {month}\n"
+            f"Outstanding balance: {balance:,.2f} {currency}\n\n"
+            "Please arrange payment when convenient. If you have already paid, kindly ignore this message.\n\n"
+            f"السلام علیکم، طالب علم {student_name} کی {month} کی فیس میں ابھی {balance:,.2f} {currency} باقی ہیں۔ "
+            "براہِ کرم سہولت کے مطابق ادائیگی کر دیں۔ اگر ادائیگی ہو چکی ہے تو اس پیغام کو نظر انداز کر دیں۔"
+        )
+        if not messagebox.askyesno(
+            "Open WhatsApp / واٹس ایپ کھولیں",
+            f"A fee reminder is ready for {student_name}.\n\n"
+            f"Month: {month}\nOutstanding: {balance:,.2f} {currency}\nPhone: +{phone}\n\n"
+            "WhatsApp will open with the message filled in. Review it and press Send yourself. Continue?",
+            parent=self.root,
+        ):
+            return
+        url = f"https://wa.me/{phone}?text={quote(message)}"
+        try:
+            opened = webbrowser.open_new_tab(url)
+            if not opened:
+                messagebox.showwarning(
+                    "WhatsApp could not be opened",
+                    "The default browser did not report that it opened. Check that a browser is installed and available, then try again.",
+                    parent=self.root,
+                )
+        except Exception as exc:
+            messagebox.showerror("WhatsApp could not be opened", str(exc), parent=self.root)
+
+    def _open_guardian_whatsapp(self, student, message, purpose, parent=None):
+        """Open a prepared bilingual message for a guardian; the operator must press Send."""
+        parent = parent or self.root
+        if not self.user or self.user.get("role") != "admin":
+            messagebox.showerror("Permission denied / اجازت نہیں", "Only an administrator can prepare guardian messages. / صرف ایڈمن سرپرست کے پیغامات تیار کر سکتا ہے۔", parent=parent)
+            return
+        phone = normalize_whatsapp_number(student["phone"])
+        if not phone:
+            messagebox.showwarning("Phone number needed / فون نمبر درکار", 
+                "This student's guardian phone is missing or invalid. Enter the country code (for example +923001234567).\nسرپرست کا درست فون نمبر ملک کے کوڈ کے ساتھ درج کریں۔", parent=parent)
+            return
+        guardian = str(student["guardian_name"] or "Parent/Guardian").strip()
+        student_name = str(student["full_name"] or "Student").strip()
+        if not messagebox.askyesno("Open WhatsApp / واٹس ایپ کھولیں",
+            f"{purpose} is ready for {guardian} ({student_name}).\nPhone: +{phone}\n\nWhatsApp will open with the message filled in. Review it and press Send yourself. Continue?\n\nپیغام واٹس ایپ میں کھلے گا؛ بھیجنے سے پہلے خود جائزہ لیں۔",
+            parent=parent):
+            return
+        try:
+            opened = webbrowser.open_new_tab(f"https://wa.me/{phone}?text={quote(message)}")
+            if not opened:
+                messagebox.showwarning("WhatsApp could not be opened / واٹس ایپ نہیں کھلا",
+                    "Check that a default browser is installed. / ڈیفالٹ براؤزر کی دستیابی چیک کریں۔", parent=parent)
+        except Exception as exc:
+            messagebox.showerror("WhatsApp error / واٹس ایپ کی خرابی", str(exc), parent=parent)
+
+    def whatsapp_class_notice(self, tree):
+        """Prepare a notice using the selected student's next database-scheduled class."""
+        if not self.user or self.user.get("role") != "admin":
+            messagebox.showerror("Permission denied / اجازت نہیں", "Only an administrator can prepare guardian messages. / صرف ایڈمن پیغام تیار کر سکتا ہے۔", parent=self.root)
+            return
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Select a student / طالب علم منتخب کریں", "Select a fee row for the student first. / پہلے طالب علم کی فیس والی قطار منتخب کریں۔", parent=self.root)
+            return
+        try:
+            student_id = int(tree.item(selected[0], "values")[0])
+        except (ValueError, IndexError, TypeError):
+            messagebox.showerror("Class notice / کلاس کی اطلاع", "Could not read the selected student. / منتخب طالب علم کا ریکارڈ نہیں پڑھا جا سکا۔", parent=self.root)
+            return
+        student = self.db.conn.execute("SELECT id,full_name,guardian_name,phone,course,class_time FROM students WHERE id=?", (student_id,)).fetchone()
+        if not student:
+            messagebox.showerror("Student not found / طالب علم نہیں ملا", "The student record no longer exists. / طالب علم کا ریکارڈ موجود نہیں۔", parent=self.root)
+            return
+        today = date.today()
+        candidates = []
+        # Next scheduled extra/make-up session, if any.
+        extra_rows = self.db.conn.execute("""SELECT session_date,start_time,end_time,session_type
+            FROM class_sessions WHERE student_id=? AND session_date>=?
+              AND status NOT IN ('Cancelled','Missed','Completed')
+            ORDER BY session_date,start_time""", (student_id, today.isoformat())).fetchall()
+        for r in extra_rows:
+            try:
+                day = date.fromisoformat(str(r["session_date"]))
+                candidates.append((day, str(r["start_time"] or ""), str(r["end_time"] or ""), str(r["session_type"] or "Scheduled class")))
+            except ValueError:
+                continue
+        # Next occurrence among the student's regular weekly timetable rows.
+        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        current_time = datetime.now().time()
+        for r in self.db.conn.execute("SELECT weekday,start_time,end_time FROM weekly_class_schedule WHERE student_id=?", (student_id,)).fetchall():
+            try:
+                target_day = day_names.index(str(r["weekday"]))
+            except ValueError:
+                continue
+            delta = (target_day - today.weekday()) % 7
+            start_text = str(r["start_time"] or "")
+            try:
+                parsed = datetime.strptime(start_text, "%I:%M %p").time()
+                if delta == 0 and parsed <= current_time:
+                    delta = 7
+            except ValueError:
+                pass
+            candidates.append((today + timedelta(days=delta), start_text, str(r["end_time"] or ""), "Regular class"))
+        if candidates:
+            next_day, start_time, end_time, session_type = min(candidates, key=lambda v: (v[0], v[1]))
+            class_when = next_day.strftime("%A, %d %B %Y")
+            if start_time:
+                class_when += " at " + start_time
+            if end_time:
+                class_when += "–" + end_time
+        else:
+            legacy = str(student["class_time"] or "").strip()
+            if not legacy:
+                messagebox.showwarning("Class time missing / کلاس کا وقت موجود نہیں",
+                    "No upcoming class is scheduled for this student. Add a weekly timetable entry first.\nاس طالب علم کے لیے اگلی کلاس شیڈول نہیں ہے؛ پہلے ہفتہ وار ٹائم ٹیبل درج کریں۔", parent=self.root)
+                return
+            class_when = legacy
+            session_type = "Regular class"
+        guardian = str(student["guardian_name"] or "Parent/Guardian").strip()
+        student_name = str(student["full_name"] or "Student").strip()
+        course = str(student["course"] or "Quran class").strip()
+        institution = str(self.brand_name or APP_NAME).strip()
+        message = (
+            f"Assalamu Alaikum {guardian},\n\nClass reminder from {institution}.\n"
+            f"Student: {student_name}\nCourse: {course}\nClass: {class_when}\n\n"
+            "Please help the student join on time. If you need to change the time, please contact us.\n\n"
+            f"السلام علیکم {guardian}،\n{student_name} کی قرآن کلاس کی یاددہانی ہے۔\n"
+            f"کورس: {course}\nکلاس کا وقت: {class_when}\nبراہِ کرم طالب علم کو وقت پر کلاس میں شامل ہونے میں مدد دیں۔")
+        self._open_guardian_whatsapp(student, message, "Class notice / کلاس کی اطلاع")
+
+    def whatsapp_absence_notice(self, tree):
+        """Prepare an absence notice only when an actual Absent attendance record exists."""
+        if not self.user or self.user.get("role") != "admin":
+            messagebox.showerror("Permission denied / اجازت نہیں", "Only an administrator can prepare guardian messages. / صرف ایڈمن پیغام تیار کر سکتا ہے۔", parent=self.root)
+            return
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Select a student / طالب علم منتخب کریں", "Select a fee row for the student first. / پہلے طالب علم کی فیس والی قطار منتخب کریں۔", parent=self.root)
+            return
+        try:
+            student_id = int(tree.item(selected[0], "values")[0])
+        except (ValueError, IndexError, TypeError):
+            messagebox.showerror("Absence notice / غیر حاضری کی اطلاع", "Could not read the selected student. / منتخب طالب علم کا ریکارڈ نہیں پڑھا جا سکا۔", parent=self.root)
+            return
+        student = self.db.conn.execute("SELECT id,full_name,guardian_name,phone,course FROM students WHERE id=?", (student_id,)).fetchone()
+        if not student:
+            messagebox.showerror("Student not found / طالب علم نہیں ملا", "The student record no longer exists. / طالب علم کا ریکارڈ موجود نہیں۔", parent=self.root)
+            return
+        absence = self.db.conn.execute("""SELECT class_date,notes FROM attendance
+            WHERE student_id=? AND status='Absent' ORDER BY class_date DESC,id DESC LIMIT 1""", (student_id,)).fetchone()
+        if not absence:
+            messagebox.showinfo("No absence record / غیر حاضری کا ریکارڈ نہیں",
+                "There is no attendance record marked Absent for this student. No message was opened.\nاس طالب علم کی غیر حاضری درج نہیں؛ کوئی پیغام نہیں کھولا گیا۔", parent=self.root)
+            return
+        guardian = str(student["guardian_name"] or "Parent/Guardian").strip()
+        student_name = str(student["full_name"] or "Student").strip()
+        course = str(student["course"] or "Quran class").strip()
+        absent_date = str(absence["class_date"] or "—")
+        notes = str(absence["notes"] or "").strip()
+        institution = str(self.brand_name or APP_NAME).strip()
+        message = (
+            f"Assalamu Alaikum {guardian},\n\nThis is an attendance notice from {institution}.\n"
+            f"Student: {student_name}\nCourse: {course}\nAbsent class date: {absent_date}\n"
+            + (f"Attendance note: {notes}\n" if notes else "") +
+            "Please let us know if there was a reason for the absence.\n\n"
+            f"السلام علیکم {guardian}،\n{student_name} کی {absent_date} کی کلاس میں غیر حاضری درج ہوئی ہے۔\n"
+            "براہِ کرم غیر حاضری کی وجہ سے آگاہ کر دیں۔")
+        # The shared helper asks once before opening WhatsApp; include the date in that confirmation.
+        self._open_guardian_whatsapp(student, message, f"Absence notice / غیر حاضری کی اطلاع ({absent_date})")
+
+    def open_fee_record_details(self, tree):
+        """Show invoice balance and all matching payments for the selected student/month/currency."""
+        selected = tree.selection()
+        if not selected:
+            return
+        vals = tree.item(selected[0], "values")
+        try:
+            student_id = int(vals[0])
+            month = str(vals[2])
+            currency = str(vals[6])
+        except (ValueError, IndexError, TypeError):
+            messagebox.showerror("Fee Details", "Could not read the selected fee record.", parent=self.root)
+            return
+        invoice = self.db.conn.execute("""SELECT i.*, s.full_name
+            FROM fee_invoices i JOIN students s ON s.id=i.student_id
+            WHERE i.student_id=? AND i.month=? AND i.currency=? ORDER BY i.id DESC LIMIT 1""",
+            (student_id, month, currency)).fetchone()
+        if not invoice:
+            messagebox.showinfo("Fee Details", "The invoice for this row was not found.", parent=self.root)
+            return
+        payments = self.db.conn.execute("""SELECT payment_date, amount, currency, status, notes
+            FROM payments WHERE student_id=? AND month=? AND currency=?
+            ORDER BY payment_date DESC, id DESC""", (student_id, month, currency)).fetchall()
+        due = float(invoice["amount_due"] or 0)
+        paid = sum(float(r["amount"] or 0) for r in payments
+                   if str(r["status"] or "").lower() not in ("unpaid", "void", "cancelled"))
+        balance = max(0.0, due-paid)
+        status = self._invoice_status(month, due, paid)
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Fee Record / فیس کی تفصیل — {invoice['full_name']}")
+        win.geometry("900x580")
+        win.minsize(700, 430)
+        win.configure(bg=APP_BG)
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text=f"{invoice['full_name']}  |  {month}", style="TLabel").pack(anchor="w", pady=(0, 10))
+        summary = ttk.LabelFrame(body, text="Invoice Summary / فیس کا خلاصہ", padding=10)
+        summary.pack(fill="x", pady=(0, 10))
+        smart_label(ttk.Label, summary, text=f"Student ID: {student_id}    Month: {month}    Currency: {currency}").pack(anchor="w", pady=2)
+        smart_label(ttk.Label, summary, text=f"Fee Due: {due:,.2f} {currency}    Paid: {paid:,.2f} {currency}    Balance: {balance:,.2f} {currency}    Status: {status}", wraplength=820).pack(anchor="w", pady=2)
+        smart_label(ttk.Label, body, text="Payments / ادائیگیاں", style="Sub.TLabel").pack(anchor="w")
+        paytree = self.make_tree(body, ("date", "amount", "currency", "status", "notes"),
+                                 ("Payment Date", "Amount", "Currency", "Status", "Notes"))
+        for row in payments:
+            paytree.insert("", "end", values=(row["payment_date"], f"{float(row['amount'] or 0):,.2f}", row["currency"], row["status"], row["notes"] or "—"))
+        if not payments:
+            smart_label(ttk.Label, body, text="No payment records for this invoice yet. / ابھی کوئی ادائیگی درج نہیں۔", style="Sub.TLabel").pack(anchor="w", pady=6)
+        ttk.Button(body, text="Close / بند کریں", command=win.destroy).pack(anchor="e", pady=(8, 0))
+
+    def _fee_amount_chart(self, parent, title):
+        box = ttk.LabelFrame(parent, text=title, padding=8)
+        canvas = tk.Canvas(box, bg=CARD_BG, height=190, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        box._chart_canvas = canvas
+        return box
+
+    def _refresh_fee_charts(self, monthly_box, status_box, month):
+        """Draw fee charts from saved records; currencies are kept separate."""
+        for box in (monthly_box, status_box):
+            canvas = box._chart_canvas
+            canvas.delete("all")
+        if len(month) != 7 or month[4:5] != "-" or not month[:4].isdigit() or not month[5:].isdigit() or not 1 <= int(month[5:]) <= 12:
+            for box in (monthly_box, status_box):
+                box._chart_canvas.create_text(180, 75, text="Enter a valid month / درست مہینہ درج کریں", fill=MUTED)
+            return
+        try:
+            monthly = self.db.conn.execute("""SELECT month AS label, currency, SUM(amount) AS amount
+                FROM payments WHERE month<>'' AND lower(status) NOT IN ('unpaid','void','cancelled')
+                GROUP BY month, currency ORDER BY month DESC LIMIT 18""").fetchall()
+            invoices = self.db.conn.execute("""SELECT i.student_id, i.month, i.amount_due, i.currency,
+                COALESCE(SUM(CASE WHEN lower(p.status) NOT IN ('unpaid','void','cancelled') THEN p.amount ELSE 0 END),0) AS paid
+                FROM fee_invoices i LEFT JOIN payments p ON p.student_id=i.student_id AND p.month=i.month AND p.currency=i.currency
+                WHERE i.month=? GROUP BY i.id""", (month,)).fetchall()
+        except Exception:
+            monthly, invoices = [], []
+        monthly_rows = [(f"{r['label']} {r['currency']}", float(r['amount'] or 0)) for r in reversed(monthly)]
+        status_totals = {}
+        for row in invoices:
+            due, paid = float(row['amount_due'] or 0), float(row['paid'] or 0)
+            status = self._invoice_status(row["month"], due, paid)
+            key = f"{status} {row['currency']}"
+            status_totals[key] = status_totals.get(key, 0.0) + (paid if status == 'Paid' else (min(paid, due) if status == 'Partial' else due))
+        self._draw_fee_bars(monthly_box._chart_canvas, monthly_rows)
+        self._draw_fee_bars(status_box._chart_canvas, sorted(status_totals.items()))
+
+    def _draw_fee_bars(self, canvas, rows):
+        if not rows:
+            canvas.create_text(180, 75, text="No recorded fee data / فیس کا ریکارڈ موجود نہیں", fill=MUTED)
+            return
+        max_value = max((v for _, v in rows), default=0) or 1
+        for idx, (label, value) in enumerate(rows[-5:]):
+            y = 10 + idx * 32
+            label = str(label)
+            if len(label) > 19: label = label[:18] + "…"
+            canvas.create_text(3, y+8, text=label, anchor="w", fill=DARK, font=(UI_FONT, 9))
+            x0, avail = 150, 190
+            width = max(2, int(avail * value / max_value))
+            canvas.create_rectangle(x0, y, x0+width, y+17, fill=GREEN, outline="")
+            canvas.create_text(x0+width+5, y+8, text=f"{value:,.0f}", anchor="w", fill=DARK, font=(UI_FONT, 9, "bold"))
+
+    def _refresh_fee_summary(self, tree, month, status_filter="All"):
+        tree.delete(*tree.get_children())
+        if len(month) != 7 or month[4:5] != "-" or not month[:4].isdigit() or not month[5:].isdigit() or not 1 <= int(month[5:]) <= 12:
+            return
+        invoices = self.db.conn.execute("""SELECT i.student_id, s.full_name, i.month, i.amount_due, i.currency
+            FROM fee_invoices i JOIN students s ON s.id=i.student_id WHERE i.month=? ORDER BY s.full_name""", (month,)).fetchall()
+        for inv in invoices:
+            paid = self.db.scalar("SELECT COALESCE(SUM(amount),0) FROM payments WHERE student_id=? AND month=? AND currency=? AND lower(status) NOT IN ('unpaid','void','cancelled')",
+                                  (inv['student_id'], month, inv['currency']))
+            due = float(inv['amount_due'] or 0); paid = float(paid or 0); balance = max(0.0, due-paid)
+            status = self._invoice_status(inv["month"], due, paid)
+            if status_filter not in (None, "", "All") and status != status_filter:
+                continue
+            tag = status.lower()
+            status_display = f"● {status}"
+            tree.insert("", "end", values=(inv['student_id'], inv['full_name'], month, f"{due:,.2f}", f"{paid:,.2f}", f"{balance:,.2f}", inv['currency'], status_display), tags=(tag,))
+
+    def _auto_generate_monthly_invoices(self):
+        """On the first admin sign-in of a month, create missing invoices without duplicates."""
+        if not self.user or self.user.get("role") != "admin":
+            return 0
+        month = date.today().strftime("%Y-%m")
+        if self.settings.get("auto_invoice_last_month", "") == month:
+            return 0
+        students = self.db.conn.execute("SELECT id, full_name, monthly_fee, currency FROM students WHERE lower(trim(COALESCE(status,'Active')))='active' ORDER BY id").fetchall()
+        if not students:
+            # Do not record the month when there are no active students; retry when one is enrolled.
+            return 0
+        created = 0
+        try:
+            with self.db.conn:
+                for student in students:
+                    cur = (student["currency"] or "PKR").upper()
+                    if cur not in CURRENCIES:
+                        cur = "PKR"
+                    result = self.db.conn.execute(
+                        "INSERT OR IGNORE INTO fee_invoices(student_id,month,amount_due,currency,created_at) VALUES(?,?,?,?,?)",
+                        (student["id"], month, float(student["monthly_fee"] or 0), cur, timestamp()))
+                    created += max(0, result.rowcount)
+                self.db.conn.execute("INSERT INTO app_settings(setting_key,setting_value) VALUES('auto_invoice_last_month',?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value", (month,))
+            self.settings["auto_invoice_last_month"] = month
+        except sqlite3.Error:
+            raise
+        return created
+
+    def generate_monthly_fees(self, month, parent=None):
+        # Enforce the exact YYYY-MM format so malformed months cannot create invoices.
+        try:
+            if len(month) != 7 or month[4] != "-":
+                raise ValueError
+            datetime.strptime(month, "%Y-%m")
+        except (ValueError, TypeError):
+            messagebox.showerror("Invalid month", "Enter the month in YYYY-MM format, for example 2026-10.", parent=parent or self.root); return
+        # Only Active students receive routine monthly invoices. Paused, Complete, and
+        # Inactive students are excluded from new invoices; existing invoices stay intact.
+        students = self.db.conn.execute("SELECT id, full_name, monthly_fee, currency, status FROM students WHERE lower(trim(COALESCE(status,'Active'))) = 'active' ORDER BY full_name").fetchall()
+        if not students:
+            messagebox.showinfo("No students", "There are no active students to invoice.", parent=parent or self.root); return
+        created = 0
+        for student in students:
+            cur = (student['currency'] or 'PKR').upper()
+            if cur not in CURRENCIES: cur = 'PKR'
+            cur_obj = self.db.conn.execute("INSERT OR IGNORE INTO fee_invoices(student_id,month,amount_due,currency,created_at) VALUES(?,?,?,?,?)",
+                                           (student['id'], month, float(student['monthly_fee'] or 0), cur, timestamp()))
+            created += cur_obj.rowcount
+        self.db.conn.commit()
+        messagebox.showinfo("Monthly fees", f"Monthly fee records ready for {month}.\nNew records created: {created}\nExisting invoices were left unchanged.", parent=parent or self.root)
+        if parent is not None and parent.winfo_exists():
+            self.show_page(parent, lambda p: self.fees_page(p))
+
+    def add_payment(self, parent=None):
+        """Record an actual payment; the billing currency follows the student's invoice."""
+        students = self.db.conn.execute(
+            "SELECT id,full_name,currency FROM students ORDER BY full_name"
+        ).fetchall()
+        if not students:
+            messagebox.showwarning("No students", "Add a student before recording a payment.")
+            return
+
+        labels = [f"{r['id']} - {r['full_name']}" for r in students]
+        win = tk.Toplevel(self.root)
+        win.title("Record Payment / ادائیگی درج کریں")
+        win.configure(bg=CARD_BG)
+        win.transient(self.root)
+        win.grab_set()
+        body = ttk.Frame(win, padding=18)
+        body.pack(fill="both", expand=True)
+        body.grid_columnconfigure(1, weight=1)
+
+        student_var = tk.StringVar(value=labels[0])
+        month_var = tk.StringVar(value=datetime.now().strftime("%Y-%m"))
+        amount_var = tk.StringVar(value="")
+        date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
+        status_var = tk.StringVar(value="Paid")
+        notes_var = tk.StringVar(value="")
+        currency_var = tk.StringVar(value="PKR")
+
+        def selected_student():
+            try:
+                sid = int(student_var.get().split(" - ", 1)[0])
+            except (ValueError, IndexError):
+                return None
+            return self.db.conn.execute(
+                "SELECT id,full_name,monthly_fee,currency FROM students WHERE id=?", (sid,)
+            ).fetchone()
+
+        def refresh_currency(*_):
+            student = selected_student()
+            if not student:
+                currency_var.set("—")
+                return
+            code = (student["currency"] or "PKR").upper().strip()
+            if code not in CURRENCIES:
+                code = "PKR"
+            try:
+                datetime.strptime(month_var.get().strip(), "%Y-%m")
+                invoice = self.db.conn.execute(
+                    "SELECT currency FROM fee_invoices WHERE student_id=? AND month=?",
+                    (student["id"], month_var.get().strip())
+                ).fetchone()
+                if invoice:
+                    code = (invoice["currency"] or code).upper()
+            except ValueError:
+                pass
+            currency_var.set(code)
+
+        def add_field(row, label, widget):
+            smart_label(ttk.Label, body, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=6)
+            widget.grid(row=row, column=1, sticky="ew", padx=6, pady=6)
+
+        student_combo = ttk.Combobox(body, values=labels, textvariable=student_var,
+                                     state="readonly", width=34)
+        add_field(0, "Student / طالب علم", student_combo)
+        month_entry = ttk.Entry(body, textvariable=month_var, width=20)
+        add_field(1, "Fee month (YYYY-MM)", month_entry)
+        add_field(2, "Amount received", ttk.Entry(body, textvariable=amount_var, width=22))
+        currency_frame = ttk.Frame(body)
+        smart_label(ttk.Label, currency_frame, textvariable=currency_var, font=(UI_FONT, 10, "bold")).pack(anchor="w")
+        add_field(3, "Invoice currency (automatic)", currency_frame)
+        add_field(4, "Payment date (YYYY-MM-DD)", ttk.Entry(body, textvariable=date_var, width=22))
+        status_combo = ttk.Combobox(body, values=["Paid", "Partial"], textvariable=status_var,
+                                    state="readonly", width=22)
+        add_field(5, "Payment status", status_combo)
+        add_field(6, "Notes / reference", ttk.Entry(body, textvariable=notes_var, width=35))
+        smart_label(ttk.Label, body, text="Currency follows the student's fee/invoice. No automatic conversion is performed.",
+                  style="Sub.TLabel", wraplength=430).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(5, 8))
+
+        student_combo.bind("<<ComboboxSelected>>", refresh_currency)
+        month_var.trace_add("write", refresh_currency)
+        refresh_currency()
+
+        def save():
+            student = selected_student()
+            if not student:
+                messagebox.showerror("Student", "Please choose a valid student.", parent=win)
+                return
+            try:
+                amount = float(amount_var.get().strip())
+                month = month_var.get().strip()
+                payment_date = date_var.get().strip()
+                datetime.strptime(month, "%Y-%m")
+                datetime.strptime(payment_date, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showerror("Invalid details", "Amount must be numeric, month YYYY-MM, and date YYYY-MM-DD.", parent=win)
+                return
+            if amount <= 0:
+                messagebox.showerror("Invalid amount", "Payment amount must be greater than zero.", parent=win)
+                return
+
+            currency = currency_var.get().upper().strip()
+            if currency not in CURRENCIES:
+                messagebox.showerror("Currency", "The student's billing currency is not valid. Check the student profile.", parent=win)
+                return
+            try:
+                invoice = self.db.conn.execute(
+                    "SELECT currency FROM fee_invoices WHERE student_id=? AND month=?",
+                    (student["id"], month)
+                ).fetchone()
+                if invoice:
+                    invoice_currency = (invoice["currency"] or "PKR").upper()
+                    if invoice_currency != currency:
+                        currency = invoice_currency
+                else:
+                    invoice_currency = (student["currency"] or "PKR").upper()
+                    if invoice_currency not in CURRENCIES:
+                        invoice_currency = "PKR"
+                    currency = invoice_currency
+                    self.db.conn.execute(
+                        "INSERT OR IGNORE INTO fee_invoices(student_id,month,amount_due,currency,created_at) VALUES(?,?,?,?,?)",
+                        (student["id"], month, float(student["monthly_fee"] or 0), currency, timestamp())
+                    )
+
+                payment_cursor = self.db.conn.execute(
+                    "INSERT INTO payments(student_id,amount,currency,payment_date,month,status,notes) VALUES(?,?,?,?,?,?,?)",
+                    (student["id"], amount, currency, payment_date, month, status_var.get(), notes_var.get().strip())
+                )
+                receipt_id = payment_cursor.lastrowid
+                self.db.conn.commit()
+            except Exception as exc:
+                self.db.conn.rollback()
+                messagebox.showerror("Payment not saved", f"The payment could not be saved. No partial changes were kept.\n\nDetails: {exc}", parent=win)
+                return
+
+            messagebox.showinfo("Payment saved", f"Payment recorded successfully. Receipt number: {receipt_id}", parent=win)
+            if messagebox.askyesno("Receipt", "Would you like to create a receipt now?", parent=win):
+                self.create_receipt(receipt_id)
+            win.destroy()
+            if parent is not None:
+                try:
+                    if parent.winfo_exists():
+                        self.show_page(parent, lambda p: self.fees_page(p))
+                except Exception:
+                    pass
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(buttons, text="Save Payment / ادائیگی محفوظ کریں", style="Accent.TButton", command=save).pack(side="right")
+        win.update_idletasks()
+        win.geometry(f"+{self.root.winfo_rootx()+90}+{self.root.winfo_rooty()+80}")
+
+    def student_fee_history(self):
+        students = self.db.conn.execute("SELECT id,full_name FROM students ORDER BY full_name").fetchall()
+        if not students:
+            messagebox.showinfo("No students", "No student records found."); return
+        win = tk.Toplevel(self.root); win.title("Student Fee History / فیس ہسٹری"); win.geometry("1040x620")
+        win.configure(bg=APP_BG)
+        body = ttk.Frame(win, padding=14); body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text="Select student:").pack(anchor="w")
+        labels = [f"{r['id']} - {r['full_name']}" for r in students]
+        selected = tk.StringVar(value=labels[0])
+        combo = ttk.Combobox(body, values=labels, textvariable=selected, state="readonly", width=40); combo.pack(anchor="w", pady=6)
+        tree = self.make_tree(body, ("date","month","amount","currency","status","notes"), ("Payment date","Month","Amount","Currency","Status","Notes"))
+        def load(*_):
+            tree.delete(*tree.get_children()); sid = int(selected.get().split(" - ",1)[0])
+            rows = self.db.conn.execute("SELECT payment_date,month,amount,currency,status,notes FROM payments WHERE student_id=? ORDER BY payment_date DESC,id DESC", (sid,)).fetchall()
+            for row in rows: tree.insert("", "end", values=tuple(row))
+            invoices = self.db.conn.execute("SELECT month,amount_due,currency FROM fee_invoices WHERE student_id=? ORDER BY month DESC", (sid,)).fetchall()
+            if invoices:
+                due_text = []
+                for inv in invoices:
+                    paid = self.db.scalar("SELECT COALESCE(SUM(amount),0) FROM payments WHERE student_id=? AND month=? AND currency=? AND lower(status) NOT IN ('unpaid','void','cancelled')", (sid, inv['month'], inv['currency']))
+                    balance = max(0.0, float(inv['amount_due'] or 0) - float(paid or 0))
+                    status = self._invoice_status(inv['month'], inv['amount_due'], paid)
+                    due_text.append(f"{inv['month']}: due {float(inv['amount_due'] or 0):.2f} {inv['currency']}, paid {float(paid or 0):.2f}, balance {balance:.2f}, status {status}")
+                summary_label.configure(text="\n".join(due_text[:8]))
+            else: summary_label.configure(text="No monthly invoices generated yet.")
+        summary_label = smart_label(ttk.Label, body, text="", style="Sub.TLabel", justify="left"); summary_label.pack(anchor="w", pady=4)
+        combo.bind("<<ComboboxSelected>>", load); load()
+
+    def receipt_for_selected(self, tree):
+        selected = tree.selection()
+        if not selected:
+            messagebox.showinfo("Select a payment", "Select a student row in the fee summary first."); return
+        vals = tree.item(selected[0], "values")
+        sid = int(vals[0]); month = vals[2]; currency = vals[6]
+        row = self.db.conn.execute("SELECT id FROM payments WHERE student_id=? AND month=? AND currency=? ORDER BY id DESC LIMIT 1", (sid, month, currency)).fetchone()
+        if not row:
+            messagebox.showinfo("No payment", "No payment exists for this student and month yet."); return
+        self.create_receipt(row['id'])
+
+    def create_receipt(self, payment_id):
+        """Show a payment receipt and allow saving a logo/Urdu-font PDF."""
+        row = self.db.conn.execute("""SELECT p.*, s.full_name, s.course, i.amount_due
+            FROM payments p JOIN students s ON s.id=p.student_id
+            LEFT JOIN fee_invoices i ON i.student_id=p.student_id AND i.month=p.month AND i.currency=p.currency
+            WHERE p.id=?""", (payment_id,)).fetchone()
+        if not row:
+            messagebox.showerror("Receipt / رسید", "Payment record not found / ادائیگی کا ریکارڈ نہیں ملا۔", parent=self.root)
+            return
+        due = float(row["amount_due"] or 0)
+        paid_total = self.db.scalar(
+            "SELECT COALESCE(SUM(amount),0) FROM payments WHERE student_id=? AND month=? AND currency=? AND lower(status) NOT IN ('unpaid','void','cancelled')",
+            (row["student_id"], row["month"], row["currency"])
+        )
+        paid_total = float(paid_total or 0)
+        balance = max(0.0, due - paid_total)
+        currency = str(row["currency"] or "PKR")
+        receipt = (
+            f"{self.brand_name}\n{self.brand_name_ur}\nPAYMENT RECEIPT / ادائیگی کی رسید\n" + "=" * 48 + "\n" +
+            f"Receipt No / رسید نمبر: {row['id']}\n"+
+            f"Student / طالب علم: {row['full_name']}\nCourse / کورس: {row['course'] or '—'}\n"+
+            f"Fee month / فیس کا مہینہ: {row['month']}\nPayment date / ادائیگی کی تاریخ: {row['payment_date']}\n"+
+            f"This payment / اس ادائیگی کی رقم: {float(row['amount'] or 0):,.2f} {currency}\n"+
+            f"Monthly fee due / ماہانہ فیس: {due:,.2f} {currency}\n"+
+            f"Total received / کل وصول شدہ: {paid_total:,.2f} {currency}\n"+
+            f"Balance remaining / بقایا رقم: {balance:,.2f} {currency}\n"+
+            f"Status / حالت: {row['status']}\nNotes / نوٹس: {row['notes'] or '—'}\n" + "=" * 48 + "\nThank you / شکریہ")
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Receipt #{payment_id} / رسید")
+        win.geometry("680x620")
+        win.configure(bg=APP_BG)
+        smart_label(ttk.Label, win, text="Payment Receipt / ادائیگی کی رسید", style="Title.TLabel").pack(anchor="w", padx=14, pady=(12, 0))
+        text_box = tk.Text(win, wrap="word", font=(UI_FONT, 11), padx=12, pady=12)
+        text_box.pack(fill="both", expand=True, padx=12, pady=12)
+        text_box.insert("1.0", receipt)
+        text_box.configure(state="disabled")
+
+        buttons = ttk.Frame(win)
+        buttons.pack(fill="x", padx=12, pady=(0, 12))
+        def save_receipt_text():
+            path = filedialog.asksaveasfilename(parent=win, title="Save receipt as text / رسید متن میں محفوظ کریں",
+                defaultextension=".txt", initialfile=f"TAHA_receipt_{payment_id}.txt",
+                filetypes=[("Text receipt", "*.txt")])
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(receipt)
+            except OSError as exc:
+                messagebox.showerror("Receipt save failed / رسید محفوظ نہیں ہوئی", str(exc), parent=win)
+                return
+            messagebox.showinfo("Receipt saved / رسید محفوظ", f"Receipt saved to:\n{path}", parent=win)
+
+        ttk.Button(buttons, text="Save as Text / متن محفوظ کریں", command=save_receipt_text).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="Save PDF / PDF محفوظ کریں", style="Accent.TButton",
+                   command=lambda: self._save_receipt_pdf(payment_id, row, due, paid_total, balance, parent=win)).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Save & Open to Print / محفوظ کرکے پرنٹ کے لیے کھولیں", 
+                   command=lambda: self._save_receipt_pdf(payment_id, row, due, paid_total, balance, open_after=True, parent=win)).pack(side="left", padx=6)
+
+    def _receipt_font_path(self, family):
+        """Find an app-bundled or locally installed font without adding font files to the database."""
+        base = os.path.dirname(os.path.abspath(__file__))
+        if family == "urdu":
+            filenames = ("Jameel Noori Nastaleeq Regular.ttf", "Jameel Noori Nastaleeq.ttf")
+            loaded = [p for p in _FONT_RESOURCES if "jameel noori nastaleeq" in os.path.basename(p).casefold()]
+        else:
+            filenames = ("Aptos.ttf", "Aptos-Regular.ttf", "Arial.ttf", "arial.ttf")
+            loaded = [p for p in _FONT_RESOURCES if "aptos" in os.path.basename(p).casefold() and os.path.basename(p).casefold() in ("aptos.ttf",)]
+        candidates = list(loaded)
+        for filename in filenames:
+            candidates.extend((
+                os.path.join(base, "assets", "fonts", filename),
+                os.path.join(base, "fonts", filename),
+                os.path.join(base, filename),
+                os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", filename),
+            ))
+        for path in candidates:
+            if path and os.path.isfile(path):
+                return path
+        return ""
+
+    def _save_receipt_pdf(self, payment_id, row, due, paid_total, balance, open_after=False, parent=None):
+        """Render a high-resolution, print-ready A4 PDF with the configured logo and Nastaleeq font."""
+        if Image is None:
+            messagebox.showerror("PDF support unavailable / PDF کی سہولت دستیاب نہیں",
+                "Install Pillow first: py -m pip install pillow\nPDF بنانے کے لیے Pillow درکار ہے۔", parent=parent or self.root)
+            return
+        try:
+            from pathlib import Path
+            from PIL import ImageDraw, ImageFont, ImageColor
+        except ImportError as exc:
+            messagebox.showerror("PDF support unavailable / PDF کی سہولت دستیاب نہیں", str(exc), parent=parent or self.root)
+            return
+
+        urdu_path = self._receipt_font_path("urdu")
+        if not urdu_path:
+            messagebox.showerror("Urdu font not found / اردو فونٹ نہیں ملا",
+                "Jameel Noori Nastaleeq font file was not found. Keep your licensed font at assets/fonts/Jameel Noori Nastaleeq Regular.ttf.\n\nJameel Noori Nastaleeq فونٹ assets/fonts فولڈر میں رکھیں۔",
+                parent=parent or self.root)
+            return
+        english_path = self._receipt_font_path("english")
+        try:
+            # 1654 × 2339 at 200 dpi: crisp enough for normal A4 printing.
+            page_w, page_h = 1654, 2339
+            img = Image.new("RGB", (page_w, page_h), "white")
+            draw = ImageDraw.Draw(img)
+            def font_at(path, size, fallback=False):
+                try:
+                    return ImageFont.truetype(path, size=size)
+                except Exception:
+                    if fallback:
+                        return ImageFont.load_default()
+                    raise
+            en_title = font_at(english_path, 48, True) if english_path else ImageFont.load_default()
+            en_label = font_at(english_path, 27, True) if english_path else ImageFont.load_default()
+            en_value = font_at(english_path, 34, True) if english_path else ImageFont.load_default()
+            ur_title = font_at(urdu_path, 48)
+            ur_label = font_at(urdu_path, 28)
+            ur_value = font_at(urdu_path, 35)
+            green = ImageColor.getrgb(GREEN)
+            dark = ImageColor.getrgb(DARK)
+            muted = ImageColor.getrgb(MUTED)
+            pale = ImageColor.getrgb(PALE)
+            border = ImageColor.getrgb(BORDER)
+
+            # Header banner and institution logo.
+            draw.rounded_rectangle((72, 64, page_w - 72, 390), radius=34, fill=green)
+            logo_drawn = False
+            if self.logo_path and os.path.isfile(self.logo_path):
+                try:
+                    logo = self._prepare_circular_logo(self.logo_path, 210, GREEN, 6)
+                    img.paste(logo, (112, 112), logo)
+                    logo_drawn = True
+                except Exception:
+                    logo_drawn = False
+            title_x = 360 if logo_drawn else 125
+            draw.text((title_x, 105), str(self.brand_name or APP_NAME), font=en_title, fill="white")
+            if str(getattr(self, "brand_name_ur", "") or "").strip():
+                draw.text((page_w - 125, 180), str(self.brand_name_ur), font=ur_title, fill="white",
+                          anchor="ra", direction="rtl", language="ur")
+            draw.text((title_x, 268), "PAYMENT RECEIPT", font=en_label, fill="#F2E8CC")
+            draw.text((page_w - 125, 268), "ادائیگی کی رسید", font=ur_label, fill="#F2E8CC",
+                      anchor="ra", direction="rtl", language="ur")
+
+            fields = [
+                ("Receipt No", "رسید نمبر", str(row["id"])),
+                ("Student", "طالب علم", str(row["full_name"] or "—")),
+                ("Course", "کورس", str(row["course"] or "—")),
+                ("Fee month", "فیس کا مہینہ", str(row["month"] or "—")),
+                ("Payment date", "ادائیگی کی تاریخ", str(row["payment_date"] or "—")),
+                ("This payment", "اس ادائیگی کی رقم", f"{float(row['amount'] or 0):,.2f} {row['currency']}"),
+                ("Monthly fee due", "ماہانہ فیس", f"{float(due or 0):,.2f} {row['currency']}"),
+                ("Total received", "کل وصول شدہ", f"{float(paid_total or 0):,.2f} {row['currency']}"),
+                ("Balance remaining", "بقایا رقم", f"{float(balance or 0):,.2f} {row['currency']}"),
+                ("Status", "حالت", str(row["status"] or "—")),
+                ("Notes", "نوٹس", str(row["notes"] or "—")),
+            ]
+            start_y = 430
+            row_h = 150
+            row_gap = 12
+            for idx, (label_en, label_ur, value) in enumerate(fields):
+                y = start_y + idx * (row_h + row_gap)
+                draw.rounded_rectangle((82, y, page_w - 82, y + row_h), radius=18,
+                                       fill=(255, 255, 255), outline=border, width=3)
+                draw.text((112, y + 12), label_en, font=en_label, fill=muted)
+                draw.text((page_w - 112, y + 12), label_ur, font=ur_label, fill=muted,
+                          anchor="ra", direction="rtl", language="ur")
+                contains_urdu = any(0x0600 <= ord(ch) <= 0x06FF or 0xFB50 <= ord(ch) <= 0xFEFF for ch in value)
+                if contains_urdu:
+                    draw.text((page_w - 112, y + 62), value, font=ur_value, fill=dark,
+                              anchor="ra", direction="rtl", language="ur")
+                else:
+                    draw.text((112, y + 62), value, font=en_value, fill=dark)
+            footer_y = min(page_h - 90, start_y + len(fields) * (row_h + row_gap) + 18)
+            draw.line((100, footer_y, page_w - 100, footer_y), fill=green, width=4)
+            draw.text((page_w // 2 - 18, footer_y + 20), "Thank you", font=en_label, fill=green, anchor="ra")
+            draw.text((page_w // 2 + 190, footer_y + 20), "شکریہ", font=ur_label, fill=green,
+                      anchor="ra", direction="rtl", language="ur")
+
+            path = filedialog.asksaveasfilename(parent=parent or self.root,
+                title="Save receipt as PDF / رسید PDF میں محفوظ کریں", defaultextension=".pdf",
+                initialfile=f"TAHA_receipt_{payment_id}.pdf", filetypes=[("PDF document", "*.pdf")])
+            if not path:
+                return
+            img.save(path, "PDF", resolution=200.0, quality=95)
+            if open_after:
+                try:
+                    if sys.platform == "win32" and hasattr(os, "startfile"):
+                        os.startfile(path)
+                    else:
+                        webbrowser.open_new_tab(Path(path).resolve().as_uri())
+                except Exception as exc:
+                    messagebox.showwarning("PDF saved / PDF محفوظ", f"PDF saved, but could not open the viewer:\n{path}\n\n{exc}", parent=parent or self.root)
+                    return
+            messagebox.showinfo("PDF receipt saved / PDF رسید محفوظ", f"PDF receipt saved to:\n{path}" +
+                ("\n\nThe PDF is open. Press Ctrl+P to print it. / پرنٹ کے لیے Ctrl+P دبائیں۔" if open_after else ""),
+                parent=parent or self.root)
+        except Exception as exc:
+            messagebox.showerror("PDF receipt failed / PDF رسید نہیں بنی",
+                f"Could not create a readable PDF receipt.\n{exc}\n\nCheck that Pillow supports Urdu RTL text rendering and that the Jameel font is valid.",
+                parent=parent or self.root)
+
+    def attendance_page(self, parent):
+        self.attendance_calendar_page(parent)
+
+    def attendance_calendar_page(self, parent):
+        """Daily/weekly/monthly attendance calendar with teacher submissions pending admin review."""
+        approval_description = (
+            "Daily, weekly and monthly attendance. Teacher submissions wait for administrator approval."
+            if self._attendance_approval_required() else
+            "Daily, weekly and monthly attendance. New teacher submissions are automatically approved by settings."
+        )
+        self.page_title(parent, "Attendance Calendar / حاضری کیلنڈر", approval_description)
+        bar = ttk.Frame(parent); bar.pack(fill="x", pady=5)
+        self.attendance_anchor = getattr(self, "attendance_anchor", date.today())
+        self.attendance_mode = getattr(self, "attendance_mode", "month")
+        if self.attendance_mode == 'month':
+            first_day = self.attendance_anchor.replace(day=1)
+            last_day = first_day.replace(day=calendar.monthrange(first_day.year, first_day.month)[1])
+        elif self.attendance_mode == 'week':
+            first_day = self.attendance_anchor - timedelta(days=self.attendance_anchor.weekday())
+            last_day = first_day + timedelta(days=6)
+        else:
+            first_day = last_day = self.attendance_anchor
+        self._prime_attendance_calendar_cache(first_day, last_day)
+        ttk.Button(bar, text="Daily View / روزانہ", command=lambda: self.set_attendance_mode(parent, "day")).pack(side="left", padx=2)
+        ttk.Button(bar, text="Weekly View / ہفتہ وار", command=lambda: self.set_attendance_mode(parent, "week")).pack(side="left", padx=2)
+        ttk.Button(bar, text="Monthly View / ماہانہ", command=lambda: self.set_attendance_mode(parent, "month")).pack(side="left", padx=2)
+        ttk.Button(bar, text="Record Attendance / حاضری درج کریں", style="Accent.TButton",
+                   command=lambda: self.add_attendance(admin=self.user.get('role') == 'admin')).pack(side="right", padx=2)
+        if self.user.get('role') == 'admin':
+            pending_count = int(self.db.conn.execute(
+                "SELECT COUNT(*) FROM attendance WHERE COALESCE(approved,0)=0").fetchone()[0] or 0)
+            ttk.Button(bar, text=f"Review Pending / منظوری باقی ({pending_count})",
+                       command=lambda: self.show_page(parent, lambda p: self.pending_attendance_page(p))).pack(side="right", padx=6)
+        ttk.Button(bar, text="Today's Classes · Quick Mark / آج کی کلاسیں", style="Accent.TButton",
+                   command=lambda: self.show_page(parent, lambda p: self.today_attendance_page(p))).pack(side="left", padx=6)
+        self.attendance_area = ttk.Frame(parent); self.attendance_area.pack(fill="both", expand=True, pady=5)
+        self.render_attendance_calendar(parent)
+
+    def set_attendance_mode(self, parent, mode):
+        self.attendance_mode = mode
+        self.render_attendance_calendar(parent)
+
+    def _prime_attendance_calendar_cache(self, start_day, end_day):
+        """Fetch all attendance marks for a visible calendar range with one query."""
+        cache = {}
+        sql = "SELECT a.class_date,a.student_id,a.status FROM attendance a WHERE a.class_date BETWEEN ? AND ?"
+        args = [start_day.isoformat(), end_day.isoformat()]
+        if self.user.get('role') == 'teacher':
+            sql += " AND a.teacher_id=?"
+            args.append(self.user.get('teacher_id'))
+        sql += " ORDER BY a.class_date,a.student_id,a.id DESC"
+        for row in self.db.conn.execute(sql, args).fetchall():
+            cache.setdefault(row['class_date'], {}).setdefault(row['student_id'], row['status'])
+        self._attendance_calendar_range_cache = cache
+
+    def _attendance_for_date(self, day):
+        range_cache = getattr(self, '_attendance_calendar_range_cache', None)
+        if range_cache is not None:
+            return dict(range_cache.get(day.isoformat(), {}))
+        role = self.user.get('role')
+        sql = "SELECT a.student_id,a.status FROM attendance a WHERE a.class_date=?"
+        args = [day.isoformat()]
+        if role == 'teacher':
+            sql += " AND a.teacher_id=?"; args.append(self.user.get('teacher_id'))
+        rows = self.db.conn.execute(sql, args).fetchall()
+        return {r['student_id']: r['status'] for r in rows}
+
+    def render_attendance_calendar(self, parent):
+        for child in self.attendance_area.winfo_children(): child.destroy()
+        anchor = self.attendance_anchor
+        mode = self.attendance_mode
+        if mode == 'month':
+            cache_start = anchor.replace(day=1)
+            cache_end = cache_start.replace(day=calendar.monthrange(cache_start.year, cache_start.month)[1])
+        elif mode == 'week':
+            cache_start = anchor - timedelta(days=anchor.weekday())
+            cache_end = cache_start + timedelta(days=6)
+        else:
+            cache_start = cache_end = anchor
+        self._prime_attendance_calendar_cache(cache_start, cache_end)
+        if mode == 'month':
+            anchor = anchor.replace(day=1); self.attendance_anchor = anchor
+            title = anchor.strftime('%B %Y')
+            prev = lambda: self._move_attendance_anchor(parent, (anchor-timedelta(days=1)).replace(day=1))
+            nxt = lambda: self._move_attendance_anchor(parent, (anchor.replace(day=calendar.monthrange(anchor.year,anchor.month)[1])+timedelta(days=1)).replace(day=1))
+        elif mode == 'week':
+            start = anchor - timedelta(days=anchor.weekday()); title = f"Week of {start.strftime('%d %b %Y')}"
+            prev = lambda: self._move_attendance_anchor(parent, start-timedelta(days=7))
+            nxt = lambda: self._move_attendance_anchor(parent, start+timedelta(days=7))
+        else:
+            title = anchor.strftime('%A, %d %B %Y')
+            prev = lambda: self._move_attendance_anchor(parent, anchor-timedelta(days=1))
+            nxt = lambda: self._move_attendance_anchor(parent, anchor+timedelta(days=1))
+        nav=ttk.Frame(self.attendance_area); nav.pack(fill='x',pady=(0,6))
+        ttk.Button(nav,text='◀ Previous',command=prev).pack(side='left')
+        smart_label(ttk.Label, nav,text=title,style='Title.TLabel').pack(side='left',padx=14)
+        ttk.Button(nav,text='Next ▶',command=nxt).pack(side='left')
+        ttk.Button(nav,text='Today',command=lambda:self._move_attendance_anchor(parent,date.today().replace(day=1) if mode=='month' else date.today())).pack(side='left',padx=8)
+        smart_label(ttk.Label, self.attendance_area,text='Green = Present  •  Red = Absent  •  Amber = Leave. Teacher entries remain pending until an administrator reviews them.',style='Sub.TLabel').pack(anchor='w',pady=(0,6))
+        if mode == 'day':
+            self._render_attendance_day(parent, anchor)
+        elif mode == 'week':
+            grid=ttk.Frame(self.attendance_area); grid.pack(fill='x',expand=False)
+            for col in range(7): grid.grid_columnconfigure(col,weight=1,uniform='attweek')
+            start=anchor-timedelta(days=anchor.weekday())
+            for col in range(7):
+                d=start+timedelta(days=col)
+                box=ttk.LabelFrame(grid,text=d.strftime('%a %d %b'),padding=4); box.grid(row=0,column=col,sticky='nsew',padx=2,pady=2)
+                self._attendance_day_buttons(box,d)
+                ttk.Button(box,text='Open day',command=lambda chosen=d:self._move_attendance_anchor(parent,chosen, 'day')).pack(fill='x',pady=3)
+        else:
+            grid=ttk.Frame(self.attendance_area); grid.pack(fill='x',expand=False)
+            for col,name in enumerate(calendar.day_abbr):
+                smart_label(ttk.Label, grid,text=name,anchor='center').grid(row=0,column=col,sticky='nsew',padx=2,pady=2); grid.grid_columnconfigure(col,weight=1,uniform='attmonth')
+            # Fixed natural-flow month rows prevent the attendance calendar stretching
+            # taller every time the outer dashboard is scrolled.
+            for row in range(1,7): grid.grid_rowconfigure(row,minsize=78)
+            weeks=calendar.Calendar(firstweekday=0).monthdayscalendar(anchor.year,anchor.month)
+            for ri,week in enumerate(weeks,start=1):
+                for ci,num in enumerate(week):
+                    if not num: continue
+                    d=date(anchor.year,anchor.month,num); statuses=self._attendance_for_date(d)
+                    marks=[]
+                    for st in statuses.values():
+                        marks.append({'Present':'✓','Absent':'✕','Leave / Class not held':'—'}.get(st,'•'))
+                    caption=str(num)+(('\n'+' '.join(marks[:8])) if marks else '')
+                    btn=ttk.Button(grid,text=caption,
+                                   style=('CalendarMarked.TButton' if marks else 'CalendarCell.TButton'),
+                                   command=lambda chosen=d:self._move_attendance_anchor(parent,chosen,'day'))
+                    btn.grid(row=ri,column=ci,sticky='nsew',padx=2,pady=2,ipady=8)
+
+    def _move_attendance_anchor(self,parent,chosen,mode=None):
+        self.attendance_anchor=chosen
+        if mode: self.attendance_mode=mode
+        self.render_attendance_calendar(parent)
+
+    def _attendance_day_buttons(self, box, day):
+        classes=self._classes_for_date(day)
+        role=self.user.get('role')
+        if role=='teacher':
+            tid=self.user.get('teacher_id')
+            classes=[c for c in classes if self.db.conn.execute('SELECT 1 FROM teacher_students WHERE teacher_id=? AND student_id=?',(tid,c['student_id'])).fetchone()]
+        if not classes:
+            smart_label(ttk.Label, box,text='No scheduled classes',style='Sub.TLabel',wraplength=120).pack(anchor='w',pady=3)
+        statuses=self._attendance_for_date(day)
+        for item in classes:
+            status=statuses.get(item['student_id'],'Not marked')
+            symbol={'Present':'✓','Absent':'✕','Leave / Class not held':'—'}.get(status,'○')
+            color={'Present':'#0F7457','Absent':'#B42318','Leave / Class not held':'#B7791F'}.get(status,DARK)
+            card=ttk.Frame(box); card.pack(fill='x',pady=2)
+            btn=tk.Button(card,text=f"{item['start']}\n{item['student']}",anchor='w',justify='left',wraplength=130,
+                          bg=CARD_BG,fg=color,relief='groove',command=lambda c=item:self.show_class_details(c))
+            btn.pack(fill='x')
+            self._attendance_bubbles(card,item,None).pack(fill='x',pady=(2,0))
+
+    def _render_attendance_day(self,parent,day):
+        wrap=ttk.Frame(self.attendance_area); wrap.pack(fill='x',expand=False)
+        self._attendance_day_buttons(wrap,day)
+
+    def mark_class_attendance(self,item,parent=None,details_win=None):
+        if self.user.get('role')=='teacher':
+            allowed=self.db.conn.execute('SELECT 1 FROM teacher_students WHERE teacher_id=? AND student_id=?',(self.user.get('teacher_id'),item['student_id'])).fetchone()
+            if not allowed:
+                messagebox.showerror('Not allowed','You can only mark attendance for your assigned students.'); return
+        win=tk.Toplevel(self.root); win.title('Mark Attendance / حاضری لگائیں'); win.transient(self.root); win.grab_set()
+        body=ttk.Frame(win,padding=18); body.pack(fill='both',expand=True)
+        smart_label(ttk.Label, body,text=item['student'],style='Title.TLabel').pack(anchor='w')
+        smart_label(ttk.Label, body,text=f"{item['date']}  •  {item['start']}  •  {item['type']}").pack(anchor='w',pady=(3,12))
+        old=self.db.conn.execute('SELECT status FROM attendance WHERE student_id=? AND class_date=? ORDER BY id DESC LIMIT 1',(item['student_id'],item['date'])).fetchone()
+        current=old['status'] if old and old['status'] in ('Present','Absent','Leave / Class not held') else 'Present'
+        status=tk.StringVar(value=current)
+        for value,label in [('Present','✓ حاضر — Present'),('Absent','✕ غیر حاضر — Absent'),('Leave / Class not held','— چھٹی / کلاس نہیں ہوئی — Leave / Class not held')]:
+            ttk.Radiobutton(body,text=label,variable=status,value=value).pack(anchor='w',pady=3)
+        smart_label(ttk.Label, body,text='Notes (optional)').pack(anchor='w',pady=(10,2))
+        notes=ttk.Entry(body,width=42); notes.pack(fill='x')
+        def save():
+            tid=self.user.get('teacher_id') if self.user.get('role')=='teacher' else None
+            if self.user.get('role')=='admin':
+                teacher=self.db.conn.execute('SELECT teacher_id FROM attendance WHERE student_id=? AND class_date=? ORDER BY id DESC LIMIT 1',(item['student_id'],item['date'])).fetchone()
+                tid=teacher['teacher_id'] if teacher else None
+            existing=self.db.conn.execute('SELECT id FROM attendance WHERE student_id=? AND class_date=? ORDER BY id DESC LIMIT 1',(item['student_id'],item['date'])).fetchone()
+            approved = self._attendance_approved_for_role(self.user.get('role'))
+            if existing:
+                self.db.conn.execute('UPDATE attendance SET status=?,teacher_id=?,approved=?,notes=? WHERE id=?',(status.get(),tid,approved,notes.get().strip(),existing['id']))
+            else:
+                self.db.conn.execute('INSERT INTO attendance(student_id,class_date,status,teacher_id,approved,notes) VALUES(?,?,?,?,?,?)',(item['student_id'],item['date'],status.get(),tid,approved,notes.get().strip()))
+            self.db.conn.commit(); win.destroy()
+            if details_win is not None and details_win.winfo_exists(): details_win.destroy()
+            if parent is not None and parent.winfo_exists():
+                if getattr(self,'calendar_area',None) is not None and self.calendar_area.winfo_exists(): self.render_class_calendar(parent)
+                elif getattr(self,'attendance_area',None) is not None and self.attendance_area.winfo_exists(): self.render_attendance_calendar(parent)
+            message = ('Attendance submitted for administrator approval. / حاضری منظوری کے لیے بھیج دی گئی۔'
+                       if approved == 0 else 'Attendance saved and approved. / حاضری محفوظ اور منظور ہو گئی۔')
+            messagebox.showinfo('Attendance saved / حاضری محفوظ', message, parent=self.root)
+        ttk.Button(body,text='Save Attendance / حاضری محفوظ کریں',style='Accent.TButton',command=save).pack(anchor='e',pady=14)
+
+    def today_attendance_page(self, parent):
+        """Show today's classes; teacher marks are submitted for admin approval."""
+        if not self.user or self.user.get("role") not in ("admin", "teacher"):
+            messagebox.showerror("Permission denied / اجازت نہیں", "Attendance is available to administrators and teachers. / حاضری صرف ایڈمن اور اساتذہ کے لیے ہے۔", parent=self.root)
+            return
+        today = date.today()
+        approval_note = (
+            "Teacher marks are sent for administrator approval. / استاد کی حاضری ایڈمن کی منظوری کے لیے جائے گی۔"
+            if self._attendance_approval_required() else
+            "Teacher marks are saved as approved. / استاد کی حاضری خود منظور ہو جائے گی۔"
+        )
+        self.page_title(parent, "Today's Classes / آج کی کلاسیں",
+                        f"{today.strftime('%A, %d %B %Y')} · {approval_note}")
+        bar = ttk.Frame(parent); bar.pack(fill="x", pady=(0, 8))
+        ttk.Button(bar, text="Back to Calendar / کیلنڈر پر واپس", command=lambda: self.show_page(parent, lambda p: self.attendance_page(p))).pack(side="left")
+        ttk.Button(bar, text="Refresh / تازہ کریں", command=lambda: self.show_page(parent, lambda p: self.today_attendance_page(p))).pack(side="left", padx=6)
+        classes = self._classes_for_date(today)
+        if self.user.get("role") == "teacher":
+            teacher_id = self.user.get("teacher_id")
+            classes = [item for item in classes if self.db.conn.execute(
+                "SELECT 1 FROM teacher_students WHERE teacher_id=? AND student_id=?",
+                (teacher_id, item["student_id"])).fetchone()]
+        if not classes:
+            smart_label(ttk.Label, parent, text="No classes are scheduled for today. / آج کوئی کلاس شیڈول نہیں ہے۔", style="Sub.TLabel").pack(anchor="w", pady=12)
+            return
+        for item in classes:
+            current = self._class_attendance_status(item)
+            color = {"Present": GREEN, "Absent": "#B42318", "Leave / Class not held": "#B7791F", "Not marked": MUTED}.get(current, MUTED)
+            card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=12, pady=9)
+            card.pack(fill="x", pady=4)
+            left = tk.Frame(card, bg=CARD_BG); left.pack(side="left", fill="x", expand=True)
+            smart_label(tk.Label, left, text=f"{item.get('start') or 'Time not set'} · {item.get('student','')}", bg=CARD_BG, fg=DARK, font=(UI_FONT, 11, "bold")).pack(anchor="w")
+            smart_label(tk.Label, left, text=f"Course / کورس: {item.get('course') or '—'} · Class / قسم: {item.get('type') or 'Class'} · Teacher / استاد: {item.get('teacher') or 'Not assigned'}", bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9)).pack(anchor="w", pady=(2,0))
+            status_urdu = {"Present": "حاضر", "Absent": "غیر حاضر", "Leave / Class not held": "چھٹی / کلاس نہیں ہوئی", "Not marked": "نشان زدہ نہیں"}.get(current, current)
+            status_label = smart_label(tk.Label, card, text=f"{current} / {status_urdu}", bg=CARD_BG, fg=color, font=(UI_FONT, 9, "bold"))
+            status_label.pack(side="left", padx=12)
+            actions = ttk.Frame(card); actions.pack(side="right")
+            ttk.Button(actions, text="✓ Present / حاضر", style="Present.TButton", command=lambda it=item, p=parent: self._save_quick_attendance(it, "Present", p)).pack(side="left", padx=2)
+            ttk.Button(actions, text="✕ Absent / غیر حاضر", style="Absent.TButton", command=lambda it=item, p=parent: self._save_quick_attendance(it, "Absent", p)).pack(side="left", padx=2)
+            ttk.Button(actions, text="Leave / Class not held / چھٹی", style="Leave.TButton", command=lambda it=item, p=parent: self._save_quick_attendance(it, "Leave / Class not held", p)).pack(side="left", padx=2)
+
+    def _save_quick_attendance(self, item, status, parent):
+        """Upsert attendance; teacher submissions follow the database's approval setting."""
+        if status not in ("Present", "Absent", "Leave / Class not held"):
+            return
+        if self.user and self.user.get("role") == "teacher":
+            allowed = self.db.conn.execute("SELECT 1 FROM teacher_students WHERE teacher_id=? AND student_id=?",
+                                           (self.user.get("teacher_id"), item["student_id"])).fetchone()
+            if not allowed:
+                messagebox.showerror("Not allowed / اجازت نہیں", "You can only mark attendance for assigned students. / آپ صرف اپنے طلبہ کی حاضری لگا سکتے ہیں۔", parent=self.root)
+                return
+        existing = self.db.conn.execute(
+            "SELECT id,teacher_id FROM attendance WHERE student_id=? AND class_date=? ORDER BY id DESC LIMIT 1",
+            (item["student_id"], item["date"])).fetchone()
+        role = self.user.get("role") if self.user else None
+        teacher_id = self.user.get("teacher_id") if role == "teacher" else (existing["teacher_id"] if existing else None)
+        approved = self._attendance_approved_for_role(role)
+        if existing:
+            self.db.conn.execute("UPDATE attendance SET status=?,teacher_id=?,approved=? WHERE id=?", (status, teacher_id, approved, existing["id"]))
+        else:
+            self.db.conn.execute("INSERT INTO attendance(student_id,class_date,status,teacher_id,approved,notes) VALUES(?,?,?,?,?,'')",
+                                 (item["student_id"], item["date"], status, teacher_id, approved))
+        self.db.conn.commit()
+        message = ("Attendance submitted for administrator approval. / حاضری منظوری کے لیے بھیج دی گئی۔"
+                   if approved == 0 else "Attendance saved and approved. / حاضری محفوظ اور منظور ہو گئی۔")
+        messagebox.showinfo("Attendance saved / حاضری محفوظ", message, parent=self.root)
+        self.show_page(parent, lambda p: self.today_attendance_page(p))
+
+    def add_attendance(self, admin=False):
+        if admin:
+            students = self.db.conn.execute("SELECT id,full_name FROM students ORDER BY full_name").fetchall()
+        else:
+            students = self.db.conn.execute("""SELECT s.id,s.full_name FROM students s
+                JOIN teacher_students ts ON ts.student_id=s.id
+                WHERE ts.teacher_id=? ORDER BY s.full_name""", (self.user.get("teacher_id"),)).fetchall()
+        if not students:
+            messagebox.showwarning("No assigned students", "No students are assigned to this account. Ask the administrator to assign students first."); return
+        student_opts = [f"{r['id']} - {r['full_name']}" for r in students]
+        if admin:
+            teachers = self.db.conn.execute("SELECT id,full_name FROM teachers ORDER BY full_name").fetchall()
+            teacher_opts = ["Unassigned"] + [f"{r['id']} - {r['full_name']}" for r in teachers]
+        else:
+            teacher_opts = [f"{self.user['teacher_id']} - Assigned teacher"]
+        fields = [("student", "Student", student_opts[0]), ("class_date", "Class date (YYYY-MM-DD)", datetime.now().strftime("%Y-%m-%d")),
+                  ("status", "Attendance status", "Present"), ("teacher", "Teacher", teacher_opts[0]), ("notes", "Notes", "")]
+        def save(v, win):
+            sid = int(v["student"].split(" - ",1)[0])
+            tid = None
+            if v["teacher"] != "Unassigned":
+                try: tid = int(v["teacher"].split(" - ",1)[0])
+                except ValueError: tid = self.user.get("teacher_id")
+            approved = self._attendance_approved_for_role("admin" if admin else (self.user.get("role") if self.user else None))
+            self.db.conn.execute("INSERT INTO attendance(student_id,class_date,status,teacher_id,approved,notes) VALUES(?,?,?,?,?,?)",
+                (sid,v["class_date"],v["status"],tid,approved,v["notes"]))
+            self.db.conn.commit()
+            message = (
+                "Attendance recorded and approved." if approved == 1 else
+                "Attendance submitted for administrator approval."
+            )
+            messagebox.showinfo("Saved", message, parent=win)
+            return True
+        self.form_dialog("Record Attendance", fields, save, {"student": student_opts, "status": ["Present","Absent","Leave / Class not held"], "teacher": teacher_opts})
+
+    def pending_attendance_page(self, parent):
+        """Administrator-only queue for reviewing teacher attendance submissions.
+
+        approved values are: 0 = pending, 1 = approved, 2 = returned for correction.
+        Returned records are retained; when a teacher resubmits the same student/date,
+        the normal attendance form sets the record back to pending (0).
+        """
+        if not self.user or self.user.get("role") != "admin":
+            messagebox.showerror("Permission denied / اجازت نہیں",
+                                 "Only an administrator can review attendance submissions.", parent=self.root)
+            return
+        self.page_title(parent, "Review attendance / حاضری کی منظوری",
+                        "Review teacher submissions. Approve a record or return it for correction.")
+        toolbar = ttk.Frame(parent); toolbar.pack(fill="x", pady=(0, 8))
+        count_label = smart_label(ttk.Label, toolbar, text="", style="Sub.TLabel")
+        count_label.pack(side="left", padx=4)
+        tree = self.make_tree(parent,
+            ("id", "date", "student", "status", "teacher", "notes"),
+            ("ID", "Class date", "Student", "Submitted attendance", "Teacher", "Notes"))
+        for column, width in (("id", 60), ("date", 110), ("student", 190), ("status", 170), ("teacher", 170), ("notes", 260)):
+            tree.column(column, width=width, minwidth=60, stretch=(column in ("student", "notes")))
+
+        def load_rows():
+            tree.delete(*tree.get_children())
+            rows = self.db.conn.execute("""SELECT a.id, a.class_date, COALESCE(s.full_name,'Unknown student') AS student,
+                    COALESCE(a.status,'Not marked') AS status, COALESCE(t.full_name,'Unassigned') AS teacher,
+                    COALESCE(a.notes,'') AS notes
+                FROM attendance a
+                LEFT JOIN students s ON s.id=a.student_id
+                LEFT JOIN teachers t ON t.id=a.teacher_id
+                WHERE COALESCE(a.approved,0)=0
+                ORDER BY a.class_date DESC, a.id DESC""").fetchall()
+            for row in rows:
+                tree.insert("", "end", iid=str(row["id"]), values=(row["id"], row["class_date"], row["student"],
+                    row["status"], row["teacher"], row["notes"]))
+            count_label.configure(text=f"Pending submissions / منظوری کے منتظر: {len(rows)}")
+            return len(rows)
+
+        def selected_id():
+            selection = tree.selection()
+            return int(selection[0]) if selection else None
+
+        def decide(value):
+            attendance_id = selected_id()
+            if attendance_id is None:
+                messagebox.showwarning("Select a record", "Select an attendance record first.", parent=self.root)
+                return
+            if value == 2 and not messagebox.askyesno(
+                    "Return for correction / اصلاح کے لیے واپس کریں",
+                    "Return this submission for correction? The record will be retained and can be resubmitted by the teacher.",
+                    parent=self.root):
+                return
+            cur = self.db.conn.execute("UPDATE attendance SET approved=? WHERE id=? AND COALESCE(approved,0)=0",
+                                       (value, attendance_id))
+            self.db.conn.commit()
+            if cur.rowcount:
+                load_rows()
+                if value == 1:
+                    messagebox.showinfo("Approved / منظور شدہ", "Attendance has been approved.", parent=self.root)
+                else:
+                    messagebox.showinfo("Returned / واپس", "Attendance was returned for correction. The teacher can submit it again.", parent=self.root)
+            else:
+                load_rows()
+                messagebox.showwarning("Already reviewed", "This record is no longer pending review.", parent=self.root)
+
+        ttk.Button(toolbar, text="Approve selected / منظور کریں", style="Accent.TButton",
+                   command=lambda: decide(1)).pack(side="right", padx=4)
+        ttk.Button(toolbar, text="Return for correction / اصلاح کے لیے واپس", command=lambda: decide(2)).pack(side="right", padx=4)
+        ttk.Button(toolbar, text="Refresh / تازہ کریں", command=load_rows).pack(side="right", padx=4)
+        ttk.Button(toolbar, text="Back to attendance / حاضری پر واپس", command=lambda: self.show_page(parent, lambda p: self.attendance_page(p))).pack(side="right", padx=4)
+        load_rows()
+
+    def teacher_students(self, parent):
+        self.page_title(parent, "My Assigned Students / میرے طلبہ", "Privacy mode: only student name, class time and level/course are shown.")
+        tid = self.user.get("teacher_id")
+        if not tid:
+            smart_label(ttk.Label, parent, text="This teacher login is not linked to a teacher record. Ask the administrator to create/link the account.", style="Sub.TLabel").pack(anchor="w", pady=10)
+            return
+        rows = self.db.conn.execute("""SELECT s.id,s.full_name,s.class_time,s.level,s.course
+            FROM students s JOIN teacher_students ts ON ts.student_id=s.id
+            WHERE ts.teacher_id=? GROUP BY s.id ORDER BY s.full_name""", (tid,)).fetchall()
+        if not rows:
+            smart_label(ttk.Label, parent, text="No assigned students yet. Admin must assign students to this teacher through attendance/records.", style="Sub.TLabel").pack(anchor="w", pady=10)
+            return
+        for i, r in enumerate(rows):
+            card = tk.Frame(parent, bg=PALE, padx=14, pady=12, highlightbackground="#DCE8E2", highlightthickness=1)
+            card.pack(fill="x", pady=5)
+            smart_label(tk.Label, card, text=r["full_name"], bg=PALE, fg=GREEN, font=(UI_FONT, 12, "bold")).pack(anchor="w")
+            smart_label(tk.Label, card, text=f"Class time: {r['class_time'] or 'Not set'}  |  Level: {r['level'] or 'Beginner'}  |  Course: {r['course'] or 'Not assigned'}", bg=PALE, fg=DARK).pack(anchor="w", pady=(5,0))
+
+    def teacher_attendance(self, parent):
+        self.attendance_calendar_page(parent)
+
+    def progress_page(self, parent):
+        self.page_title(parent, "Student Progress / تعلیمی پیش رفت",
+                        "Record lesson progress, level and optional score. Quran-specific Sabaq, Sabqi, Manzil and Qaida/Nazra records are available separately.")
+        tools = ttk.Frame(parent); tools.pack(fill="x", pady=5)
+        ttk.Button(tools, text="Add Progress / پیش رفت درج کریں", style="Accent.TButton",
+                   command=lambda: self.add_progress(admin=True, refresh=lambda: self.show_page(parent, lambda p: self.progress_page(p)))).pack(side="right", padx=4)
+        ttk.Button(tools, text="Quran Progress Records / قرآنی ریکارڈ",
+                   command=lambda: self._open_quran_progress("admin")).pack(side="right", padx=4)
+        tree = self.make_tree(parent, ("id","student","course","level","lesson","score","date"),
+                              ("ID","Student / طالب علم","Course / کورس","Level / درجہ","Lesson / سبق","Score / اسکور","Date / تاریخ"))
+        rows = self.db.conn.execute("""SELECT p.id,COALESCE(s.full_name,'Unknown'),p.course,p.level,p.lesson,p.score,p.entry_date
+            FROM progress p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.id DESC""").fetchall()
+        rows = [tuple(r) for r in rows]
+        try:
+            qrows = self.db.conn.execute("""SELECT 'Q'||q.id, COALESCE(s.full_name,'Unknown'), 'Quran', q.record_type,
+                TRIM(COALESCE(q.surah,'')||' '||COALESCE(q.ayah_from,'')||'-'||COALESCE(q.ayah_to,'')||' '||COALESCE(q.lesson_number,'')),
+                q.quality, q.session_date
+                FROM quran_progress q LEFT JOIN students s ON s.id=q.student_id ORDER BY q.id DESC""").fetchall()
+            rows += [tuple(r) for r in qrows]
+        except Exception:
+            pass
+        rows.sort(key=lambda r: str(r[6] or ""), reverse=True)
+        self._run_in_batches(tree, rows, lambda r, _i: tree.insert("", "end", values=tuple(r)), batch_size=60, delay_ms=1)
+
+    def add_progress(self, admin=False, refresh=None):
+        if admin:
+            students = self.db.conn.execute("SELECT id,full_name,course,level FROM students ORDER BY full_name").fetchall()
+        else:
+            students = self.db.conn.execute("""SELECT s.id,s.full_name,s.course,s.level FROM students s
+                JOIN teacher_students ts ON ts.student_id=s.id
+                WHERE ts.teacher_id=? ORDER BY s.full_name""", (self.user.get("teacher_id"),)).fetchall()
+        if not students:
+            messagebox.showwarning("No assigned students", "No students are assigned to this account. Ask the administrator to assign students first."); return
+        opts = [f"{r['id']} - {r['full_name']}" for r in students]
+        fields = [("student","Student",opts[0]),("course","Course",COURSES[0]),("level","Level",LEVELS[0]),
+                  ("lesson","Lesson / Sura / topic",""),("score","Score (optional)",""),("entry_date","Date",datetime.now().strftime("%Y-%m-%d")),("notes","Notes","")]
+        def save(v, win):
+            sid = int(v["student"].split(" - ",1)[0])
+            score = None
+            if v["score"]:
+                try: score = float(v["score"])
+                except ValueError:
+                    messagebox.showerror("Invalid score", "Score must be a number.", parent=win); return False
+            tid = self.user.get("teacher_id") if self.user["role"] == "teacher" else None
+            self.db.conn.execute("INSERT INTO progress(student_id,course,level,lesson,score,teacher_id,notes,entry_date) VALUES(?,?,?,?,?,?,?,?)",
+                (sid,v["course"],v["level"],v["lesson"],score,tid,v["notes"],v["entry_date"]))
+            self.db.conn.commit()
+            messagebox.showinfo("Saved", "Progress saved.", parent=win)
+            if callable(refresh):
+                self.root.after(150, refresh)   # reload the table so the new row shows at once
+            return True
+        self.form_dialog("Add Progress", fields, save, {"student": opts, "course": COURSES, "level": LEVELS})
+
+    def teacher_progress(self, parent):
+        self.page_title(parent, "Progress for My Students / میرے طلبہ کی پیش رفت",
+                        "Only progress entries recorded by this teacher are shown.")
+        tid = self.user.get("teacher_id")
+        tools = ttk.Frame(parent); tools.pack(fill="x", pady=5)
+        ttk.Button(tools, text="Add Progress / پیش رفت درج کریں", style="Accent.TButton",
+                   command=lambda: self.add_progress(admin=False, refresh=lambda: self.show_page(parent, lambda p: self.teacher_progress(p)))).pack(side="left", padx=4)
+        ttk.Button(tools, text="Quran Progress Records / قرآنی ریکارڈ",
+                   command=lambda: self._open_quran_progress("teacher")).pack(side="left", padx=4)
+        tree = self.make_tree(parent, ("student","course","level","lesson","score","date"),
+                              ("Student / طالب علم","Course / کورس","Level / درجہ","Lesson / سبق","Score / اسکور","Date / تاریخ"))
+        rows = self.db.conn.execute("""SELECT s.full_name,p.course,p.level,p.lesson,p.score,p.entry_date FROM progress p
+            JOIN students s ON s.id=p.student_id WHERE p.teacher_id=? ORDER BY p.id DESC""", (tid,)).fetchall()
+        self._run_in_batches(tree, rows, lambda r, _i: tree.insert("", "end", values=tuple(r)), batch_size=60, delay_ms=1)
+
+    def _open_quran_progress(self, viewer, student_id=None):
+        """Open Quran-specific progress in a separate window with strict role scoping."""
+        role = (self.user or {}).get("role")
+        if viewer == "admin" and role != "admin":
+            messagebox.showerror("Permission denied / اجازت نہیں", "Only an administrator can view all Quran records.", parent=self.root); return
+        if viewer == "teacher" and role != "teacher":
+            messagebox.showerror("Permission denied / اجازت نہیں", "Only a teacher can view assigned-student Quran records.", parent=self.root); return
+        if viewer == "student":
+            if role != "student":
+                messagebox.showerror("Permission denied / اجازت نہیں", "This view is only for a student account.", parent=self.root); return
+            # Never trust an arbitrary student_id supplied by a UI caller.
+            student_id = (self.user or {}).get("student_id")
+            if not student_id:
+                messagebox.showwarning("Profile not linked / پروفائل منسلک نہیں", "Your login is not linked to a student profile.", parent=self.root); return
+        win = tk.Toplevel(self.root)
+        win.title("Quran Progress Records / قرآنی پیش رفت")
+        win.geometry("1180x650")
+        win.minsize(850, 480)
+        win.configure(bg=APP_BG)
+        win.transient(self.root)
+        title = "Quran Progress Records / قرآنی ریکارڈ"
+        subtitle = "Daily Sabaq, Sabqi, Manzil and Qaida/Nazra lesson history. / روزانہ سبق، سبقی، منزل اور قاعدہ/ناظرہ کا ریکارڈ۔"
+        if viewer == "student":
+            subtitle = "Only your own Quran learning record is shown. / صرف آپ کا اپنا قرآنی ریکارڈ دکھایا جاتا ہے۔"
+        elif viewer == "teacher":
+            subtitle = "Only assigned students are shown. / صرف آپ کے مقررہ طلبہ دکھائے جاتے ہیں۔"
+        self.page_title(win, title, subtitle)
+        bar = ttk.Frame(win, padding=(8, 2)); bar.pack(fill="x")
+        if viewer in ("admin", "teacher"):
+            ttk.Button(bar, text="Add Quran Record / قرآنی ریکارڈ درج کریں", style="Accent.TButton",
+                       command=lambda: self.add_quran_progress(admin=(viewer == "admin"), parent=win, on_saved=load_rows)).pack(side="right", padx=4)
+        if viewer == "student":
+            columns = ("date","type","juz","surah","ayahs","lesson","quality","notes")
+            headings = ("Date / تاریخ","Record / قسم","Juz / پارہ","Surah / سورت","Ayahs / آیات","Lesson / سبق نمبر","Quality / معیار","Notes / نوٹس")
+        else:
+            columns = ("date","student","type","juz","surah","ayahs","lesson","quality","notes")
+            headings = ("Date / تاریخ","Student / طالب علم","Record / قسم","Juz / پارہ","Surah / سورت","Ayahs / آیات","Lesson / سبق نمبر","Quality / معیار","Notes / نوٹس")
+        tree = self.make_tree(win, columns, headings)
+        for col, width in {"date":100,"student":150,"type":180,"juz":80,"surah":120,"ayahs":100,"lesson":150,"quality":150,"notes":220}.items():
+            if col in columns:
+                tree.column(col, width=width, minwidth=65, stretch=True)
+        generation = {"value": 0}
+        def load_rows():
+            if not win.winfo_exists():
+                return
+            generation["value"] += 1
+            active_generation = generation["value"]
+            tree.delete(*tree.get_children())
+            if viewer == "admin":
+                sql = """SELECT q.session_date,COALESCE(s.full_name,'Unknown'),q.record_type,COALESCE(q.juz_number,''),q.surah,
+                    CASE WHEN COALESCE(q.ayah_from,'')='' AND COALESCE(q.ayah_to,'')='' THEN ''
+                         ELSE COALESCE(q.ayah_from,'') || CASE WHEN COALESCE(q.ayah_to,'')<>'' THEN '–' ELSE '' END || COALESCE(q.ayah_to,'') END,
+                    q.lesson_number,q.quality,q.notes
+                    FROM quran_progress q LEFT JOIN students s ON s.id=q.student_id
+                    ORDER BY q.session_date DESC,q.id DESC"""
+                params = ()
+            elif viewer == "teacher":
+                tid = (self.user or {}).get("teacher_id")
+                if not tid:
+                    rows = []
+                    sql = None; params = ()
+                else:
+                    sql = """SELECT q.session_date,COALESCE(s.full_name,'Unknown'),q.record_type,COALESCE(q.juz_number,''),q.surah,
+                        CASE WHEN COALESCE(q.ayah_from,'')='' AND COALESCE(q.ayah_to,'')='' THEN ''
+                             ELSE COALESCE(q.ayah_from,'') || CASE WHEN COALESCE(q.ayah_to,'')<>'' THEN '–' ELSE '' END || COALESCE(q.ayah_to,'') END,
+                        q.lesson_number,q.quality,q.notes
+                        FROM quran_progress q JOIN students s ON s.id=q.student_id
+                        JOIN teacher_students ts ON ts.student_id=q.student_id AND ts.teacher_id=?
+                        GROUP BY q.id ORDER BY q.session_date DESC,q.id DESC"""
+                    params = (tid,)
+            else:
+                sql = """SELECT q.session_date,q.record_type,COALESCE(q.juz_number,''),q.surah,
+                    CASE WHEN COALESCE(q.ayah_from,'')='' AND COALESCE(q.ayah_to,'')='' THEN ''
+                         ELSE COALESCE(q.ayah_from,'') || CASE WHEN COALESCE(q.ayah_to,'')<>'' THEN '–' ELSE '' END || COALESCE(q.ayah_to,'') END,
+                    q.lesson_number,q.quality,q.notes FROM quran_progress q
+                    WHERE q.student_id=? ORDER BY q.session_date DESC,q.id DESC"""
+                params = (student_id,)
+            if sql is not None:
+                try:
+                    rows = self.db.conn.execute(sql, params).fetchall()
+                except sqlite3.Error as exc:
+                    messagebox.showerror("Cannot load records / ریکارڈ نہیں کھل سکا", str(exc), parent=win)
+                    return
+            total = len(rows)
+            index = {"value": 0}
+            def add_batch():
+                if not win.winfo_exists() or generation["value"] != active_generation or not tree.winfo_exists():
+                    return
+                stop = min(total, index["value"] + 50)
+                while index["value"] < stop:
+                    row = rows[index["value"]]
+                    tree.insert("", "end", values=tuple(row))
+                    index["value"] += 1
+                if index["value"] < total:
+                    win.after(5, add_batch)
+            win.after_idle(add_batch)
+        load_rows()
+
+    def add_quran_progress(self, admin=False, parent=None, on_saved=None):
+        """Record a Quran-specific learning session without changing the legacy progress table."""
+        role = (self.user or {}).get("role")
+        if admin and role != "admin":
+            messagebox.showerror("Permission denied / اجازت نہیں", "Only the administrator can add an all-student Quran record.", parent=parent or self.root)
+            return
+        if not admin and role != "teacher":
+            messagebox.showerror("Permission denied / اجازت نہیں", "Only a teacher or administrator can record lesson progress.", parent=parent or self.root)
+            return
+        if admin:
+            students = self.db.conn.execute("SELECT id,full_name FROM students ORDER BY full_name").fetchall()
+        else:
+            tid = (self.user or {}).get("teacher_id")
+            if not tid:
+                messagebox.showwarning("Teacher not linked / استاد منسلک نہیں", "This teacher login is not linked to a teacher record.", parent=parent or self.root)
+                return
+            students = self.db.conn.execute("""SELECT s.id,s.full_name FROM students s
+                JOIN teacher_students ts ON ts.student_id=s.id
+                WHERE ts.teacher_id=? GROUP BY s.id ORDER BY s.full_name""", (tid,)).fetchall()
+        if not students:
+            messagebox.showwarning("No students / طلبہ موجود نہیں", "No eligible students are available for this account.", parent=parent or self.root)
+            return
+        opts = [f"{r['id']} - {r['full_name']}" for r in students]
+        types = ["Sabaq / سبق", "Sabqi / سبقی", "Manzil / منزل", "Qaida/Nazra lesson / قاعدہ/ناظرہ سبق"]
+        qualities = ["Excellent / بہترین", "Good / اچھا", "Needs practice / مزید مشق"]
+        fields = [
+            ("student", "Student / طالب علم", opts[0]),
+            ("record_type", "Record type / ریکارڈ کی قسم", types[0]),
+            ("session_date", "Date (YYYY-MM-DD) / تاریخ", datetime.now().strftime("%Y-%m-%d")),
+            ("juz_number", "Juz 1–30 / پارہ نمبر", ""),
+            ("surah", "Surah / سورت", ""),
+            ("ayah_from", "Ayah from / آیت شروع", ""),
+            ("ayah_to", "Ayah to / آیت آخر", ""),
+            ("lesson_number", "Lesson no. / page / سبق نمبر یا صفحہ", ""),
+            ("quality", "Recitation / سبق کا معیار", qualities[1]),
+            ("notes", "Notes / نوٹس", ""),
+        ]
+        def save(v, win):
+            try:
+                sid = int(v["student"].split(" - ", 1)[0])
+                session_date = date.fromisoformat(v["session_date"])
+            except (ValueError, TypeError):
+                messagebox.showerror("Invalid information / غلط معلومات", "Choose a student and enter a valid date in YYYY-MM-DD format.", parent=win)
+                return False
+            record_type = v["record_type"]
+            if record_type not in types:
+                messagebox.showerror("Invalid record type / غلط قسم", "Choose a record type from the list.", parent=win)
+                return False
+            juz = None
+            if v["juz_number"]:
+                try:
+                    juz = int(v["juz_number"])
+                except ValueError:
+                    messagebox.showerror("Invalid Juz / غلط پارہ", "Juz number must be from 1 to 30.", parent=win)
+                    return False
+                if not 1 <= juz <= 30:
+                    messagebox.showerror("Invalid Juz / غلط پارہ", "Juz number must be from 1 to 30.", parent=win)
+                    return False
+            ayah_from = v["ayah_from"].strip()
+            ayah_to = v["ayah_to"].strip()
+            if bool(ayah_from) != bool(ayah_to):
+                messagebox.showerror("Ayah range / آیات", "Enter both starting and ending ayah, or leave both empty.", parent=win)
+                return False
+            if ayah_from or ayah_to:
+                try:
+                    a_from, a_to = int(ayah_from), int(ayah_to)
+                    if a_from < 1 or a_to < a_from:
+                        raise ValueError
+                except ValueError:
+                    messagebox.showerror("Ayah range / آیات", "Ayah numbers must be positive, and the ending ayah cannot be before the starting ayah.", parent=win)
+                    return False
+            if record_type != types[3] and not (juz or v["surah"].strip()):
+                messagebox.showerror("Quran location required / مقام درج کریں", "For Sabaq, Sabqi and Manzil, enter at least a Juz number or Surah.", parent=win)
+                return False
+            if record_type == types[3] and not (v["lesson_number"].strip() or v["surah"].strip()):
+                messagebox.showerror("Lesson required / سبق درج کریں", "For Qaida/Nazra, enter a lesson/page number or topic.", parent=win)
+                return False
+            if not admin:
+                tid = (self.user or {}).get("teacher_id")
+                allowed = self.db.conn.execute("SELECT 1 FROM teacher_students WHERE teacher_id=? AND student_id=?", (tid, sid)).fetchone()
+                if not allowed:
+                    messagebox.showerror("Permission denied / اجازت نہیں", "This student is not assigned to your teacher account.", parent=win)
+                    return False
+            else:
+                tid = None
+            self.db.conn.execute("""INSERT INTO quran_progress
+                (student_id,teacher_id,session_date,record_type,juz_number,surah,ayah_from,ayah_to,lesson_number,quality,notes,created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                    sid, tid, session_date.isoformat(), record_type, juz, v["surah"].strip(),
+                    ayah_from, ayah_to, v["lesson_number"].strip(), v["quality"], v["notes"].strip(), timestamp()))
+            self.db.conn.commit()
+            if callable(on_saved):
+                on_saved()
+            messagebox.showinfo("Saved / محفوظ", "Quran progress record saved successfully.", parent=win)
+            return True
+        self.form_dialog("Quran Progress / قرآنی پیش رفت", fields, save, {
+            "student": opts, "record_type": types, "quality": qualities
+        })
+    def student_home(self, parent):
+        self.page_title(parent, "My Learning / میری تعلیم", "Only your own learning record is shown.")
+        sid = self.user.get("student_id")
+        if not sid:
+            smart_label(ttk.Label, parent, text="This student login is not linked to a student profile. Ask the administrator for help.", style="Sub.TLabel").pack(anchor="w", pady=10)
+            return
+        row = self.db.conn.execute("SELECT full_name,course,level,class_time,status,admission_date FROM students WHERE id=?", (sid,)).fetchone()
+        if not row:
+            smart_label(ttk.Label, parent, text="Student profile not found. Please contact the administrator.", style="Sub.TLabel").pack(anchor="w", pady=10); return
+        card = tk.Frame(parent, bg=PALE, padx=20, pady=18, highlightbackground="#DCE8E2", highlightthickness=1)
+        card.pack(fill="x", pady=8)
+        smart_label(tk.Label, card, text=row["full_name"], bg=PALE, fg=GREEN, font=(UI_FONT, 16, "bold")).pack(anchor="w")
+        for label, value in [("Course",row["course"]),("Level",row["level"]),("Class time",row["class_time"]),("Status",row["status"]),("Admission date",row["admission_date"] )]:
+            smart_label(tk.Label, card, text=f"{label}: {value or 'Not set'}", bg=PALE, fg=DARK, font=(UI_FONT, 10)).pack(anchor="w", pady=2)
+        tools = ttk.Frame(parent); tools.pack(fill="x", pady=(10, 0))
+        ttk.Button(tools, text="Quran Progress Records / قرآنی ریکارڈ",
+                   command=lambda: self._open_quran_progress("student", student_id=sid)).pack(anchor="w")
+        smart_label(ttk.Label, parent, text="My progress / میری پیش رفت", style="Title.TLabel").pack(anchor="w", pady=(18,6))
+        tree = self.make_tree(parent, ("course","level","lesson","score","date"),
+                              ("Course / کورس","Level / درجہ","Lesson / سبق","Score / اسکور","Date / تاریخ"))
+        rows = self.db.conn.execute("SELECT course,level,lesson,score,entry_date FROM progress WHERE student_id=? ORDER BY id DESC", (sid,)).fetchall()
+        self._run_in_batches(tree, rows, lambda r, _i: tree.insert("", "end", values=tuple(r)), batch_size=60, delay_ms=1)
+
+    def accounts_page(self, parent):
+        self.page_title(parent, "Login Accounts / صارفین کے اکاؤنٹس", "Only the administrator can manage login accounts.")
+        top = ttk.Frame(parent); top.pack(fill="x", pady=5)
+        ttk.Button(top, text="Create Login", style="Accent.TButton", command=self.new_account).pack(side="right")
+        ttk.Button(top, text="Activate / Deactivate selected", command=lambda: toggle()).pack(side="right", padx=6)
+        tree = self.make_tree(parent, ("id","username","role","linked","active","created_at"), ("ID","Username","Role","Linked record ID","Status / حالت","Created / تاریخ"))
+        def load():
+            tree.delete(*tree.get_children())
+            rows = self.db.conn.execute("""SELECT id,username,role,COALESCE(teacher_id,student_id,''),active,created_at FROM users ORDER BY id DESC""").fetchall()
+            for r in rows:
+                status = "Active / فعال" if int(r[4] or 0) == 1 else "Pending / منظوری باقی"
+                tree.insert("", "end", values=(r[0], r[1], r[2], r[3], status, r[5]))
+        def toggle():
+            sel = tree.selection()
+            if not sel: messagebox.showwarning("Select account","Select an account first."); return
+            for item in sel:
+                vals = tree.item(item,"values"); uid=int(vals[0])
+                current_active = int(self.db.scalar("SELECT active FROM users WHERE id=?", (uid,)) or 0)
+                active=0 if current_active else 1
+                if vals[2] == "admin" and active == 0 and self.db.scalar("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1") <= 1:
+                    messagebox.showwarning("Keep an admin","At least one active admin must remain."); continue
+                self.db.conn.execute("UPDATE users SET active=? WHERE id=?",(active,uid))
+            self.db.conn.commit(); load()
+        load()
+
+    def new_account(self):
+        roles = ["teacher"]
+        fields = [("role","Role","teacher"),("username","Username",""),("password","Temporary password (12+ chars)",""),
+                  ("record_id","Teacher ID","")]
+        def save(v, win):
+            role=v["role"]
+            if role not in roles or not v["username"] or len(v["password"])<12:
+                messagebox.showwarning("Check details","Choose teacher, username and a password of at least 12 characters.",parent=win); return False
+            try: rid=int(v["record_id"])
+            except ValueError:
+                messagebox.showwarning("Record ID required","Enter the matching teacher record ID.",parent=win); return False
+            table="teachers"
+            if not self.db.scalar(f"SELECT COUNT(*) FROM {table} WHERE id=?",(rid,)):
+                messagebox.showerror("Record not found",f"No {role} record has ID {rid}.",parent=win); return False
+            try:
+                self.db.conn.execute("INSERT INTO users(username,password_hash,role,teacher_id,student_id,active,created_at) VALUES(?,?,?,?,?,1,?)",
+                    (v["username"],password_hash(v["password"]),role,rid if role=="teacher" else None,rid if role=="student" else None,timestamp()))
+                self.db.conn.commit()
+                messagebox.showinfo("Created","Login account created.",parent=win); return True
+            except sqlite3.IntegrityError:
+                messagebox.showerror("Username exists","Choose a different username.",parent=win); return False
+        self.form_dialog("Create Login", fields, save, {"role": roles})
+
+    def reports_page(self, parent):
+        self.page_title(parent, "Reports & Export / رپورٹس", "Export selected report data to CSV for spreadsheet use.")
+        identity = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=14, pady=10)
+        identity.pack(fill="x", pady=(8, 12))
+        logo_box = tk.Frame(identity, bg=CARD_BG, width=62, height=62)
+        logo_box.pack(side="left", padx=(0, 12))
+        logo_box.pack_propagate(False)
+        self._reports_logo_image = None
+        if self.logo_path and os.path.isfile(self.logo_path) and Image is not None:
+            try:
+                self._reports_logo_image = self._circular_logo_photo(self.logo_path, 58, GREEN, 3)
+                if self._reports_logo_image is not None:
+                    tk.Label(logo_box, image=self._reports_logo_image, bg=CARD_BG, bd=0).pack(expand=True)
+            except Exception:
+                self._reports_logo_image = None
+        if self._reports_logo_image is None:
+            mark = tk.Canvas(logo_box, width=54, height=54, bg=CARD_BG, highlightthickness=0, bd=0)
+            mark.pack(expand=True)
+            mark.create_oval(2, 2, 52, 52, fill=GREEN, outline="#DCE8E2", width=2)
+            mark.create_text(27, 27, text=(self.brand_name[:1] or "I").upper(), fill=WHITE, font=(UI_FONT, 19, "bold"))
+        identity_text = tk.Frame(identity, bg=CARD_BG)
+        identity_text.pack(side="left", fill="x", expand=True)
+        smart_label(tk.Label, identity_text, text=self._brand_display_name(), bg=CARD_BG, fg=DARK, font=((URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT), 14, "bold")).pack(anchor="w")
+        smart_label(tk.Label, identity_text, text="Official reports / ادارے کی رپورٹس", bg=CARD_BG, fg=MUTED, font=(UI_FONT, 9)).pack(anchor="w", pady=(2, 0))
+        choices = ["Students", "Teachers", "Payments", "Attendance", "Progress"]
+        choice_labels = {"Students": "طلبہ", "Teachers": "اساتذہ", "Payments": "ادائیگیاں", "Attendance": "حاضری", "Progress": "کارکردگی"}
+        display_choices = choices if APP_LANGUAGE == "en" else [choice_labels[x] for x in choices]
+        choice = tk.StringVar(value=display_choices[0])
+        smart_label(ttk.Label, parent, text="Choose report").pack(anchor="w", pady=(8,4))
+        ttk.Combobox(parent, textvariable=choice, values=display_choices, state="readonly", width=30).pack(anchor="w")
+        report_language = tk.StringVar(value="en")
+        report_controls = ttk.Frame(parent)
+        report_controls.pack(fill="x", pady=(8, 2))
+        smart_label(ttk.Label, report_controls, text="Report language / رپورٹ کی زبان").pack(side="left", padx=(0, 8))
+        ttk.Radiobutton(report_controls, text="English", variable=report_language, value="en").pack(side="left", padx=4)
+        ttk.Radiobutton(report_controls, text="اردو", variable=report_language, value="ur").pack(side="left", padx=4)
+        report_status_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=report_status_var, style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
+        report_queries = {
+            "Students": "SELECT id,full_name,guardian_name,phone,course,level,class_time,monthly_fee,currency,status,admission_date FROM students ORDER BY full_name",
+            "Teachers": "SELECT id,full_name,email,phone,qualification,experience,availability,status FROM teachers ORDER BY full_name",
+            "Payments": "SELECT p.id,s.full_name,p.amount,p.currency,p.payment_date,p.month,p.status,p.notes FROM payments p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.payment_date DESC",
+            "Attendance": "SELECT a.id,s.full_name,a.class_date,a.status,a.notes,t.full_name AS teacher FROM attendance a LEFT JOIN students s ON s.id=a.student_id LEFT JOIN teachers t ON t.id=a.teacher_id ORDER BY a.class_date DESC",
+            "Progress": "SELECT p.id,s.full_name,p.course,p.level,p.lesson,p.score,p.entry_date,p.notes FROM progress p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.entry_date DESC"
+        }
+        report_job = {"running": False}
+        def fetch_report_async(report, on_rows):
+            if report_job["running"]:
+                messagebox.showinfo("Report in progress", "Please wait for the current report to finish.", parent=self.root)
+                return
+            report_job["running"] = True
+            report_status_var.set("Preparing report…")
+            def completed(rows):
+                report_job["running"] = False
+                try:
+                    report_status_var.set(f"Loaded {len(rows):,} records.")
+                except tk.TclError:
+                    pass
+                on_rows(rows)
+            def failed(error):
+                report_job["running"] = False
+                try:
+                    report_status_var.set("Report could not be prepared.")
+                except tk.TclError:
+                    pass
+                messagebox.showerror("Report error", str(error), parent=self.root)
+            AsyncWorker.run(self.root, _fetch_report_rows_worker,
+                            (self.db.path, report_queries[report]),
+                            callback=completed, error_callback=failed)
+        def export():
+            selected_label = choice.get()
+            report = selected_label if selected_label in choices else next((k for k, v in choice_labels.items() if v == selected_label), choices[0])
+            path = filedialog.asksaveasfilename(defaultextension=".csv", initialfile=report.lower()+"_report.csv", filetypes=[("CSV files","*.csv")])
+            if not path: return
+            language = report_language.get()
+            def write_csv_rows(rows):
+                with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                    writer = csv.writer(f)
+                    if rows:
+                        headers = list(rows[0].keys())
+                        if language == "ur":
+                            header_ur = {"id":"شناختی نمبر", "full_name":"پورا نام", "guardian_name":"سرپرست", "phone":"فون",
+                                "course":"کورس", "level":"درجہ", "class_time":"کلاس کا وقت", "monthly_fee":"ماہانہ فیس",
+                                "currency":"کرنسی", "status":"حالت", "admission_date":"داخلے کی تاریخ", "email":"ای میل",
+                                "qualification":"قابلیت", "experience":"تجربہ", "availability":"دستیابی", "amount":"رقم",
+                                "payment_date":"ادائیگی کی تاریخ", "month":"مہینہ", "notes":"نوٹس", "class_date":"کلاس کی تاریخ",
+                                "teacher":"استاد", "entry_date":"اندراج کی تاریخ", "lesson":"سبق", "score":"نمبر"}
+                            writer.writerow([header_ur.get(h, h) for h in headers])
+                        else:
+                            writer.writerow(headers)
+                        for row in rows:
+                            writer.writerow([_report_value_for_language(h, row.get(h), language) for h in headers])
+                    else:
+                        writer.writerow(["No records"])
+                messagebox.showinfo("Export complete", f"CSV report saved:\n{path}", parent=self.root)
+            fetch_report_async(report, write_csv_rows)
+        report_size_var = tk.IntVar(value=11)
+        size_row = ttk.Frame(parent)
+        size_row.pack(fill="x", pady=(6, 2))
+        smart_label(ttk.Label, size_row, text="Report text size / رپورٹ کے متن کا سائز").pack(side="left", padx=(0, 8))
+        ttk.Spinbox(size_row, from_=8, to=20, increment=1, textvariable=report_size_var, width=5).pack(side="left")
+
+        def export_formatted_report():
+            import html
+            selected_label = choice.get()
+            report = selected_label if selected_label in choices else next((k for k, v in choice_labels.items() if v == selected_label), choices[0])
+            language = report_language.get()
+            def build_formatted_report(rows):
+                if not rows:
+                    messagebox.showinfo("No records", "No records are available for this report.", parent=self.root)
+                    return
+                header_ur = {"id":"شناختی نمبر", "full_name":"پورا نام", "guardian_name":"سرپرست", "phone":"فون",
+                    "course":"کورس", "level":"درجہ", "class_time":"کلاس کا وقت", "monthly_fee":"ماہانہ فیس",
+                    "currency":"کرنسی", "status":"حالت", "admission_date":"داخلے کی تاریخ", "email":"ای میل",
+                    "qualification":"قابلیت", "experience":"تجربہ", "availability":"دستیابی", "amount":"رقم",
+                    "payment_date":"ادائیگی کی تاریخ", "month":"مہینہ", "notes":"نوٹس", "class_date":"کلاس کی تاریخ",
+                    "teacher":"استاد", "entry_date":"اندراج کی تاریخ", "lesson":"سبق", "score":"نمبر"}
+                headers = list(rows[0].keys())
+                visible_headers = [header_ur.get(h, h) for h in headers] if language == "ur" else headers
+                title = ({"Students":"طلبہ کی رپورٹ", "Teachers":"اساتذہ کی رپورٹ", "Payments":"ادائیگیوں کی رپورٹ",
+                          "Attendance":"حاضری کی رپورٹ", "Progress":"تعلیمی کارکردگی کی رپورٹ"}.get(report, "رپورٹ")
+                         if language == "ur" else f"{report} Report")
+                institution = self.brand_name if language == "en" else (self.brand_name_ur or "ادارے کا نام")
+                direction = "rtl" if language == "ur" else "ltr"
+                font_family = "'Jameel Noori Nastaleeq', 'Urdu Typesetting', serif" if language == "ur" else "Aptos, Arial, sans-serif"
+                try:
+                    font_size = max(8, min(20, int(report_size_var.get())))
+                except (TypeError, ValueError):
+                    font_size = 12
+                header_html = "".join(f"<th>{html.escape(str(h))}</th>" for h in visible_headers)
+                body_html = []
+                for row in rows:
+                    cells = "".join(
+                        f"<td>{html.escape(str(_report_value_for_language(field, value, language) or ''))}</td>"
+                        for field, value in zip(headers, [row.get(field) for field in headers])
+                    )
+                    body_html.append(f"<tr>{cells}</tr>")
+                logo_markup = ""
+                if self.logo_path and os.path.isfile(self.logo_path) and Image is not None:
+                    try:
+                        from PIL import Image as _ReportImage
+                        with _ReportImage.open(self.logo_path) as _im:
+                            _buf = io.BytesIO()
+                            _im.convert("RGBA").save(_buf, format="PNG")
+                        _logo64 = base64.b64encode(_buf.getvalue()).decode("ascii")
+                        logo_markup = f'<img class="institution-logo" src="data:image/png;base64,{_logo64}" alt="Institution logo">'
+                    except Exception:
+                        logo_markup = ""
+                brand_block = f'<div class="brand">{logo_markup}<div><h1>{html.escape(institution)}</h1><div class="subtitle">{html.escape(title)} • {datetime.now().strftime("%Y-%m-%d %H:%M")}</div></div></div>'
+                document = f"""<!doctype html><html lang="{language}" dir="{direction}"><head><meta charset="utf-8">
+    <title>{html.escape(title)}</title><style>
+    @page {{ size: landscape; margin: 14mm; }}
+    body {{ font-family:{font_family}; font-size:{font_size}pt; color:#173D32; margin:22px; direction:{direction}; }}
+    .brand {{ display:flex; align-items:center; gap:18px; border-bottom:3px solid #0F7457; padding-bottom:10px; margin-bottom:18px; }}
+    .institution-logo {{ width:72px; height:72px; object-fit:contain; border-radius:12px; }}
+    h1 {{ color:#0F7457; font-size:{font_size+7}pt; margin:0 0 4px 0; }}
+    .subtitle {{ color:#63766F; margin-bottom:0; }}
+    table {{ border-collapse:collapse; width:100%; table-layout:auto; }}
+    th {{ background:#0F7457; color:white; text-align:start; }}
+    th,td {{ border:1px solid #DCE8E2; padding:7px 9px; vertical-align:top; overflow-wrap:anywhere; }}
+    tr:nth-child(even) td {{ background:#EAF4F0; }}
+    @media print {{ body {{ margin:0; }} .brand {{ break-inside:avoid; }} }}
+    </style></head><body>{brand_block}
+    <table><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_html)}</tbody></table>
+    <script>window.addEventListener('load',()=>{{}});</script></body></html>"""
+                path = filedialog.asksaveasfilename(parent=self.root, title="Save formatted report", defaultextension=".html",
+                    initialfile=f"{report.lower()}_report_{language}.html", filetypes=[("Formatted offline report", "*.html")])
+                if not path:
+                    return
+                with open(path, "w", encoding="utf-8") as report_file:
+                    report_file.write(document)
+                try:
+                    webbrowser.open("file:///" + quote(os.path.abspath(path).replace(os.sep, "/"), safe="/:"))
+                except Exception:
+                    pass
+                messagebox.showinfo("Export complete", "Formatted report saved. Open it in your browser and use Print / Save as PDF.", parent=self.root)
+            fetch_report_async(report, build_formatted_report)
+
+        report_actions = ttk.Frame(parent)
+        report_actions.pack(anchor="w", pady=10)
+        ttk.Button(report_actions, text="📄 Export CSV / CSV برآمد کریں", style="Accent.TButton", command=export).pack(side="left", padx=(0, 8))
+        ttk.Button(report_actions, text="🧾 Export formatted report / فارمیٹڈ رپورٹ", command=export_formatted_report).pack(side="left")
+
+        backup_box = ttk.LabelFrame(parent, text="Database Safety / ڈیٹا بیس کی حفاظت", padding=14)
+        backup_box.pack(fill="x", pady=(4, 10))
+        smart_label(ttk.Label, backup_box, text="Create a consistent SQLite backup or export all tables to a JSON file. Backup and export do not change the active database. Restore replaces it (a safety copy is saved first).", style="Sub.TLabel", wraplength=900).pack(anchor="w", pady=(0, 8))
+        actions = ttk.Frame(backup_box)
+        actions.pack(anchor="w")
+        ttk.Button(actions, text="🛡️ Download SQLite Backup", command=self.export_sqlite_backup).pack(side="left", padx=(0, 8))
+        ttk.Button(actions, text="🗂️ Export JSON Backup", command=self.export_json_backup).pack(side="left", padx=8)
+        ttk.Button(actions, text="♻️ Restore from Backup…", command=self.restore_backup).pack(side="left", padx=8)
+        self._auto_backup_box(parent)
+        smart_label(ttk.Label, parent, text="Keep a backup on a separate drive before Windows reinstallation or major upgrades. / ونڈوز دوبارہ انسٹال کرنے سے پہلے الگ ڈرائیو پر بیک اپ رکھیں۔", style="Sub.TLabel", wraplength=900).pack(anchor="w", pady=8)
+
+    def _save_setting(self, key, value):
+        self.db.conn.execute(
+            "INSERT INTO app_settings(setting_key,setting_value) VALUES(?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+            (key, str(value)))
+        self.db.conn.commit()
+        self.settings[key] = str(value)
+
+    def make_verified_backup(self, target_path):
+        """Write a consistent copy of the live database to target_path and verify it. Raises on any problem."""
+        tmp = target_path + ".part"
+        dest = None
+        try:
+            dest = sqlite3.connect(tmp)
+            with dest:
+                self.db.conn.backup(dest)
+            check = dest.execute("PRAGMA integrity_check").fetchone()[0]
+            dest.close()
+            dest = None
+            if check != "ok":
+                raise sqlite3.DatabaseError(f"Backup integrity check failed: {check}")
+            os.replace(tmp, target_path)
+        except Exception:
+            if dest is not None:
+                try:
+                    dest.close()
+                except Exception:
+                    pass
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def _make_verified_backup_from_path(self, target_path):
+        """Make a consistent, verified SQLite copy using a worker-local connection."""
+        tmp = target_path + ".part"
+        source = destination = None
+        try:
+            source = sqlite3.connect(self.db.path, timeout=20.0)
+            destination = sqlite3.connect(tmp, timeout=20.0)
+            source.backup(destination, pages=256, sleep=0.05)
+            check = destination.execute("PRAGMA integrity_check").fetchone()[0]
+            destination.close(); destination = None
+            source.close(); source = None
+            if check != "ok":
+                raise sqlite3.DatabaseError(f"Backup integrity check failed: {check}")
+            os.replace(tmp, target_path)
+        except Exception:
+            for conn in (destination, source):
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+    def run_auto_backup_async(self, callback=None):
+        """Run the verified second-folder backup outside Tk's UI thread."""
+        if getattr(self, "_auto_backup_running", False):
+            return False, "A backup is already in progress."
+        folder = self.settings.get("backup_primary_folder", _default_backup_dir()).strip() or _default_backup_dir()
+        keep_count = self.settings.get("backup_keep", "30")
+        result_queue = queue.Queue(maxsize=1)
+        self._auto_backup_result_queue = result_queue
+        self._auto_backup_running = True
+
+        def worker():
+            try:
+                primary = self.settings.get("backup_primary_folder", _default_backup_dir()).strip() or _default_backup_dir()
+                os.makedirs(primary, exist_ok=True)
+                target = os.path.join(primary, "taha_auto_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite3")
+                self._make_verified_backup_from_path(target)
+                prune_backups(primary, keep_count, "taha_auto_", ".sqlite3")
+                sec = self.settings.get("backup_second_folder", "").strip()
+                if sec and os.path.isdir(sec):
+                    try:
+                        sec_target = os.path.join(sec, "taha_auto_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite3")
+                        self._make_verified_backup_from_path(sec_target)
+                        prune_backups(sec, keep_count, "taha_auto_", ".sqlite3")
+                    except Exception:
+                        pass
+                result_queue.put((True, target))
+            except Exception as exc:
+                result_queue.put((False, str(exc)))
+
+        self._auto_backup_thread = threading.Thread(target=worker, name="TahaVerifiedBackup", daemon=True)
+        self._auto_backup_thread.start()
+
+        def poll_result():
+            try:
+                if not self.root.winfo_exists():
+                    return
+                try:
+                    ok, result = result_queue.get_nowait()
+                except queue.Empty:
+                    self.root.after(150, poll_result)
+                    return
+                self._auto_backup_running = False
+                if ok:
+                    self._save_setting("backup_last_auto", timestamp())
+                if callback:
+                    callback(ok, result)
+            except tk.TclError:
+                return
+
+        self.root.after(150, poll_result)
+        return True, "Backup started."
+
+    def run_auto_backup(self):
+        """Back up to the dedicated persistent folder and optional second folder, trim old copies. Returns (ok, file_or_error_message)."""
+        folder = self.settings.get("backup_primary_folder", _default_backup_dir()).strip() or _default_backup_dir()
+        try:
+            os.makedirs(folder, exist_ok=True)
+            target = os.path.join(folder, "taha_auto_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite3")
+            self.make_verified_backup(target)
+            prune_backups(folder, self.settings.get("backup_keep", "30"), "taha_auto_", ".sqlite3")
+            sec = self.settings.get("backup_second_folder", "").strip()
+            if sec and os.path.isdir(sec):
+                try:
+                    sec_target = os.path.join(sec, "taha_auto_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite3")
+                    self.make_verified_backup(sec_target)
+                    prune_backups(sec, self.settings.get("backup_keep", "30"), "taha_auto_", ".sqlite3")
+                except Exception:
+                    pass
+            self._save_setting("backup_last_auto", timestamp())
+            return True, target
+        except Exception as exc:
+            return False, str(exc)
+
+    def _hours_since_auto_backup(self):
+        last = self.settings.get("backup_last_auto", "")
+        try:
+            return (datetime.now() - datetime.strptime(last, "%Y-%m-%d %H:%M:%S")).total_seconds() / 3600.0
+        except ValueError:
+            return 10 ** 6
+
+    def start_backup_tasks(self):
+        """Prune old local copies and run due secondary backup without freezing the UI."""
+        try:
+            folder = os.path.join(os.path.dirname(os.path.abspath(self.db.path)), "backups")
+            prune_backups(folder, self.settings.get("backup_keep", "30"), os.path.basename(self.db.path) + ".", ".bak")
+        except Exception:
+            pass
+        if self.settings.get("backup_second_folder", "").strip() and self._hours_since_auto_backup() >= 12:
+            started, detail = self.run_auto_backup_async(
+                callback=lambda ok, result: None if ok else messagebox.showwarning(
+                    "Automatic backup / خودکار بیک اپ",
+                    f"Could not back up to the second folder:\n{result}\n\nCheck that the drive or folder is connected.",
+                    parent=self.root))
+            if not started:
+                self.root.after(2500, lambda msg=detail: messagebox.showwarning(
+                    "Automatic backup / خودکار بیک اپ", msg, parent=self.root))
+
+    def auto_backup_on_exit(self):
+        """Finish a backup already in progress before closing, otherwise keep the existing exit rule."""
+        if getattr(self, "_auto_backup_running", False):
+            thread = getattr(self, "_auto_backup_thread", None)
+            if thread is not None and thread.is_alive():
+                # Exiting may wait for the disk operation; routine use/navigation never does.
+                thread.join()
+            result_queue = getattr(self, "_auto_backup_result_queue", None)
+            if result_queue is not None:
+                try:
+                    ok, _message = result_queue.get_nowait()
+                except queue.Empty:
+                    ok = False
+                self._auto_backup_running = False
+                if ok:
+                    self._save_setting("backup_last_auto", timestamp())
+            return
+        if self.settings.get("backup_second_folder", "").strip() and self._hours_since_auto_backup() >= 4:
+            self.run_auto_backup()
+
+    def restore_backup(self):
+        """Replace the live database with a chosen backup (verified first, with a safety copy of current data)."""
+        from pathlib import Path
+        path = filedialog.askopenfilename(
+            parent=self.root, title="Choose a backup to restore / بحال کرنے کے لیے بیک اپ چنیں",
+            filetypes=[("Database backups", "*.sqlite3 *.db *.bak"), ("All files", "*.*")])
+        if not path:
+            return
+        if os.path.abspath(path) == os.path.abspath(self.db.path):
+            messagebox.showerror("Restore", "That is the active database itself. Choose a backup file.", parent=self.root)
+            return
+        src = None
+        try:
+            src = sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True)
+            check = src.execute("PRAGMA integrity_check").fetchone()[0]
+            if check != "ok":
+                raise ValueError(f"This backup file is damaged ({check}).")
+            tables = {r[0] for r in src.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            missing = sorted({"students", "teachers", "users", "payments", "attendance"} - tables)
+            if missing:
+                raise ValueError("This does not look like a school backup. Missing tables: " + ", ".join(missing))
+            def count(conn, table):
+                return conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+            def summary(conn):
+                return f"Students {count(conn, 'students')}, Teachers {count(conn, 'teachers')}, Payments {count(conn, 'payments')}"
+            question = (f"The backup file contains:\n   {summary(src)}\n\nYour current data contains:\n   {summary(self.db.conn)}\n\n"
+                        "Restoring REPLACES all current data and user accounts with the backup.\n"
+                        "A safety copy of your current data is saved first. The program then closes so you can open it again.\n\nContinue?")
+            if not messagebox.askyesno("Restore backup / بیک اپ بحال کریں", question, icon="warning", default="no", parent=self.root):
+                return
+            safety_dir = os.path.join(os.path.dirname(os.path.abspath(self.db.path)), "backups")
+            os.makedirs(safety_dir, exist_ok=True)
+            safety = os.path.join(safety_dir, "before_restore_" + datetime.now().strftime("%Y%m%d_%H%M%S") + ".sqlite3")
+            self.make_verified_backup(safety)
+            self.db.conn.commit()
+            src.backup(self.db.conn)
+            self.db.conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Restore failed / بحالی ناکام", f"{exc}\n\nYour current data was not replaced.", parent=self.root)
+            return
+        finally:
+            if src is not None:
+                try:
+                    src.close()
+                except Exception:
+                    pass
+        messagebox.showinfo(
+            "Restore complete / بحالی مکمل",
+            f"The backup was restored.\nA safety copy of your previous data was saved:\n{safety}\n\n"
+            "The program will now close. Open it again and log in with the restored accounts.",
+            parent=self.root)
+        try:
+            self.db.close()
+        finally:
+            self.root.destroy()
+
+    def _local_backups_dir(self):
+        return os.path.join(os.path.dirname(os.path.abspath(self.db.path)), "backups")
+
+    def open_folder(self, path):
+        """Open a folder in Windows Explorer."""
+        path = (path or "").strip()
+        if not path or not os.path.isdir(path):
+            messagebox.showinfo("Folder not found", f"This folder does not exist yet or is not connected:\n{path or '(not set)'}", parent=self.root)
+            return
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(path)
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", path])
+        except Exception as exc:
+            messagebox.showerror("Cannot open folder", str(exc), parent=self.root)
+
+    def _auto_backup_box(self, parent):
+        box = ttk.LabelFrame(parent, text="Automatic Backup / خودکار بیک اپ", padding=14)
+        box.pack(fill="x", pady=(4, 10))
+        smart_label(ttk.Label, box,
+                    text="The program saves a verified backup to a second folder (a USB drive or another disk) when it starts (every 12 hours) and when it closes (every 4 hours). Old copies are removed automatically.",
+                    style="Sub.TLabel", wraplength=900).pack(anchor="w", pady=(0, 8))
+        folder_var = tk.StringVar(value=self.settings.get("backup_second_folder", ""))
+        keep_var = tk.StringVar(value=self.settings.get("backup_keep", "30"))
+        status_var = tk.StringVar()
+        def refresh_status():
+            last = self.settings.get("backup_last_auto", "")
+            status_var.set(f"Last automatic backup: {last}" if last else "No automatic backup has been made yet.")
+        row = ttk.Frame(box)
+        row.pack(fill="x", pady=4)
+        smart_label(ttk.Label, row, text="Second backup folder / دوسرا فولڈر").pack(side="left")
+        ttk.Entry(row, textvariable=folder_var, width=50, state="readonly").pack(side="left", padx=8)
+        def choose():
+            path = filedialog.askdirectory(parent=self.root, title="Choose second backup folder")
+            if path:
+                folder_var.set(path)
+                self._save_setting("backup_second_folder", path)
+                refresh_status()
+        def turn_off():
+            folder_var.set("")
+            self._save_setting("backup_second_folder", "")
+        ttk.Button(row, text="Choose…", command=choose).pack(side="left")
+        ttk.Button(row, text="Turn off", command=turn_off).pack(side="left", padx=6)
+        ttk.Button(row, text="📂 Open", command=lambda: self.open_folder(self.settings.get("backup_second_folder", ""))).pack(side="left")
+        row_local = ttk.Frame(box)
+        row_local.pack(fill="x", pady=4)
+        smart_label(ttk.Label, row_local, text="Start-up backups folder / مقامی بیک اپ فولڈر").pack(side="left")
+        ttk.Label(row_local, text=self._local_backups_dir()).pack(side="left", padx=8)
+        ttk.Button(row_local, text="📂 Open", command=lambda: self.open_folder(self._local_backups_dir())).pack(side="left")
+        row2 = ttk.Frame(box)
+        row2.pack(fill="x", pady=4)
+        smart_label(ttk.Label, row2, text="Keep newest backups / کتنے بیک اپ رکھیں").pack(side="left")
+        spin = ttk.Spinbox(row2, from_=5, to=365, textvariable=keep_var, width=6)
+        spin.pack(side="left", padx=8)
+        def save_keep(_event=None):
+            try:
+                n = max(5, min(365, int(keep_var.get())))
+            except ValueError:
+                n = 30
+            keep_var.set(str(n))
+            self._save_setting("backup_keep", n)
+        spin.bind("<FocusOut>", save_keep)
+        spin.bind("<Return>", save_keep)
+        def back_up_now():
+            save_keep()
+            def finished(ok, msg):
+                if ok:
+                    messagebox.showinfo("Backup complete / بیک اپ مکمل", f"Backup saved and verified:\n{msg}", parent=self.root)
+                else:
+                    messagebox.showerror("Backup error / بیک اپ میں خرابی", msg, parent=self.root)
+                refresh_status()
+            started, msg = self.run_auto_backup_async(finished)
+            if not started:
+                messagebox.showerror("Backup error / بیک اپ میں خرابی", msg, parent=self.root)
+            else:
+                status_var.set("Backup running in background… / بیک اپ پس منظر میں جاری ہے…")
+        ttk.Button(row2, text="Back up now / ابھی بیک اپ", style="Accent.TButton", command=back_up_now).pack(side="left", padx=12)
+        ttk.Label(box, textvariable=status_var, style="Sub.TLabel").pack(anchor="w", pady=(6, 0))
+        refresh_status()
+
+    def export_sqlite_backup(self):
+        """Export a transactionally consistent SQLite copy without changing the active DB."""
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Save SQLite Backup / ڈیٹا بیس بیک اپ محفوظ کریں",
+            defaultextension=".sqlite3",
+            initialfile=f"school_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sqlite3",
+            filetypes=[("SQLite database", "*.sqlite3 *.db"), ("All files", "*.*")])
+        if not path:
+            return
+        dest = None
+        try:
+            dest = sqlite3.connect(path)
+            with dest:
+                self.db.conn.backup(dest)
+            check = dest.execute("PRAGMA integrity_check").fetchone()[0]
+            if check != "ok":
+                raise sqlite3.DatabaseError(f"Backup integrity check failed: {check}")
+            messagebox.showinfo("Backup Complete / بیک اپ مکمل", f"Backup saved and verified:\n{path}", parent=self.root)
+        except Exception as exc:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except OSError:
+                pass
+            messagebox.showerror("Backup Error / بیک اپ میں خرابی", str(exc), parent=self.root)
+        finally:
+            if dest is not None:
+                dest.close()
+
+    def export_json_backup(self):
+        """Export every SQLite table as JSON; this is an export, not a restorable SQLite file."""
+        import json
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Export JSON Backup / JSON بیک اپ",
+            defaultextension=".json",
+            initialfile=f"school_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            tables = [r[0] for r in self.db.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+            payload = {"format": "school-management-json-v1", "exported_at": timestamp(), "tables": {}}
+            for table in tables:
+                # Table names originate from sqlite_master, and are quoted for safe identifier handling.
+                quoted = '"' + table.replace('"', '""') + '"'
+                rows = self.db.conn.execute(f"SELECT * FROM {quoted}").fetchall()
+                payload["tables"][table] = [dict(row) for row in rows]
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+            messagebox.showinfo("Export Complete / برآمد مکمل", f"JSON data export saved:\n{path}", parent=self.root)
+        except Exception as exc:
+            messagebox.showerror("Export Error / برآمد میں خرابی", str(exc), parent=self.root)
+
+
+
+def _default_backup_dir():
+    """Default dedicated persistent backup folder outside app install dir."""
+    sys_drive = os.environ.get("SystemDrive", "C:")
+    target = os.path.join(sys_drive + os.sep, "InstituteLedgerBackups")
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError:
+        pass
+    return target
+
+def _database_selection_config_path():
+    """Store the selected database location outside the installation directory."""
+    root_dir = os.environ.get("APPDATA") or os.path.expanduser("~")
+    folder = os.path.join(root_dir, "Institute Ledger")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, "database_path.json")
+
+
+def _load_saved_database_path():
+    try:
+        with open(_database_selection_config_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        path = data.get("database_path", "") if isinstance(data, dict) else ""
+        if isinstance(path, str) and path:
+            return os.path.abspath(path)
+    except (OSError, ValueError, TypeError):
+        pass
+    return None
+
+
+def _save_database_path(path):
+    """Atomically remember a database choice; never copies or changes the DB."""
+    if not path:
+        return
+    try:
+        config_path = _database_selection_config_path()
+        temp_path = config_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump({"database_path": os.path.abspath(path)}, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, config_path)
+    except OSError:
+        pass
+
+
+def _validate_existing_database(path):
+    """Read-only validation before an existing DB is opened or migrated."""
+    if not os.path.isfile(path) or os.path.getsize(path) == 0:
+        raise sqlite3.DatabaseError("The selected database file does not exist or is empty.")
+    uri = "file:" + quote(os.path.abspath(path).replace("\\", "/"), safe="/:") + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=4.0)
+    try:
+        check = conn.execute("PRAGMA integrity_check").fetchone()
+        if not check or str(check[0]).lower() != "ok":
+            raise sqlite3.DatabaseError("SQLite integrity check failed.")
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
+        known = {"users", "students", "teachers", "attendance", "payments", "fees", "progress", "teacher_students", "app_settings", "class_sessions", "weekly_class_schedule"}
+        if not tables or not (tables & known):
+            raise sqlite3.DatabaseError("This file does not look like an Institute Ledger database.")
+        if "users" in tables:
+            cols = {r[1] for r in conn.execute('PRAGMA table_info("users")')}
+            if not {"username", "password_hash", "role"}.issubset(cols):
+                raise sqlite3.DatabaseError("The database has an incompatible users table.")
+    finally:
+        conn.close()
+    return True
+
+
+def _database_has_business_records(path):
+    """Check whether a no-admin database contains records that must not be reset."""
+    try:
+        uri = "file:" + quote(os.path.abspath(path).replace("\\", "/"), safe="/:") + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=3.0)
+        try:
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            for table in ("students", "teachers", "attendance", "payments", "fees", "progress", "class_sessions", "weekly_class_schedule"):
+                if table in tables and conn.execute(f'SELECT EXISTS(SELECT 1 FROM "{table}" LIMIT 1)').fetchone()[0]:
+                    return True
+            return False
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return True
+
+
+def choose_initial_data_mode(root, saved_hint=""):
+    """Clear first-launch choice: start a new institute or open an existing database."""
+    result = {"choice": None}
+    win = tk.Toplevel(root)
+    win.title("Welcome to Institute Ledger / خوش آمدید")
+    win.transient(root)
+    win.resizable(False, False)
+    win.configure(bg="#F3F6F5")
+    win.grab_set()
+    frame = tk.Frame(win, bg="#F3F6F5", padx=26, pady=22)
+    frame.pack(fill="both", expand=True)
+    tk.Label(frame, text="Welcome to Institute Ledger", bg="#F3F6F5", fg="#173D32",
+             font=("Aptos", 18, "bold")).pack(anchor="w")
+    tk.Label(frame, text="Choose how you want to begin. / آغاز کرنے کا طریقہ منتخب کریں۔",
+             bg="#F3F6F5", fg="#687872", font=("Aptos", 10)).pack(anchor="w", pady=(4, 16))
+    def pick(value):
+        result["choice"] = value
+        win.destroy()
+    new_box = tk.Frame(frame, bg="#FFFFFF", highlightbackground="#D9E3DF", highlightthickness=1, padx=14, pady=12)
+    new_box.pack(fill="x", pady=5)
+    tk.Label(new_box, text="NEW INSTITUTE  •  Create first Admin account",
+             bg="#FFFFFF", fg=GREEN, font=(UI_FONT, 11, "bold")).pack(anchor="w")
+    tk.Label(new_box, text="I am installing Institute Ledger for the first time. Choose a new data folder and create the institute's first administrator login.",
+             bg="#FFFFFF", fg="#52635C", wraplength=500, justify="left", font=("Aptos", 9)).pack(anchor="w", pady=(5, 8))
+    tk.Button(new_box, text="Create a new institute / نیا ادارہ بنائیں", command=lambda: pick("new"),
+              bg=GREEN, fg=on_color(GREEN, "#FFFFFF", "#000000"), activebackground=GREEN_HOVER, activeforeground=on_color(GREEN_HOVER, "#FFFFFF", "#000000"),
+              relief="flat", bd=0, padx=14, pady=9, cursor="hand2", font=("Aptos", 10, "bold")).pack(anchor="w")
+    old_box = tk.Frame(frame, bg="#FFFFFF", highlightbackground="#D9E3DF", highlightthickness=1, padx=14, pady=12)
+    old_box.pack(fill="x", pady=5)
+    tk.Label(old_box, text="EXISTING INSTITUTE  •  Keep current accounts and data",
+             bg="#FFFFFF", fg="#173D32", font=("Aptos", 11, "bold")).pack(anchor="w")
+    tk.Label(old_box, text="I already have an Institute Ledger database or backup. Select it to continue with the existing Admin/Teacher accounts and records.",
+             bg="#FFFFFF", fg="#52635C", wraplength=500, justify="left", font=("Aptos", 9)).pack(anchor="w", pady=(5, 8))
+    tk.Button(old_box, text="Open existing database / پرانی ڈیٹابیس کھولیں", command=lambda: pick("existing"),
+              bg="#E8F4EE", fg="#173D32", activebackground="#D6E9E0", relief="flat", bd=0,
+              padx=14, pady=9, cursor="hand2", font=("Aptos", 10, "bold")).pack(anchor="w")
+    if saved_hint:
+        tk.Label(frame, text=saved_hint, bg="#F3F6F5", fg="#687872", wraplength=520,
+                 justify="left", font=("Aptos", 8)).pack(anchor="w", pady=(8, 0))
+    tk.Button(frame, text="Cancel / منسوخ", command=win.destroy, bg="#E6ECE9", fg="#35463F",
+              relief="flat", bd=0, padx=12, pady=7, cursor="hand2").pack(anchor="e", pady=(12, 0))
+    win.update_idletasks()
+    x = max(0, (win.winfo_screenwidth() - win.winfo_reqwidth()) // 2)
+    y = max(0, (win.winfo_screenheight() - win.winfo_reqheight()) // 2)
+    win.geometry(f"+{x}+{y}")
+    win.wait_window()
+    return result["choice"]
+
+
+def choose_database(root, force_prompt=False):
+    """Choose an existing database explicitly, or create one only after explicit consent.
+
+    The first post-install launch forces an explicit data choice so a stale per-user
+    database_path.json cannot silently open a prior test database.
+    """
+    saved_path = _load_saved_database_path()
+    if saved_path and os.path.isfile(saved_path) and not force_prompt:
+        try:
+            _validate_existing_database(saved_path)
+            return saved_path
+        except Exception as exc:
+            messagebox.showwarning(
+                "Saved database needs attention / محفوظ ڈیٹابیس کی جانچ ضروری ہے",
+                f"The previously selected database could not be verified, so it will not be opened or replaced automatically.\\n\\n{saved_path}\\n\\n{exc}\\n\\nChoose the original data file or backup, or select a new data folder only if you really want a new empty database.", parent=root)
+    elif saved_path and not os.path.exists(saved_path):
+        messagebox.showwarning(
+            "Database not found / ڈیٹابیس نہیں ملی",
+            f"The previously used database is not at its saved location:\\n\\n{saved_path}\\n\\nThis can happen after Windows is reinstalled or a drive letter changes. Choose your original database/backup. A new empty database will not be created automatically.", parent=root)
+
+    # Retain compatibility with the legacy database locations, but never silently
+    # prefer the project/install directory when a user has a saved data path.
+    candidates = []
+    if not force_prompt:
+        for candidate in (DEFAULT_DB, PROJECT_DB):
+            candidate = os.path.abspath(candidate)
+            if os.path.isfile(candidate) and not any(os.path.normcase(candidate) == os.path.normcase(x) for x in candidates):
+                try:
+                    _validate_existing_database(candidate)
+                    candidates.append(candidate)
+                except Exception:
+                    continue
+    saved_hint = f"\n\nPreviously saved data path (not opened automatically):\n{saved_path}" if force_prompt and saved_path else ""
+    data_mode = choose_initial_data_mode(
+        root,
+        "A previous data location is recorded, but it will not be opened automatically: " + saved_path if force_prompt and saved_path else "")
+    if data_mode is None:
+        return None
+    existing = data_mode == "existing"
+    if existing:
+        initialdir = os.path.dirname(saved_path) if saved_path and os.path.isdir(os.path.dirname(saved_path)) else os.path.expanduser("~")
+        initialfile = os.path.basename(saved_path) if saved_path and os.path.isfile(saved_path) else ""
+        selected = filedialog.askopenfilename(
+            parent=root, title="Choose existing Institute Ledger database / پرانی ڈیٹابیس منتخب کریں",
+            initialdir=initialdir, initialfile=initialfile,
+            filetypes=[("SQLite database and backups", "*.db *.sqlite *.sqlite3 *.bak"), ("All files", "*.*")])
+        if not selected:
+            return None
+        selected = os.path.abspath(selected)
+        try:
+            _validate_existing_database(selected)
+        except Exception as exc:
+            messagebox.showerror("Database not verified / ڈیٹابیس کی تصدیق نہیں ہوئی",
+                                 f"No changes were made. Choose another file or a valid backup.\n\n{exc}", parent=root)
+            return None
+        if selected.lower().endswith((".bak", ".sqlite3", ".sqlite")):
+            target_folder = filedialog.askdirectory(parent=root, title="Choose permanent data folder for restored copy / بحال شدہ ڈیٹا کے لیے مستقل فولڈر منتخب کریں", mustexist=False)
+            if not target_folder:
+                return None
+            target_folder = os.path.abspath(target_folder)
+            os.makedirs(target_folder, exist_ok=True)
+            target_path = os.path.join(target_folder, "institute_ledger.db")
+            if os.path.exists(target_path):
+                messagebox.showerror("Target already exists / منزل پر ڈیٹا بیس موجود ہے",
+                                     f"The existing file will not be overwritten. Choose another empty data folder.\n\n{target_path}", parent=root)
+                return None
+            source = destination = None
+            try:
+                source_uri = "file:" + quote(selected.replace("\\", "/"), safe="/:") + "?mode=ro"
+                source = sqlite3.connect(source_uri, uri=True, timeout=10.0)
+                destination = sqlite3.connect(target_path, timeout=10.0)
+                source.backup(destination)
+                integrity = destination.execute("PRAGMA integrity_check").fetchone()[0]
+                if str(integrity).lower() != "ok":
+                    raise sqlite3.DatabaseError("Restored copy did not pass SQLite integrity_check.")
+                destination.close(); destination = None
+                source.close(); source = None
+                _validate_existing_database(target_path)
+                selected = target_path
+            except Exception as exc:
+                for connection in (destination, source):
+                    if connection is not None:
+                        try: connection.close()
+                        except Exception: pass
+                try:
+                    if os.path.exists(target_path): os.remove(target_path)
+                except OSError: pass
+                messagebox.showerror("Restore copy failed / بحالی ناکام",
+                                     f"The source backup was left unchanged.\n\n{exc}", parent=root)
+                return None
+        _save_database_path(selected)
+        return selected
+
+    folder = filedialog.askdirectory(parent=root, title="Choose permanent data folder / مستقل ڈیٹا فولڈر منتخب کریں", mustexist=False)
+    if not folder:
+        return None
+    folder = os.path.abspath(folder)
+    os.makedirs(folder, exist_ok=True)
+    preferred = os.path.join(folder, "institute_ledger.db")
+    if os.path.exists(preferred):
+        messagebox.showerror(
+            "Choose an empty data folder / خالی ڈیٹا فولڈر منتخب کریں",
+            "You chose Create a new institute, but this folder already contains an Institute Ledger database. It has NOT been opened, overwritten or changed.\n\nChoose a different empty folder for the new institute. If you want to keep using this existing database, cancel and choose Open existing database instead.\n\nآپ نے نیا ادارہ بنانے کا انتخاب کیا ہے، لیکن اس فولڈر میں پہلے سے ڈیٹابیس موجود ہے۔ اسے نہ کھولا گیا ہے، نہ تبدیل کیا گیا ہے۔ نئے ادارے کے لیے کوئی دوسرا خالی فولڈر منتخب کریں؛ پرانا ڈیٹا استعمال کرنا ہو تو واپس جا کر Open existing database منتخب کریں۔",
+            parent=root)
+        return None
+    # Never reuse a differently named database in a folder selected for a new institute.
+    found_files = []
+    try:
+        for name in os.listdir(folder):
+            if name.lower().endswith((".db", ".sqlite", ".sqlite3", ".bak")):
+                found_files.append(os.path.join(folder, name))
+    except OSError:
+        pass
+    if found_files:
+        messagebox.showerror(
+            "Folder is not empty / فولڈر خالی نہیں",
+            "A database file already exists in this folder. The Create a new institute option will not reuse an existing database. No file was changed. Choose another empty folder, or go back and use Open existing database.\n\nاس فولڈر میں پہلے سے ڈیٹابیس موجود ہے۔ نیا ادارہ بنانے کا اختیار کسی موجودہ ڈیٹابیس کو خودکار طور پر استعمال نہیں کرے گا۔ دوسرا خالی فولڈر منتخب کریں یا واپس جا کر پرانی ڈیٹابیس کھولیں۔",
+            parent=root)
+        return None
+    # In installer handoff, the explicit NO answer plus selecting a data folder
+    # is already the user's consent to create a new database; avoid asking twice.
+    if not force_prompt and not messagebox.askyesno("Create new database? / نئی ڈیٹابیس بنائیں؟",
+            f"Create a new, empty Institute Ledger database here?\n\n{preferred}\n\nOnly choose Yes if you do not need existing data.", parent=root, default="no"):
+        return None
+    _save_database_path(preferred)
+    return preferred
+
+def _prepare_hidden_tk_owner(root):
+    """Keep a mapped, invisible owner window so modal startup dialogs stay visible on Windows.
+
+    A withdrawn Tk root cannot reliably own a transient Toplevel on Windows:
+    the child can inherit the withdrawn state and remain invisible while the
+    Python console waits forever in wait_window(). Keep the 1x1 owner mapped,
+    borderless and transparent until the database picker has completed.
+    """
+    try:
+        root.overrideredirect(True)
+        root.geometry("1x1+0+0")
+        try:
+            root.attributes("-alpha", 0.0)
+        except tk.TclError:
+            # Some window managers do not support alpha. The 1x1 borderless
+            # owner still prevents the transient dialog from being withdrawn.
+            pass
+        root.deiconify()
+        root.update_idletasks()
+    except tk.TclError:
+        try:
+            root.geometry("1x1+0+0")
+            root.deiconify()
+        except tk.TclError:
+            pass
+
+
+def _restore_main_tk_window(root):
+    """Restore the regular decorated root before building the main interface."""
+    try:
+        root.attributes("-alpha", 1.0)
+    except tk.TclError:
+        pass
+    try:
+        root.overrideredirect(False)
+    except tk.TclError:
+        pass
+
+
+def main():
+    root = tk.Tk()
+    _prepare_hidden_tk_owner(root)
+    # Inno Setup installs this one-time marker beside the EXE. It makes the first
+    # post-install launch ask the user to choose existing data or a new institute
+    # database, even when an older database_path.json survives a reinstall.
+    app_folder = os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))
+    first_install_marker = os.path.join(app_folder, "first_install.flag")
+    force_first_install_choice = os.path.isfile(first_install_marker)
+    path = choose_database(root, force_prompt=force_first_install_choice)
+    if not path:
+        root.destroy()
+        return
+    # Only consume the marker after a valid database path was chosen. If the user
+    # cancels the picker, the next launch will present the choice again.
+    if force_first_install_choice:
+        try:
+            os.remove(first_install_marker)
+        except OSError:
+            pass
+        try:
+            completion_dir = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "Institute Ledger")
+            os.makedirs(completion_dir, exist_ok=True)
+            with open(os.path.join(completion_dir, "install_complete.flag"), "w", encoding="utf-8") as marker:
+                marker.write(datetime.now().isoformat(timespec="seconds"))
+        except OSError:
+            pass
+    existing_before_open = os.path.isfile(path) and os.path.getsize(path) > 0
+    if existing_before_open:
+        try:
+            _validate_existing_database(path)
+            probe_uri = "file:" + quote(os.path.abspath(path).replace("\\", "/"), safe="/:") + "?mode=ro"
+            probe = sqlite3.connect(probe_uri, uri=True, timeout=3.0)
+            try:
+                tables = {r[0] for r in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                has_admin = ("users" in tables and probe.execute("SELECT COUNT(*) FROM users WHERE lower(role)='admin'").fetchone()[0] > 0)
+            finally:
+                probe.close()
+            # No Admin means the app must enter first-admin setup. That screen also
+            # offers the user a safe way to select the original database; records are
+            # preserved and no account/password is reset automatically.
+        except Exception as e:
+            messagebox.showerror("Database verification failed / ڈیٹابیس کی تصدیق ناکام",
+                                 f"The selected database was not changed or opened.\n\n{e}", parent=root)
+            root.destroy()
+            return
+    try:
+        db = SchoolDB(path)
+        _save_database_path(path)
+    except Exception as e:
+        messagebox.showerror("Database error", f"Could not open or prepare the database:\n{e}", parent=root)
+        root.destroy()
+        return
+    _restore_main_tk_window(root)
+    root.deiconify()
+    app = SchoolApp(root, db)
+    app.start_backup_tasks()
+    # Keep the chosen installed UI family stable for the lifetime of this session.
+    # Start maximized on Windows while preserving the standard title-bar
+    # controls, including the user's ability to minimize the window.
+    def maximize_on_startup():
+        try:
+            root.state("zoomed")
+        except tk.TclError:
+            # Fallback for window managers that do not support the "zoomed" state.
+            root.attributes("-zoomed", True)
+    root.after_idle(maximize_on_startup)
+    if db.backup_path:
+        root.after(1200, lambda: messagebox.showinfo("Backup created", f"Before upgrading, a backup copy was created:\n{db.backup_path}"))
+    def on_close():
+        # Close all profile/dialog Toplevels owned by the main window first so
+        # no child window can outlive the database connection. Do not touch data
+        # records here; the existing safe exit-backup routine remains in place.
+        try:
+            for child in list(root.winfo_children()):
+                try:
+                    if isinstance(child, tk.Toplevel) and child.winfo_exists():
+                        child.destroy()
+                except tk.TclError:
+                    pass
+        except tk.TclError:
+            pass
+        try:
+            app.auto_backup_on_exit()
+        except Exception:
+            pass
+        try:
+            db.close()
+        finally:
+            root.destroy()
+    root.protocol("WM_DELETE_WINDOW", on_close)
+    root.mainloop()
+
+
+
+# ==========================================================================
+# MODERN UI KIT — integrated into the original application.
+# Shared reusable UI components; no database schema or business logic changes.
+# ========================================================================
+MODERN_ROUND_CARDS = True
+MODERN_ZEBRA_ROWS = True
+MODERN_TOASTS = True
+
+ACCENT_GOLD = "#D4A537"
+OK_FG, OK_BG = "#157347", "#E1F4E8"
+WARN_FG, WARN_BG = "#A15C07", "#FDF0D5"
+BAD_FG, BAD_BG = "#B42318", "#FCE8E6"
+INFO_FG, INFO_BG = "#1D5FA8", "#E2EEFA"
+NEUTRAL_FG, NEUTRAL_BG = "#55655F", "#EBF0EE"
+PALETTE_ACCENTS = ("#10765B", "#2F7F8F", "#C8962E", "#7A5AA6", "#C2553A", "#2D6CB5", "#5B8C3A", "#B5456B")
+
+
+def _rgb(color):
+    try:
+        value = str(color).strip()
+        if value.startswith("#"):
+            digits = value[1:]
+            if len(digits) == 3:
+                digits = "".join(ch * 2 for ch in digits)
+            if len(digits) == 6:
+                return tuple(int(digits[i:i + 2], 16) for i in (0, 2, 4))
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def mix(c1, c2, t):
+    """Blend two hex colors; preserve the first value if either is not hex."""
+    a, b = _rgb(c1), _rgb(c2)
+    if a is None or b is None:
+        return c1
+    t = max(0.0, min(1.0, float(t)))
+    return "#%02X%02X%02X" % tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def tint(color, amount=0.88):
+    return mix(color, "#FFFFFF", amount)
+
+
+def shade(color, amount=0.15):
+    return mix(color, "#000000", amount)
+
+
+def _rel_luminance(color):
+    rgb = _rgb(color)
+    if rgb is None:
+        return None
+    def lin(v):
+        v = v / 255.0
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = (lin(v) for v in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast_ratio(c1, c2):
+    """WCAG 2.x contrast ratio between two hex colors (1.0 .. 21.0)."""
+    l1, l2 = _rel_luminance(c1), _rel_luminance(c2)
+    if l1 is None or l2 is None:
+        return 1.0
+    hi, lo = (l1, l2) if l1 >= l2 else (l2, l1)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def on_color(color, light="#FFFFFF", dark="#12261F"):
+    """Readable text color for a background, chosen by real WCAG contrast."""
+    if _rgb(color) is None:
+        return light
+    return light if contrast_ratio(color, light) >= contrast_ratio(color, dark) else dark
+
+
+_ROW_TAG_KIND = {
+    "paid": "ok", "present": "ok", "active": None, "available": "ok", "ok": "ok",
+    "partial": "warn", "pending": "warn", "late": "warn", "warn": "warn",
+    "unpaid": "bad", "absent": "bad", "overdue": "bad", "booked": "bad", "unavailable": "bad", "bad": "bad",
+    "leave": "info", "current": "info", "info": "info", "off": None,
+}
+_ROW_TAG_BASE = {"ok": "#16A34A", "warn": "#F5B301", "bad": "#DC2626", "info": "#2563EB"}
+
+
+def plain_row_text():
+    """Data text in tables is always black on light cards (white on dark cards)."""
+    return "#FFFFFF" if on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF" else "#000000"
+
+
+def row_tag_opts(tag_name):
+    """Black text for every table row; the status is shown by a soft background tint instead."""
+    opts = {"foreground": plain_row_text()}
+    kind = _ROW_TAG_KIND.get(str(tag_name).replace("taha_", ""))
+    if kind:
+        dark = plain_row_text() == "#FFFFFF"
+        opts["background"] = mix(_ROW_TAG_BASE[kind], CARD_BG, 0.72 if dark else 0.86)
+    return opts
+
+
+def ui_size(value):
+    try:
+        scale = max(0.8, min(1.8, float(FONT_SCALE)))
+    except (TypeError, ValueError, NameError):
+        scale = 1.0
+    return max(8, int(round(value * scale)))
+
+
+def semantic_colors(kind):
+    return {"ok": (OK_FG, OK_BG), "warn": (WARN_FG, WARN_BG), "bad": (BAD_FG, BAD_BG),
+            "info": (INFO_FG, INFO_BG)}.get(kind, (NEUTRAL_FG, NEUTRAL_BG))
+
+
+def status_kind(text):
+    t = str(text or "").lower()
+    if not t.strip():
+        return "neutral"
+    if any(k in t for k in ("unpaid", "overdue", "absent", "inactive", "cancel", "missed", "void", "غیر", "منسوخ")):
+        return "bad"
+    if any(k in t for k in ("partial", "pending", "paused", "leave", "late", "not marked", "جزوی", "زیر", "چھٹی")):
+        return "warn"
+    if any(k in t for k in ("paid", "present", "active", "complete", "approved", "available", "ادا", "حاضر", "فعال", "مکمل")):
+        return "ok"
+    if any(k in t for k in ("scheduled", "extra", "make-up", "regular", "طے")):
+        return "info"
+    return "neutral"
+
+
+def initials_of(name):
+    parts = [p for p in re.split(r"\s+", str(name or "").strip()) if p]
+    if not parts:
+        return "?"
+    return parts[0][:1].upper() if len(parts) == 1 else (parts[0][:1] + parts[-1][:1]).upper()
+
+
+def accent_for(name):
+    return PALETTE_ACCENTS[sum(ord(ch) for ch in str(name or "?")) % len(PALETTE_ACCENTS)]
+
+
+def _widget_bg(widget, default=None):
+    default = default or APP_BG
+    for option in ("bg", "background"):
+        try:
+            value = widget.cget(option)
+            if value:
+                return str(value)
+        except (tk.TclError, AttributeError):
+            pass
+    try:
+        value = ttk.Style().lookup(str(widget.cget("style") or widget.winfo_class()), "background")
+        if value:
+            return str(value)
+    except (tk.TclError, AttributeError):
+        pass
+    return default
+
+
+def _rr_points(x1, y1, x2, y2, r):
+    return [x1+r,y1, x1+r,y1, x2-r,y1, x2-r,y1, x2,y1, x2,y1+r, x2,y1+r, x2,y2-r,
+            x2,y2-r, x2,y2, x2-r,y2, x2-r,y2, x1+r,y2, x1+r,y2, x1,y2, x1,y2-r,
+            x1,y2-r, x1,y1+r, x1,y1+r, x1,y1]
+
+
+def draw_round_rect(canvas, x1, y1, x2, y2, r, **kw):
+    r = max(1, min(int(r), int((x2-x1)//2), int((y2-y1)//2)))
+    return canvas.create_polygon(_rr_points(x1, y1, x2, y2, r), smooth=True, **kw)
+
+
+class RoundCard(tk.Frame):
+    """Reusable rounded card; put child widgets inside card.body."""
+    def __init__(self, parent, bg=None, border=None, radius=14, padx=16, pady=14, shadow=True,
+                 min_width=1, parent_bg=None):
+        self._outer = parent_bg or _widget_bg(parent)
+        self._fill = bg or CARD_BG
+        self._line = border or BORDER
+        self._line_now = self._line
+        self._radius, self._px, self._py, self._shadow = radius, padx, pady, shadow
+        self._click_cmd = None
+        super().__init__(parent, bg=self._outer, bd=0, highlightthickness=0)
+        if not MODERN_ROUND_CARDS:
+            self.configure(bg=self._fill, highlightbackground=self._line, highlightthickness=1)
+            self.body = tk.Frame(self, bg=self._fill, padx=padx, pady=pady)
+            self.body.pack(fill="both", expand=True)
+            self._cv = None
+            return
+        self._cv = tk.Canvas(self, bg=self._outer, highlightthickness=0, bd=0, width=max(1, int(min_width)), height=2)
+        self._cv.pack(fill="both", expand=True)
+        self.body = tk.Frame(self._cv, bg=self._fill, bd=0, highlightthickness=0)
+        self._win = self._cv.create_window(padx, pady, window=self.body, anchor="nw")
+        self._cv.bind("<Configure>", self._on_canvas)
+        self.body.bind("<Configure>", self._on_body)
+
+    def _on_body(self, _event=None):
+        try:
+            self._cv.configure(height=int(self.body.winfo_reqheight()) + 2*self._py + 4)
+        except (tk.TclError, ValueError, AttributeError):
+            pass
+
+    def _on_canvas(self, event):
+        try:
+            self._cv.itemconfigure(self._win, width=max(1, event.width - 2*self._px))
+            self._cv.configure(scrollregion=(0, 0, max(1, event.width), max(1, event.height)))
+            self._redraw(event.width, event.height)
+        except tk.TclError:
+            pass
+
+    def _redraw(self, w, h):
+        cv = self._cv
+        cv.delete("shape")
+        if w < 12 or h < 12:
+            return
+        if self._shadow:
+            draw_round_rect(cv, 2, 4, w-2, h-1, self._radius, fill=mix(self._outer, "#000000", .06), outline="", tags="shape")
+        draw_round_rect(cv, 1, 1, w-2, h-4, self._radius, fill=self._fill, outline=self._line_now, width=1, tags="shape")
+        cv.tag_lower("shape")
+
+    def set_border(self, color):
+        self._line_now = color
+        if self._cv is None:
+            self.configure(highlightbackground=color)
+        else:
+            try:
+                self._redraw(self._cv.winfo_width(), self._cv.winfo_height())
+            except tk.TclError:
+                pass
+
+    def make_clickable(self, command):
+        self._click_cmd = command
+        def enter(_e=None): self.set_border(GREEN)
+        def leave(_e=None): self.set_border(self._line)
+        def click(_e=None):
+            if callable(self._click_cmd): self._click_cmd()
+        def wire(widget):
+            try: kind = str(widget.winfo_class())
+            except tk.TclError: return
+            if kind in ("Button", "TButton", "Entry", "TEntry", "TCombobox", "Menubutton", "TMenubutton"):
+                return
+            widget.bind("<Button-1>", click, add="+")
+            widget.bind("<Enter>", enter, add="+")
+            widget.bind("<Leave>", leave, add="+")
+            try: widget.configure(cursor="hand2")
+            except tk.TclError: pass
+            for child in widget.winfo_children(): wire(child)
+        wire(self)
+        return self
+
+
+def make_pill(parent, text, fg, bg, size=9, padx=10, pady=3, outer_bg=None, bold=True):
+    text = _language_text(text)
+    outer = outer_bg or _widget_bg(parent)
+    base_font = (UI_FONT, size, "bold" if bold else "normal")
+    scaled = _font_for_localized_text(text, base_font) or base_font
+    try:
+        meter = tkfont.Font(font=scaled)
+        text_w, text_h = int(meter.measure(text)), int(meter.metrics("linespace"))
+    except (tk.TclError, TypeError, ValueError):
+        text_w, text_h = max(20, len(text)*7), 18
+    width, height = text_w + 2*padx, text_h + 2*pady
+    canvas = tk.Canvas(parent, width=width, height=height, bg=outer, highlightthickness=0, bd=0)
+    draw_round_rect(canvas, 0, 0, width-1, height-1, height//2, fill=bg, outline="")
+    canvas.create_text(width//2, height//2, text=text, fill=fg, font=scaled)
+    return canvas
+
+
+def make_avatar(parent, name, size=44, color=None, outer_bg=None):
+    color, outer = color or accent_for(name), outer_bg or _widget_bg(parent)
+    canvas = tk.Canvas(parent, width=size, height=size, bg=outer, highlightthickness=0, bd=0)
+    canvas.create_oval(1, 1, size-2, size-2, fill=tint(color, .80), outline="")
+    canvas.create_text(size//2, size//2, text=initials_of(name), fill=shade(color, .12),
+                       font=(UI_FONT, max(8, int(size*.30)), "bold"))
+    return canvas
+
+
+def make_icon_tile(parent, icon, color, size=46, radius=13, outer_bg=None, solid=True):
+    outer = outer_bg or _widget_bg(parent)
+    canvas = tk.Canvas(parent, width=size, height=size, bg=outer, highlightthickness=0, bd=0)
+    fill = color if solid else tint(color, .85)
+    draw_round_rect(canvas, 0, 0, size-1, size-1, radius, fill=fill, outline="")
+    canvas.create_text(size//2, size//2+1, text=icon, fill=on_color(fill) if solid else color,
+                       font=("Segoe UI Emoji", max(10, int(size*.40))))
+    return canvas
+
+
+class SearchBox(tk.Frame):
+    """Search field with icon, placeholder, clear action and debounced callback."""
+    def __init__(self, parent, placeholder="Search…", on_change=None, width=30, delay=240):
+        self._on_change, self._delay = on_change, delay
+        self._debouncer = Debouncer(self, delay)
+        self._placeholder = _language_text(placeholder)
+        self._showing_placeholder = False
+        super().__init__(parent, bg=CARD_BG, bd=0, highlightthickness=1, highlightbackground=BORDER, highlightcolor=GREEN)
+        tk.Label(self, text="🔍", bg=CARD_BG, fg=MUTED, font=("Segoe UI Emoji", 10)).pack(side="left", padx=(10, 2))
+        family = URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT
+        self.entry = tk.Entry(self, width=width, relief="flat", bd=0, bg=CARD_BG, fg=DARK, insertbackground=GREEN,
+                              highlightthickness=0, font=(family, ui_size(10)))
+        self.entry.pack(side="left", fill="x", expand=True, ipady=7, padx=(2, 0))
+        self._clear = tk.Label(self, text="✕", bg=CARD_BG, fg=MUTED, cursor="hand2", font=(UI_FONT, 9, "bold"), padx=10)
+        self._clear.bind("<Button-1>", lambda _e: self.set(""))
+        self.entry.bind("<FocusIn>", self._focus_in)
+        self.entry.bind("<FocusOut>", self._focus_out)
+        self.entry.bind("<KeyRelease>", self._typed)
+        self.entry.bind("<Return>", lambda _e: self._fire())
+        self._show_placeholder()
+        self.bind("<Destroy>", self._on_destroy, add="+")
+    def _on_destroy(self, _event=None):
+        if getattr(self, "_debouncer", None):
+            self._debouncer.cancel()
+    def _show_placeholder(self):
+        if not self.entry.get():
+            self._showing_placeholder = True
+            self.entry.insert(0, self._placeholder)
+            self.entry.configure(fg=MUTED)
+    def _focus_in(self, _event=None):
+        self.configure(highlightbackground=GREEN)
+        if self._showing_placeholder:
+            self.entry.delete(0, "end"); self.entry.configure(fg=DARK); self._showing_placeholder = False
+    def _focus_out(self, _event=None):
+        self.configure(highlightbackground=BORDER)
+        if not self.entry.get(): self._show_placeholder()
+    def _typed(self, _event=None):
+        try:
+            if self.get(): self._clear.pack(side="right")
+            else: self._clear.pack_forget()
+        except tk.TclError: return
+        self._debouncer.run(self._fire)
+    def _fire(self):
+        self._debouncer.cancel()
+        if callable(self._on_change):
+            try: self._on_change(self.get())
+            except tk.TclError: pass
+    def get(self): return "" if self._showing_placeholder else self.entry.get().strip()
+    def set(self, value):
+        self._showing_placeholder = False
+        self.entry.delete(0, "end"); self.entry.configure(fg=DARK)
+        if value: self.entry.insert(0, value)
+        else:
+            self._clear.pack_forget()
+            if self.focus_get() is not self.entry: self._show_placeholder()
+        self._fire()
+
+
+class Segmented(tk.Frame):
+    """Pill-style segmented control bound to a Tk StringVar."""
+    def __init__(self, parent, options, variable, command=None, padx=14, pady=6):
+        self._track = mix(GREEN, "#FFFFFF", .90)
+        super().__init__(parent, bg=self._track, bd=0, highlightthickness=1, highlightbackground=BORDER)
+        self._var, self._command, self._buttons = variable, command, {}
+        for value, label in options:
+            button = tk.Button(self, text=label, relief="flat", bd=0, cursor="hand2", takefocus=0, padx=padx, pady=pady,
+                               font=(UI_FONT, 10, "bold"), command=lambda v=value: self._select(v))
+            button.pack(side="left", padx=2, pady=2)
+            button.bind("<Enter>", lambda _e, v=value: self._hover(v, True))
+            button.bind("<Leave>", lambda _e, v=value: self._hover(v, False))
+            self._buttons[value] = button
+        self._trace = variable.trace_add("write", self._sync)
+        self._sync()
+    def _select(self, value):
+        self._var.set(value)
+        if callable(self._command): self._command(value)
+    def _hover(self, value, inside):
+        try:
+            if self._var.get() != value:
+                self._buttons[value].configure(bg=mix(self._track, "#FFFFFF", .55) if inside else self._track)
+        except tk.TclError: pass
+    def _sync(self, *_):
+        try:
+            for value, button in self._buttons.items():
+                if value == self._var.get():
+                    button.configure(bg=GREEN, fg=on_color(GREEN), activebackground=GREEN, activeforeground=on_color(GREEN))
+                else:
+                    button.configure(bg=self._track, fg=NEUTRAL_FG, activebackground=self._track, activeforeground=GREEN)
+        except tk.TclError: pass
+
+
+def responsive_canvas(parent, height, draw, bg=None):
+    """Return a canvas that redraws at its actual width: draw(canvas, width, height)."""
+    canvas = tk.Canvas(parent, bg=bg or CARD_BG, height=height, width=1, highlightthickness=0, bd=0)
+    def redraw(_event=None):
+        try:
+            width = int(canvas.winfo_width())
+            if width >= 60:
+                canvas.delete("all")
+                draw(canvas, width, height)
+        except tk.TclError: pass
+    canvas.bind("<Configure>", redraw)
+    return canvas, redraw
+
+
+def _install_modern_tree():
+    """Apply zebra striping and status colors to Treeviews without changing row values."""
+    if getattr(ttk.Treeview, "_taha_modern_installed", False): return
+    previous_init, previous_insert, previous_delete = ttk.Treeview.__init__, ttk.Treeview.insert, ttk.Treeview.delete
+    status_columns = {"status", "active", "attendance", "att_status", "attendance_status", "class_status"}
+    def modern_init(self, *args, **kwargs):
+        previous_init(self, *args, **kwargs)
+        try:
+            self._taha_row_counter = 0
+            self.tag_configure("taha_even", background=CARD_BG)
+            self.tag_configure("taha_odd", background=mix(GREEN, "#FFFFFF", .955))
+            for kind in ("ok", "warn", "bad", "info"):
+                self.tag_configure("taha_" + kind, **row_tag_opts(kind))
+        except tk.TclError: pass
+    def modern_insert(self, parent, index, iid=None, **kwargs):
+        if MODERN_ZEBRA_ROWS:
+            try:
+                tags = kwargs.get("tags", ())
+                tags = (tags,) if isinstance(tags, str) else tuple(tags or ())
+                pos = int(getattr(self, "_taha_row_counter", 0)); self._taha_row_counter = pos + 1
+                extra = ["taha_odd" if pos % 2 else "taha_even"]
+                if not tags:
+                    values, columns = tuple(kwargs.get("values", ()) or ()), tuple(self.cget("columns"))
+                    for idx, column in enumerate(columns):
+                        if str(column).lower() in status_columns and idx < len(values):
+                            kind = status_kind(values[idx])
+                            if kind in ("ok", "warn", "bad", "info"): extra.append("taha_" + kind)
+                            break
+                kwargs["tags"] = tags + tuple(extra)
+            except (tk.TclError, TypeError, ValueError): pass
+        return previous_insert(self, parent, index, iid, **kwargs)
+    def modern_delete(self, *items):
+        result = previous_delete(self, *items)
+        try: self._taha_row_counter = len(self.get_children(""))
+        except tk.TclError: pass
+        return result
+    ttk.Treeview.__init__ = modern_init
+    ttk.Treeview.insert = modern_insert
+    ttk.Treeview.delete = modern_delete
+    ttk.Treeview._taha_modern_installed = True
+
+
+def _install_modern_toasts():
+    """Replace only selected quick success dialogs with a toast if app.toast exists."""
+    if getattr(messagebox, "_taha_toast_installed", False): return
+    previous_showinfo = messagebox.showinfo
+    quick_titles = ("saved", "created", "settings saved", "progress saved", "attendance saved")
+    def toast_showinfo(title=None, message=None, **kwargs):
+        try:
+            app = getattr(SchoolApp, "_instance", None)
+            first = str(title or "").split("/")[0].strip().lower()
+            if MODERN_TOASTS and app is not None and first in quick_titles and app.root.winfo_exists() and callable(getattr(app, "toast", None)):
+                app.toast(message or title)
+                return "ok"
+        except Exception: pass
+        return previous_showinfo(title, message, **kwargs)
+    messagebox.showinfo = toast_showinfo
+    messagebox._taha_toast_installed = True
+
+
+_install_modern_tree()
+_install_modern_toasts()
+
+def _record_startup_exception(exc):
+    """Write an actionable startup traceback outside the installation folder."""
+    try:
+        import traceback
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~")
+        folder = os.path.join(base, "Institute Ledger")
+        os.makedirs(folder, exist_ok=True)
+        log_path = os.path.join(folder, "startup_error.log")
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write("\n\n=== Startup error " + datetime.now().isoformat(timespec="seconds") + " ===\n")
+            log.write("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+        return log_path
+    except Exception:
+        return None
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as startup_exc:
+        log_path = _record_startup_exception(startup_exc)
+        details = str(startup_exc)
+        if log_path:
+            details += "\n\nA diagnostic log was saved here:\n" + log_path
+        try:
+            error_root = tk.Tk()
+            error_root.withdraw()
+            messagebox.showerror("Institute Ledger could not start", details, parent=error_root)
+            error_root.destroy()
+        except Exception:
+            print(details, file=sys.stderr)
+        raise

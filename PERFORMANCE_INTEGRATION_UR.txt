@@ -1,0 +1,51 @@
+Institute Ledger — Phase 1 / Performance Integration v15.2
+
+یہ پیکیج v15.1 (Login UI Preserved) کو بنیاد بناتا ہے۔ صارف کی فراہم کردہ Pasted text(6).txt سے صرف وہی مفید کوڈ حصے موجودہ سورس میں مناسب جگہ شامل کیے گئے ہیں جو موجودہ پروگرام کے ساتھ مطابقت رکھتے ہیں۔
+
+شامل کردہ بہتریاں
+-----------------
+1) LRUCache:
+   - محدود گنجائش والا، thread-safe cache شامل کیا گیا۔
+   - Wallpaper tiles، button texture/source images، attendance bubble images اور circular logo PhotoImages کے موجودہ caches اب bounded LRU ہیں۔
+   - پرانے عناصر خودکار طور پر خارج ہوتے ہیں؛ ایک ساتھ لامحدود تصویری references جمع نہیں ہوتے۔
+   - Tk PhotoImage caches ہر SchoolApp/root کے اپنے ہیں تاکہ مختلف Tk windows کے PhotoImage references آپس میں خلط ملط نہ ہوں۔
+
+2) Debouncer:
+   - عمومی Debouncer utility شامل کی گئی۔
+   - SearchBox کے اندر الگ timer implementation کی جگہ یہی مشترکہ Debouncer استعمال ہوتا ہے۔
+   - تیز typing پر صرف آخری input کے بعد search callback چلتا ہے؛ widget destroy ہونے پر pending timer منسوخ ہو جاتا ہے۔
+
+3) AsyncWorker:
+   - دو worker threads والا محدود ThreadPoolExecutor شامل ہے۔
+   - Worker completion براہِ راست Tk root.after() نہیں چلاتی؛ نتیجہ thread-safe Queue میں جاتا ہے اور root.after pump callback کو UI/main thread پر چلاتا ہے۔
+   - Reports کی CSV اور formatted HTML export سے پہلے SQLite query الگ worker-owned connection پر چلتی ہے۔ Connection صرف read-only mode میں کام کرتا ہے؛ مرکزی DB connection worker thread میں share نہیں کیا جاتا۔
+   - callback error ایک report job کو ناکام ہونے پر UI error handler تک پہنچاتا ہے؛ result pump بند نہیں ہوتا۔
+
+4) پہلے سے موجود کوڈ کو نقل نہیں کیا گیا:
+   - APP_BASE_DIR / app_asset_path، DEFAULT_WALLPAPER_IMAGE، DEFAULT_LOGIN_LOGO، bundled font loading، Pillow imports اور PyMuPDF compatibility import اصل فائل میں پہلے ہی موجود تھے۔ انہیں duplicate نہیں کیا گیا۔
+   - اصل notification GIF کی مکمل Base64 string اصل فائل میں برقرار رکھی گئی۔ صارف کی فراہم کردہ pasted text اسی GIF string کے درمیان ختم ہوتی ہے، اس لیے ادھورا Base64 حصہ اصل مکمل GIF کے اوپر نہیں لکھا گیا۔
+   - _avatar_cache کا generic نام دیا گیا تھا مگر موجودہ Canvas-based make_avatar() میں PhotoImage نہیں بنتی؛ parent-specific Canvas widget کو global cache میں رکھنا غلط ہوتا، اس لیے اسے بلاوجہ شامل نہیں کیا گیا۔
+
+محفوظ رکھی گئی چیزیں
+------------------
+- v15.1 کا Login Interface، first_admin_setup، theme/style اور login assets تبدیل نہیں کیے گئے۔
+- Phase 1 کا Header/Scroll Controller تبدیل نہیں کیا گیا۔
+- موجودہ database schema، business logic، user/password hashes اور data files نہیں بدلے گئے۔
+- موجودہ Build scripts اور dependencies کی خودکار upgrade policy تبدیل نہیں کی گئی۔
+
+جانچ
+----
+- Python syntax compilation: PASS
+- Module import: PASS
+- LRU eviction / dictionary-compatible API: PASS
+- SearchBox debounce: PASS (Tk/Xvfb)
+- AsyncWorker result callback UI thread پر: PASS (Tk/Xvfb)
+- Reports کے Students، Teachers، Payments، Attendance اور Progress queries: PASS (temporary SQLite database)
+- Login screen، first_admin_setup، style/theme، اور Phase 1 scroll/header methods کا AST comparison v15.1 کے ساتھ: unchanged
+- ZIP integrity: PASS
+
+حدود
+----
+- یہ Source & Build Kit ہے، تیار شدہ EXE installer نہیں۔
+- Windows 10 پر native GUI، PyInstaller x86/x64 build، Inno Setup installer اور حقیقی بڑی user database کے ساتھ performance ابھی ٹیسٹ نہیں ہوئی۔
+- AsyncWorker کا موجودہ استعمال Reports کی DB read query کو UI thread سے باہر کرتا ہے؛ HTML string creation اور فائل لکھنے کا باقی حصہ UI callback میں ہوتا ہے، اس لیے بہت بڑی رپورٹس کے لیے مزید worker-side streaming/export optimization الگ کام ہے۔

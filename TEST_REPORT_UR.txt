@@ -1,0 +1,112 @@
+Institute Ledger — ٹیسٹ رپورٹ (Data/Login Safety RC)
+تاریخ: 2026-10-29
+
+اس ماحول میں انجام دیے گئے ٹیسٹ:
+[PASS] Python source syntax compilation.
+[PASS] Module import.
+[PASS] Temporary SQLite database schema creation and reopen.
+[PASS] Existing database read-only integrity/schema validation.
+[PASS] Existing PBKDF2-SHA256 password hash verifies with the same password.
+[PASS] Incorrect password is rejected by password_matches.
+[PASS] SQLite online backup copy passes PRAGMA integrity_check.
+[PASS] Restore copy passes PRAGMA integrity_check.
+[PASS] Restored Admin username/password hash and a sample student record are identical to source DB.
+[PASS] ZIP archive integrity check.
+
+اس ماحول میں انجام نہیں دیے جا سکے:
+[NOT TESTED] Windows GUI interaction and visual layout.
+[NOT TESTED] Login against the user's actual pre-existing database/credentials.
+[NOT TESTED] Installer wizard, data-folder selection during installation, uninstall/update behavior.
+[NOT TESTED] x86 and x64 PyInstaller builds and compiled Inno Setup installer.
+[NOT TESTED] External logos/images/fonts referenced outside the database restored as a full asset bundle.
+
+اہم وضاحت:
+ٹیسٹ عارضی، الگ ڈیٹا بیس پر کیے گئے۔ اصل صارف کا ڈیٹا بیس نہ کھولا گیا، نہ تبدیل ہوا۔
+یہ نتائج بنیادی database/auth/backup code checks کی تصدیق کرتے ہیں، Windows پر مکمل ریلیز کی نہیں۔
+
+
+ورژن 10 / انسٹالر handoff tests
+1) Python syntax compilation: PASS.
+2) Installer first-launch mode with saved old DB: explicit YES/NO choice is shown instead of silent reuse: PASS (mocked UI flow).
+3) First-launch NO path: selects a new data folder and returns a new institute_ledger.db path without overwriting an existing DB: PASS (mocked UI flow).
+4) First-launch YES path: prompts user to select an existing DB and keeps that file unchanged: PASS (mocked UI flow).
+5) Windows GUI/EXE/Inno Setup runtime test: NOT RUN in this environment.
+
+
+ورژن 12 — Wallpaper اور Scroll Transition ٹیسٹ
+تاریخ: 2026-10-31
+
+[PASS] تازہ Python سورس کی syntax compilation۔
+[PASS] Tk/Xvfb runtime smoke test: Dashboard، Students، Teachers، Fees، Timetable، Attendance، Progress، Accounts، Graphs، Reports اور Settings سب بغیر exception render ہوئے۔
+[PASS] Scroll down پر header collapse progress = 1.0 اور header frame pack سے ہٹ گیا۔
+[PASS] Scroll up پر header collapse progress = 0.0 اور header اسی جگہ/اونچائی کے ساتھ واپس pack ہوا۔
+[PASS] 220ms easing transition callback دونوں سمتوں میں execute ہوئی۔
+[PASS] ایک ہی wallpaper asset path login stage، header canvas اور page workspace کے لیے استعمال ہوتا ہے؛ Wallpaper transparency/preview header اور workspace دونوں پر sync ہوتی ہے۔
+[PASS] Header identity text (institution name، slogan، LOCAL • OFFLINE، signed-in username/role) برقرار؛ الگ cover-image painter اور cover customizer options ہٹا دیے گئے۔
+[PASS] Horizontal اور vertical navigation layout کی source-level/runtime construction چیک کی گئی۔
+[PASS] ZIP archive integrity check۔
+
+[NOT TESTED] Windows کے اصل Tk/Windows rendering، display scaling اور mouse-wheel behavior کی native machine پر جانچ۔
+[NOT TESTED] x86/x64 PyInstaller builds اور compiled Inno Setup installer۔
+[NOT TESTED] صارف کی اصل ڈیٹابیس پر upgrade run؛ آزمائش کے لیے عارضی SQLite database استعمال ہوا۔
+
+اہم: یہ نتائج Linux/Xvfb کے تحت Tk runtime smoke tests اور source checks ہیں؛ انہیں Windows installer کی منظوری نہ سمجھا جائے۔ اصل صارف کا DB اس ٹیسٹ میں تبدیل نہیں کیا گیا۔
+
+
+ورژن 13 — Wallpaper، Scroll اور Performance Regression Tests
+تاریخ: 2026-10-31
+
+[PASS] تازہ Python source کی syntax compilation۔
+[PASS] Tk/Xvfb میں Wallpaper Canvas پر widget-level stacking command؛ صحیح state initialization، image tile اور canvas items بنے۔
+[PASS] دو مختلف صفحات کے درمیان resized wallpaper tile cache دوبارہ استعمال ہوا؛ cache میں مختلف viewport sizes کے صرف دو entries رہے۔
+[PASS] Main page scroll position کو وسط میں لے جانے پر header pack سے ہٹا، اوپر واپس آنے پر restore ہوا۔
+[PASS] اندرونی Treeview کی yview کو mid-list پر لے جانے سے header collapse ہوا؛ Treeview کو top پر لانے سے header واپس آیا۔
+[PASS] Treeview پر MouseWheel event نے list position 0.00 سے 0.02 تک آگے بڑھائی۔
+[PASS] Dashboard، Students، Teachers، Fees، Timetable، Attendance، Progress، Accounts، Graphs، Reports اور Settings render ہوئے۔
+[PASS] Synthetic test DB میں 140 طلبہ، 7 اساتذہ، 140 weekly schedule rows اور 140 attendance rows شامل کرکے Calendar performance چیک کی گئی۔
+[PASS] Timetable repeat render: تقریباً 0.09–0.12 سیکنڈ؛ Attendance repeat render: تقریباً 0.03–0.04 سیکنڈ (Linux/Xvfb test host پر)۔
+[PASS] Legacy tk.Button controls پر wallpaper image surfaces لگیں؛ Ttk Accent/Nav styles میں image element layout موجود تھا۔
+[PASS] Attendance month range prefetch duplicate SQL call ہٹا کر ایک query فی render رہ گئی۔
+[PASS] unused legacy cover source asset پیکیج سے خارج؛ active shared wallpaper asset موجود۔
+
+[NOT TESTED] Windows کے اصل Tk rendering، حقیقی user monitor پر mouse wheel/drag، display scaling اور perceived speed۔
+[NOT TESTED] Windows x86/x64 executable builds اور Inno Setup installer۔
+[NOT TESTED] حقیقی صارف کے database پر upgrade یا کوئی data migration؛ test database عارضی تھا۔
+
+نوٹ: Tkinter native Buttons میں per-pixel alpha transparency فراہم نہیں کرتا؛ اسی wallpaper سے بنائی گئی blended images کو button surfaces کے طور پر استعمال کیا جاتا ہے۔ ٹیسٹ کے دوران اصل صارف کا database نہ کھولا گیا اور نہ تبدیل ہوا۔
+
+
+ورژن 14 — 2026-10-31 — اضافی Regression Tests
+[PASS] Python syntax compilation۔
+[PASS] Tk/Xvfb میں Students، Teachers، Fees، Timetable، Attendance، Progress، Accounts، Graphs، Reports، Settings اور Dashboard رینڈر۔
+[PASS] 80 طلبہ کے synthetic DB پر Student cards پہلے 18 تک محدود؛ صفحہ ابتدائی render تقریباً 0.36 sec؛ اگلے کارڈز demand پر paged query سے لائے جاتے ہیں۔
+[PASS] Synthetic dataset پر Timetable repeat render تقریباً 0.09 sec؛ Attendance Calendar تقریباً 0.03 sec (Linux/Xvfb host)۔
+[PASS] Attendance اور Teachers کے لیے الگ test wallpaper فعال؛ page workspace، header painter اور Ttk button style تینوں صحیح منتخب تصویر کی path استعمال کرتے ہیں۔
+[PASS] بغیر page override والے Fees صفحے نے default global wallpaper fallback استعمال کیا۔
+[PASS] Dark palette: APP_BG #151D1A، CARD_BG #202B27؛ Light palette واپس #F3F6F5 / #FFFFFF۔
+[PASS] New institute selection: خالی folder سے نئی DB path؛ DB میں Admin نہیں؛ SchoolApp Create Admin setup screen کھولتا ہے۔
+[PASS] Existing database option پر پرانی DB کا انتخاب برقرار اور اس کی شناخت محفوظ۔
+[PASS] Create New Institute منتخب کرکے ایسا folder دینے پر جس میں پہلے سے DB موجود تھی، کوئی DB واپس/کھولی نہیں گئی؛ اصل DB bytes بالکل unchanged رہے۔
+[PASS] Inno Setup source میں first_install.flag unconditional copy؛ ہر installer run کے بعد پہلی launch پر explicit data choice دستیاب۔
+[PASS] Profile menu میں Customize header command نہیں؛ Header customizer Settings میں باقی۔
+[PASS] ZIP archive integrity (پیکیج بناتے وقت)۔
+
+[NOT TESTED] Windows native GUI / screen scaling / actual mouse drag۔
+[NOT TESTED] Windows x86/x64 PyInstaller builds اور compiled Inno Setup installer۔
+[NOT TESTED] حقیقی user database پر upgrade یا password/login؛ tests isolated temporary DBs پر ہوئے۔
+
+رفتار کے اعداد Linux/Xvfb test host اور temporary synthetic DB سے ہیں؛ Windows machine پر عین یہی time guarantee نہیں۔
+
+
+Hotfix v14.2 — Startup Window Visibility Regression Tests (2026-10-31)
+[PASS] Python source compilation after startup-owner correction.
+[PASS] Tk/Xvfb: owner root is mapped in borderless 1x1 state; first-run transient chooser reports mapped/normal instead of withdrawn.
+[PASS] Tk/Xvfb: Create a new institute path selects an empty folder and reaches the Create Admin setup screen.
+[PASS] Tk/Xvfb: Open existing database path displays normal Login screen rather than Create Admin.
+[PASS] Existing Admin username and password_hash are unchanged after selecting and opening existing database.
+[PASS] Source Kit contains first_install.flag; installer script still copies the flag unconditionally.
+[PASS] Startup exception logger writes diagnostic traceback outside installation directory.
+[NOT TESTED] Native Windows 10/11 GUI, display scaling, real Windows file-picker and Inno Setup compiled installer.
+[NOT TESTED] User's actual live database; all DB tests used isolated temporary SQLite copies.
+
+Root cause addressed: the app withdrew its Tk root, then created a transient first-run Toplevel with that hidden root as its owner. Tk/Xvfb reproduced the Toplevel as withdrawn/unmapped. Keeping an invisible mapped owner for the startup choice allows the dialog to appear; the regular main window is restored after database selection.

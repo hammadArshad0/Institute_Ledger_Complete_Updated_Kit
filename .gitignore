@@ -1,0 +1,18 @@
+@"
+build/
+dist/
+__pycache__/
+*.pyc
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.bak_*
+*.spec
+.idea/
+.venv/
+venv/
+output/
+branding/
+startup_error.log
+"@ | Set-Content -Encoding UTF8 .gitignore

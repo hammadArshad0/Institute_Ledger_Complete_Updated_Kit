@@ -1,0 +1,7 @@
+Institute Ledger — Phase 1 / v15.2 (Login UI Preserved)
+
+یہ پیکیج v15.1 کو بنیاد بناتا ہے۔ Login screen، first-admin setup، theme/style اور login assets کو تبدیل نہیں کیا گیا۔ Phase 1 Header/Scroll Controller بھی جوں کا توں برقرار ہے۔
+
+v15.2 میں صرف Performance Integration شامل ہے: bounded LRU image caches، SearchBox کے لیے مشترکہ Debouncer، محفوظ Queue-based AsyncWorker اور Reports کے read-only SQLite queries کو worker thread میں چلانا۔ مکمل تفصیل PERFORMANCE_INTEGRATION_UR.txt میں ہے۔
+
+Windows native GUI/drag testing، x86/x64 executable builds اور compiled Inno Setup installer کی جانچ ابھی باقی ہے۔

@@ -1,0 +1,86 @@
+Institute Ledger — تبدیلیاں (Data/Login Safety RC)
+
+اس ریلیز میں موجودہ سورس کی جانچ کے بعد محدود تبدیلیاں کی گئیں:
+
+1. منتخب ڈیٹا بیس کا راستہ انسٹالیشن فولڈر سے باہر APPDATA میں محفوظ رہتا ہے۔
+2. محفوظ شدہ ڈیٹا بیس موجود ہو تو پہلے اسے read-only integrity/schema check سے گزارا جاتا ہے؛ غائب/خراب فائل پر خاموش نیا ڈیٹا بیس نہیں کھولا جاتا۔
+3. پہلی بار ڈیٹا فولڈر کا انتخاب واضح طور پر کیا جاتا ہے؛ نیا خالی ڈیٹا بیس صرف صارف کی واضح منظوری پر بنتا ہے۔
+4. موجودہ ریکارڈز مگر Admin کے بغیر ڈیٹا بیس میں نیا Admin خودکار طور پر بنانے سے پہلے پروگرام رک کر اصل ڈیٹا بیس/بیک اپ منتخب کرنے کا پیغام دیتا ہے۔
+5. لاگ اِن پر Admin (پہلی ترجیح) یا Teacher منتخب کیا جا سکتا ہے؛ موجودہ PBKDF2-SHA256/260000 ہیش تصدیق برقرار ہے۔ Student لاگ اِن کی اجازت نہیں؛ پرانے Student ریکارڈز حذف نہیں کیے جاتے۔
+6. لاگ اِن اسکرین سے موجودہ DB یا بیک اپ منتخب کرنے کا راستہ شامل ہے۔ .bak/.sqlite/.sqlite3 فائل کو براہ راست live DB کے طور پر کھولنے کے بجائے نئے منتخب data folder میں SQLite backup API کے ذریعے کاپی کیا جاتا ہے؛ اصل فائل نہیں بدلی جاتی۔
+7. پہلی Admin تخلیق اور Teacher login بنانے کے فارم میں Password/Confirm Password کے Show/Hide کنٹرول، password match اور 12+ حرف کی شرط شامل ہے۔
+8. DB میں institute_id setting محفوظ کرنے کی شروعات کی گئی ہے؛ یہ UUID نئی settings میں بنتا ہے اور موجودہ DB میں موجود value INSERT OR IGNORE کی وجہ سے برقرار رہتی ہے۔
+
+احتیاط:
+- یہ Release Candidate ہے، حتمی Windows installer نہیں۔
+- Windows GUI، حقیقی موجودہ صارف DB، installer، x86/x64 binaries اور Inno Setup کی عملی جانچ اس ماحول میں نہیں ہوئی۔
+- بیک اپ میں SQLite database کی مکمل transactional copy شامل ہوتی ہے۔ بیرونی logo/image files کی bundle/restore مکمل طور پر ثابت نہیں؛ اگر ان کے paths ڈیٹا بیس سے باہر ہوں تو انہیں الگ محفوظ رکھیں۔
+- اصل DB استعمال کرنے سے پہلے اس کی الگ نقل/بیک اپ بنائیں۔
+
+
+Release Candidate v9 (2026-10-29):
+- لاگ اِن کارڈ کو دستیاب ونڈو کے مطابق بنایا گیا، اندرونی عمودی فاصلہ کم کیا اور ایکشن بٹنوں کو کارڈ کے نچلے حصے میں رکھا تاکہ کٹنے کا امکان کم ہو۔
+- لاگ اِن پاس ورڈ کے لیے Show/Hide اختیار شامل کیا۔
+- اگر منتخب ڈیٹابیس میں Admin موجود نہ ہو تو پہلی Admin ترتیب تک پہنچنے سے متعلق رکاوٹ ہٹائی؛ موجودہ ریکارڈ حذف یا ری سیٹ نہیں کیے جاتے۔
+- Admin کی شناخت role کی case/space سے متاثر نہیں ہوگی۔
+- Python syntax اور ZIP integrity چیک کیے گئے؛ Windows GUI/installer کا عملی ٹیسٹ اس ماحول میں ممکن نہیں تھا۔
+
+
+v10: پہلی تنصیب پر existing DB یا نئے data folder کے انتخاب کی لازمی ونڈو؛ نیا ڈیٹا منتخب کرنے پر Create Admin Account۔ پرانا ڈیٹا خودکار طور پر نہیں چھیڑا جاتا۔
+
+
+Release Candidate v12 (2026-10-31) — مشترکہ Wallpaper اور متحرک شناختی ہیڈر
+- پورے سافٹ ویئر کے لیے ایک ہی Wallpaper Source مقرر کیا: لاگ اِن، مرکزی صفحات اور ادارے کا شناختی ہیڈر ایک ہی تصویر/Settings انتخاب استعمال کرتے ہیں۔
+- الگ Cover Photo، Header Image، Header Pattern اور Cover Scale کا نظام ہٹا دیا؛ duplicate cover asset بھی پیکیج میں شامل نہیں۔
+- ادارے کا لوگو، ادارے کا نام، سلوگن، LOCAL • OFFLINE شناخت اور لاگ اِن صارف/Role کی معلومات اپنی موجودہ جگہ پر برقرار رکھی ہیں۔
+- نیچے اسکرول کرنے پر ہیڈر 220ms نرم easing transition کے ساتھ اوپر سمٹ کر غائب ہوتا ہے؛ اوپر واپس اسکرول کرنے پر اسی جگہ بحال ہوتا ہے۔ Navigation bar اپنی جگہ رہتی ہے۔
+- Wallpaper Settings کی تصویر، شفافیت اور Live Preview مرکزی صفحات اور شناختی ہیڈر پر ایک ساتھ اپ ڈیٹ ہوتے ہیں۔
+- پرانی ڈیٹابیس میں موجود سابقہ header/cover settings کو استعمال نہیں کیا جاتا؛ طلبہ، صارفین، پاس ورڈ ہیش، مالی یا حاضری ریکارڈ کو تبدیل یا حذف نہیں کیا گیا۔
+- مرکزی ماڈیولز کے Tk runtime smoke tests، vertical/horizontal navigation، scroll collapse/restore، Python syntax اور ZIP integrity چیک کیے گئے۔ Windows native GUI/EXE installer اب بھی الگ سے ٹیسٹ ہونا باقی ہے۔
+
+
+Release Candidate v13 (2026-10-31) — Wallpaper، Scroll اور Performance کی اصلاح
+- صفحے کا Wallpaper layer درست کیا: tk.Canvas.lower() دراصل Canvas کے اندر tag/item کے لیے ہوتا ہے، Widget stacking کے لیے نہیں۔ اب Canvas widget کو Tk کے widget-level lower command سے نیچے رکھا جاتا ہے؛ پہلے اسی غلط call کے باعث صفحے کے Wallpaper کا layer جزوی طور پر ناکام تھا۔
+- Wallpaper canvas کی ایک جزوی طور پر initialize ہوئی پرانی instance ملنے پر اسے دوبارہ صحیح طرح بنایا جاتا ہے۔
+- resized Wallpaper tile کو پوری application میں cache کیا؛ ایک ہی page بدلنے پر 2MB اصل PNG دوبارہ decode/resize نہیں ہوتی۔ پورے لمبے page کی بڑی bitmap بھی نہیں بنتی۔
+- عام ttk.Button، Accent، Navigation، Attendance Status اور Calendar Buttons پر اسی wallpaper سے تیار کردہ blended image surface لگائی؛ legacy tk.Button پر بھی cached image surface اور hover/pressed states ہیں۔ native Tk میں per-pixel alpha transparency دستیاب نہیں، اس لیے visual blend استعمال ہوتا ہے۔
+- Mouse wheel کے fractional/high-resolution deltas محفوظ کیے جاتے ہیں؛ nested Treeview کے wheel اور scrollbar دونوں scroll position کو Header animation تک پہنچاتے ہیں۔
+- Scroll position کی جانچ میں Tkinter top-level window identity کی غلط comparison درست کی؛ inner table scroll اب header collapse/restore کو trigger کر سکتی ہے۔ Outer Canvas کے resize callbacks inner scroll state کو منسوخ نہیں کرتے۔
+- Attendance Calendar میں duplicate date-range SQL prefetch ہٹایا؛ اب ہر render میں range query ایک مرتبہ چلتی ہے۔ ہفتہ وار کلاس، dated sessions، attendance اور bubble images کے caches برقرار/فعال ہیں۔
+- نئے اداروں کے لیے Wallpaper transparency default کو 68% (یعنی 32% wallpaper blend) سے ہم آہنگ کیا؛ پرانی saved custom values کو بلاوجہ overwrite نہیں کیا۔
+- unused legacy cover-source JPEG کو پیکیج سے ہٹایا؛ واحد فعال wallpaper `assets/background_wallpaper.png` ہے۔
+- Tk/Xvfb smoke tests میں 11 main modules render ہوئے؛ synthetic 140-student dataset پر Timetable تقریباً 0.09–0.12 sec اور Attendance Calendar تقریباً 0.03–0.04 sec میں render ہوا۔ Main page اور nested table scroll collapse/restore اور mouse-wheel movement چیک کیے۔
+- Windows native GUI، حقیقی صارف کے ڈیٹا، DPI/mouse-wheel اور compiled x86/x64/installer کی جانچ اب بھی باقی ہے۔
+
+
+Release Candidate v14 (2026-10-31) — صفحہ وار Wallpaper، Light/Dark، اور First-Run
+- Settings میں ہر صفحے، Login، اور Create Admin کے لیے الگ تصویر/شفافیت؛ ہر page اپنے workspace، header اور blended Ttk button surfaces پر اسی تصویر کو استعمال کرتا ہے۔ بلا override صفحہ shared default wallpaper لیتا ہے۔
+- Day / Night (Light / Dark) mode مستقل طور پر database settings میں محفوظ؛ Login screen بھی منتخب palette کے ساتھ بنتی ہے۔
+- Admin account dropdown سے `Customize header` ہٹا دیا؛ یہ اختیار Settings میں موجود ہے۔
+- ہر Inno installer run پہلی launch کے لیے `first_install.flag` رکھتا ہے۔ نئی تنصیب/اپ گریڈ کے بعد ایک مرتبہ نیا ادارہ بنانے یا existing DB کھولنے کا صاف انتخاب ہوتا ہے؛ منتخب راستہ کامیابی کے بعد یاد رکھا جاتا ہے۔
+- New Institute کا folder پہلے سے database رکھتا ہو تو اسے موجودہ database کے طور پر خاموشی سے نہیں کھولا جاتا؛ دوسرا خالی فولڈر ضروری ہے۔
+- Student card view میں 18 طلبہ فی batch لائے جاتے ہیں، مختصر column selection کے ساتھ؛ ابتدائی load میں سیکڑوں Tk widgets نہیں بنتے۔
+- Ttk wallpaper button rendering میں image states کی تعداد اور repeated image work کم کیا۔
+- Appearance save سابقہ فعال صفحہ بحال کرتا ہے۔
+- Tests: Python compile، 11 module runtime smoke، per-page image/header/button synchronization، dark/light palette، new database first-admin route، collision guard اور existing DB route پاس۔ Native Windows EXE/installer test باقی۔
+
+
+Hotfix v14.1 — PyMuPDF:
+- جدید PyMuPDF import `pymupdf` استعمال کیا گیا ہے؛ پرانے ورژنز کے لیے compatibility fallback برقرار ہے۔
+- `fitz` deprecation warning ختم ہونی چاہیے؛ PDF rendering calls اسی alias کے ذریعے کام جاری رکھیں گی۔
+
+
+Hotfix v14.2 — Startup dialog visibility
+- Windows پر hidden Tk root کی وجہ سے first-launch chooser غائب رہنے اور Python console کے خالی انتظار میں رہنے کی بنیادی وجہ درست کی۔
+- Database selection کے دوران invisible, mapped, 1x1 owner window؛ setup مکمل ہونے پر اصل root window بحال۔
+- Startup exception کے لیے LOCALAPPDATA میں diagnostic log اور واضح error dialog۔
+- New Admin اور Existing DB کے دونوں startup paths کی Tk/Xvfb regression tests۔
+
+
+Phase 1 / v15.2 — صارف کے فراہم کردہ Performance Code کا انضمام
+- Bounded thread-safe LRUCache کو button textures، wallpaper tiles، attendance bubbles اور circular logo images کے اصل caches میں فٹ کیا۔
+- SearchBox کے اپنے debounce timer کو مشترکہ Debouncer سے بدلا؛ pending callback کو widget destruction پر cancel کیا جاتا ہے۔
+- Queue-based AsyncWorker شامل کیا؛ worker threads Tkinter UI کو براہ راست نہیں چھیڑتے۔
+- Reports کی پانچوں اقسام کے read-only SQLite data queries background worker پر منتقل کیے؛ ہر worker اپنا connection بناتا اور بند کرتا ہے۔
+- Login UI، Phase 1 scroll/header methods، DB schema اور اصل notification GIF برقرار رکھے۔
+- Python compile، Tk/Xvfb Debouncer/AsyncWorker، پانچ report queries، LRU eviction اور protected methods comparison PASS؛ Windows-native tests باقی۔
