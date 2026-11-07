@@ -208,9 +208,8 @@ DEFAULT_LOGIN_LOGO = app_asset_path("assets", "login_default_logo.png")
 DEFAULT_INSTITUTION_NAME = "Institute's Name"
 DEFAULT_INSTITUTION_NAME_UR = "ادارے کا نام"
 # Default palette matched to the user-provided TAHA reference screenshots.
-DEFAULT_PRIMARY_COLOR = "#0B3D2E"   # dark green (changeable in Settings)
-DEFAULT_BACKGROUND_COLOR = "#F6F8F7"
-DEFAULT_TEXT_COLOR = "auto"         # auto = black on light backgrounds, white on dark ones (changeable)
+DEFAULT_PRIMARY_COLOR = "#0F5132"   # deep emerald green
+DEFAULT_BACKGROUND_COLOR = "#F3F6F5"
 
 # Load the user's supplied Aptos family and Jameel Noori Nastaleeq fonts privately.
 # No substitute fonts are bundled. The exact supplied TTF files live in assets/fonts.
@@ -678,7 +677,7 @@ _NOTIFICATION_ANIMATION_GIF_BASE64 = (
 )
 
 APP_NAME = "Institute Ledger"
-APP_VERSION = "Professional dark-green UI — black text, fully customisable"
+APP_VERSION = "Desktop green UI — readable bilingual fonts"
 
 # =============================================================================
 # CENTRAL DESIGN TOKENS & THEME PRESETS (WCAG AA Compliant)
@@ -686,25 +685,25 @@ APP_VERSION = "Professional dark-green UI — black text, fully customisable"
 THEME_PRESETS = {
     "emerald": {
         "id": "emerald",
-        "name": "Dark Green & Black (Default)",
-        "name_ur": "گہرا سبز اور سیاہ (طے شدہ)",
-        "primary": "#0B3D2E",
-        "primary_hover": "#072A20",
-        "primary_light": "#D5E6DE",
-        "primary_subtle": "#EAF2EE",
-        "accent": "#B8860B",
-        "accent_hover": "#8F6809",
-        "accent_light": "#F6EBC8",
-        "bg_light": "#F6F8F7",
+        "name": "Emerald & Gold (Default)",
+        "name_ur": "زمرد اور سنہری (طے شدہ)",
+        "primary": "#0F5132",
+        "primary_hover": "#0A3622",
+        "primary_light": "#D1E7DD",
+        "primary_subtle": "#E8F4EE",
+        "accent": "#D97706",
+        "accent_hover": "#B45309",
+        "accent_light": "#FEF3C7",
+        "bg_light": "#F8FAF8",
         "card_light": "#FFFFFF",
-        "border_light": "#D3DDD8",
-        "text_light": "#000000",
-        "muted_light": "#4A5A53",
-        "bg_dark": "#0E1512",
-        "card_dark": "#17211C",
-        "border_dark": "#2A3A33",
-        "text_dark": "#F2F7F4",
-        "muted_dark": "#A3B5AC",
+        "border_light": "#DCE5E0",
+        "text_light": "#132D23",
+        "muted_light": "#5D736A",
+        "bg_dark": "#121A16",
+        "card_dark": "#1D2823",
+        "border_dark": "#2E3F37",
+        "text_dark": "#EAF2EE",
+        "muted_dark": "#9BB0A6",
     },
     "royal_blue": {
         "id": "royal_blue",
@@ -798,9 +797,9 @@ THEME_PRESETS = {
 
 # Semantic status tokens
 STATUS_COLORS = {
-    "paid": {"fg": "#0F5132", "bg": "#D1E7DD", "border": "#A3CFBB", "label": "Paid / ادا شدہ"},
-    "present": {"fg": "#0F5132", "bg": "#D1E7DD", "border": "#A3CFBB", "label": "Present / حاضر"},
-    "active": {"fg": "#0F5132", "bg": "#D1E7DD", "border": "#A3CFBB", "label": "Active / فعال"},
+    "paid": {"fg": "#166534", "bg": "#DCFCE7", "border": "#86EFAC", "label": "Paid / ادا شدہ"},
+    "present": {"fg": "#166534", "bg": "#DCFCE7", "border": "#86EFAC", "label": "Present / حاضر"},
+    "active": {"fg": "#166534", "bg": "#DCFCE7", "border": "#86EFAC", "label": "Active / فعال"},
     "partial": {"fg": "#854D0E", "bg": "#FEF3C7", "border": "#FDE68A", "label": "Partial / جزوی"},
     "pending": {"fg": "#854D0E", "bg": "#FEF3C7", "border": "#FDE68A", "label": "Pending / زیرِ التواء"},
     "late": {"fg": "#854D0E", "bg": "#FEF3C7", "border": "#FDE68A", "label": "Late / دیر"},
@@ -820,8 +819,8 @@ SPACE_MD = 12
 SPACE_LG = 16
 SPACE_XL = 24
 
-GREEN = "#0B3D2E"
-GREEN_HOVER = "#072A20"
+PRIMARY = "#0F5132"
+PRIMARY_DARK = "#0A3622"
 ACCENT = "#D97706"
 ACCENT_HOVER = "#B45309"
 ACCENT_LIGHT = "#FEF3C7"
@@ -829,13 +828,13 @@ DANGER = "#991B1B"
 DANGER_HOVER = "#7F1D1D"
 DANGER_LIGHT = "#FEE2E2"
 WHITE = "#FFFFFF"
-APP_BG = "#F6F8F7"
+APP_BG = "#F8FAF8"
 CARD_BG = "#FFFFFF"
-BORDER = "#D3DDD8"
-DARK = "#000000"
-MUTED = "#4A5A53"
+BORDER = "#DCE5E0"
+DARK = "#132D23"
+MUTED = "#5D736A"
 PALE = "#E8F4EE"
-SOFT_GREEN = "#E8F4EE"
+PRIMARY_LIGHT = "#E8F4EE"
 GOLD = "#FEF3C7"
 # Fixed STATUS / FUNCTION colors. They never depend on the saved primary color.
 SEM_GREEN = "#16A34A"     # paid, present, success
@@ -844,12 +843,19 @@ SEM_YELLOW = "#F5B301"    # pending, partial
 SEM_ORANGE = "#F28C28"    # warning, due soon; print / export / certificates buttons
 SEM_RED = "#DC2626"       # unpaid, absent, danger
 SEM_BLUE = "#2563EB"      # information, refresh / open / view buttons, Students
+# Dynamic primary token set. SchoolApp._apply_theme_palette() derives all of these from the saved primary color.
+PRIMARY_TEXT = "#FFFFFF"   # readable text/icon color on PRIMARY (white or near-black, chosen by WCAG contrast)
+PRIMARY_INK = PRIMARY      # PRIMARY adjusted for text/icons on page surfaces (>= 4.5:1)
+PRIMARY_SUBTLE = PALE      # very light primary tint for panels
+PRINT_INK = PRIMARY        # PRIMARY adjusted for text on white paper (reports, certificates, exported images)
+OK_INK, BAD_INK, WARN_INK, INFO_INK = "#166534", "#B42318", "#92400E", "#1E40AF"   # status text colors, readable in light and dark mode
+FUNCTION_BUTTON_COLORS = True   # False = every normal button uses PRIMARY (only delete stays red)
 # The wallpaper is only ever a faint page background (max share of the picture).
-WALLPAPER_MAX_STRENGTH = 0.35
+WALLPAPER_MAX_STRENGTH = 0.20
 # Urdu font is selected from fonts installed in Windows at application startup.
 # Prefer true Nastaleeq fonts; fall back gracefully if none is installed.
-UI_FONT = "Arial"
-UI_BOLD_FONT = "Arial"
+UI_FONT = "Aptos"
+UI_BOLD_FONT = "Aptos"
 URDU_FONT = "Jameel Noori Nastaleeq"
 FONT_SCALE = 1.2  # Readable default; user-configurable in Settings.
 URDU_FONT_CANDIDATES = (
@@ -1435,7 +1441,7 @@ def apply_script_fonts(root):
     """Apply script-appropriate fonts in small UI-thread batches instead of freezing large screens."""
     try:
         families = {str(name).casefold(): str(name) for name in root.tk.call("font", "families")}
-        english_family = families.get(str(UI_FONT).casefold(), str(UI_FONT) or "Arial")
+        english_family = families.get("aptos", "Aptos")
         urdu_family = choose_urdu_font(root)
         urdu_ranges = ((0x0600, 0x06FF), (0x0750, 0x077F), (0x08A0, 0x08FF),
                        (0xFB50, 0xFDFF), (0xFE70, 0xFEFF))
@@ -1597,8 +1603,8 @@ APP_BG = DEFAULT_BACKGROUND_COLOR
 CARD_BG = "#FFFFFF"
 BORDER = "#D9E3DF"
 GOLD = "#FFF3D6"
-SOFT_GREEN = "#E8F4EE"
-GREEN_HOVER = "#0B624A"
+PRIMARY_LIGHT = "#E8F4EE"
+PRIMARY_DARK = "#0B624A"
 DEFAULT_DB = r"D:\TAHA_SCHOOL_DATA\taha_school.db"
 PROJECT_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "taha_school.db")
 COURSES = [
@@ -2096,8 +2102,8 @@ class SchoolApp:
             "logo_path": "",
             "primary_color": DEFAULT_PRIMARY_COLOR,
             "background_color": DEFAULT_BACKGROUND_COLOR,
-            "text_color": DEFAULT_TEXT_COLOR,
-            "english_font": "Arial",
+            "text_color": "#173D32",
+            "english_font": "Aptos",
             "urdu_font": "Jameel Noori Nastaleeq",
             "font_size": "12",
             "font_size_heading": "14",
@@ -2115,7 +2121,6 @@ class SchoolApp:
             "page_backgrounds": "{}",
             "theme_mode": "light",
             "nav_orientation": "row",
-            "wallpaper_enabled": "0",
         }
         self.db.conn.executemany(
             "INSERT OR IGNORE INTO app_settings(setting_key,setting_value) VALUES(?,?)",
@@ -2124,10 +2129,9 @@ class SchoolApp:
         # previous built-in palette. Any genuinely customized colors are preserved.
         current_brand = self.db.conn.execute(
             "SELECT setting_value FROM app_settings WHERE setting_key='primary_color'").fetchone()
+        # "#2563EB" is NOT listed: blue is a valid user choice and must survive a restart.
         previous_defaults = {"#0F7457", "#174B3D", "#16634B", "#1B6E53", "#0D6B50",
-                             "#16785B", "#1F6F55", "#2563EB", "#10765B", "#0F5132"}
-        self.db.conn.execute("UPDATE app_settings SET setting_value='Arial' WHERE setting_key='english_font' AND setting_value='Aptos'")
-        self.db.conn.execute("UPDATE app_settings SET setting_value='auto' WHERE setting_key='text_color' AND setting_value IN ('#173D32','#132D23','#000000')")
+                             "#16785B", "#1F6F55", "#10765B"}
         if current_brand and str(current_brand[0]).strip().upper() in previous_defaults:
             migration = {
                 "primary_color": DEFAULT_PRIMARY_COLOR,
@@ -2173,14 +2177,14 @@ class SchoolApp:
         self.slogan_ur = self.settings.get("institution_slogan_ur", "تعلیم، تربیت اور قرآن کی روشنی")
         self.logo_path = self.settings.get("logo_path", "")
         # Restore saved branding colors before styling widgets on every launch.
-        global GREEN, GREEN_HOVER, APP_BG, DARK, UI_FONT, UI_BOLD_FONT, URDU_FONT
-        saved_primary = self.settings.get("primary_color", GREEN)
+        global PRIMARY, PRIMARY_DARK, APP_BG, DARK, UI_FONT, UI_BOLD_FONT, URDU_FONT
+        saved_primary = self.settings.get("primary_color", PRIMARY)
         saved_background = self.settings.get("background_color", APP_BG)
         saved_text = self.settings.get("text_color", DARK)
         try:
             self.root.winfo_rgb(saved_primary)
-            GREEN = saved_primary
-            GREEN_HOVER = saved_primary   # recalculated by _apply_theme_palette()
+            PRIMARY = saved_primary
+            PRIMARY_DARK = saved_primary
         except tk.TclError:
             pass
         try:
@@ -2189,21 +2193,18 @@ class SchoolApp:
         except tk.TclError:
             pass
         try:
-            if str(saved_text).strip().lower() != "auto":
-                self.root.winfo_rgb(saved_text)
-                DARK = saved_text
+            self.root.winfo_rgb(saved_text)
+            DARK = saved_text
         except tk.TclError:
             pass
         try:
             installed_fonts = {str(name).casefold(): str(name) for name in self.root.tk.call("font", "families")}
-            requested_english = self.settings.get("english_font", "Arial")
-            if requested_english.strip().casefold() == "aptos":
-                requested_english = "Arial"   # old default -> new default
-            UI_FONT = installed_fonts.get(requested_english.casefold(), installed_fonts.get("arial", "Arial"))
+            requested_english = self.settings.get("english_font", "Aptos")
+            UI_FONT = installed_fonts.get(requested_english.casefold(), installed_fonts.get("aptos", "Aptos"))
             requested_urdu = self.settings.get("urdu_font", "Jameel Noori Nastaleeq")
             URDU_FONT = installed_fonts.get(requested_urdu.casefold(), choose_urdu_font(self.root))
         except Exception:
-            UI_FONT = self.settings.get("english_font", "Arial") or "Arial"
+            UI_FONT = self.settings.get("english_font", "Aptos") or "Aptos"
             URDU_FONT = choose_urdu_font(self.root)
         UI_BOLD_FONT = UI_FONT
         self._apply_theme_palette()
@@ -2222,87 +2223,98 @@ class SchoolApp:
         else:
             self.login_screen()
 
+    def _resolve_primary_hex(self):
+        """Saved primary color as #RRGGBB (hex or any Tk color name); falls back to the preset color."""
+        raw = str(self.settings.get("primary_color", "") or "").strip()
+        if raw:
+            try:
+                r, g, b = self.root.winfo_rgb(raw)
+                return "#%02X%02X%02X" % (r // 257, g // 257, b // 257)
+            except (tk.TclError, AttributeError):
+                pass
+        key = str(self.settings.get("theme_preset", "emerald") or "emerald").strip().lower()
+        return THEME_PRESETS.get(key, THEME_PRESETS["emerald"])["primary"]
+
     def _apply_theme_palette(self):
-        """Set the shared light/day or dark/night palette and theme preset tokens."""
-        global APP_BG, CARD_BG, BORDER, DARK, MUTED, PALE, SOFT_GREEN, GREEN_HOVER, GREEN
+        """Derive every color token from the saved primary color and light/dark mode.
+
+        The saved primary color always wins (a preset only fills in that color). Status colors
+        (SEM_*) are fixed and never depend on it."""
+        global APP_BG, CARD_BG, BORDER, DARK, MUTED, PALE, PRIMARY_SUBTLE
+        global PRIMARY, PRIMARY_DARK, PRIMARY_LIGHT, PRIMARY_TEXT, PRIMARY_INK, PRINT_INK
+        global OK_INK, BAD_INK, WARN_INK, INFO_INK
         global ACCENT, ACCENT_HOVER, ACCENT_LIGHT, DANGER, DANGER_HOVER, DANGER_LIGHT, GOLD
         mode = str(self.settings.get("theme_mode", "light") or "light").strip().lower()
         if mode not in ("light", "dark"):
             mode = "light"
         self.theme_mode = mode
-
         preset_key = str(self.settings.get("theme_preset", "emerald") or "emerald").strip().lower()
         preset = THEME_PRESETS.get(preset_key, THEME_PRESETS["emerald"])
 
-        custom_primary = str(self.settings.get("primary_color", "") or "").strip()
-        if preset_key == "custom" and custom_primary:
-            primary = custom_primary
-            hover = self._mix_color(primary, "#000000", 0.22) if hasattr(self, "root") else primary
-            light = self._mix_color(primary, "#FFFFFF", 0.82) if hasattr(self, "root") else "#E8F4EE"
-        else:
-            primary = preset["primary"]
-            hover = preset["primary_hover"]
-            light = preset["primary_light"]
+        def saved_color(key, defaults):
+            raw = str(self.settings.get(key, "") or "").strip()
+            if not raw or raw.upper() in defaults:
+                return None
+            try:
+                r, g, b = self.root.winfo_rgb(raw)
+            except (tk.TclError, AttributeError):
+                return None
+            return "#%02X%02X%02X" % (r // 257, g // 257, b // 257)
 
-        # Legacy default values saved by older versions are treated as "not customised".
-        legacy_text = {"#173D32", "#132D23", "#000000", "AUTO", ""}
-        user_text = str(self.settings.get("text_color", "") or "").strip()
-        user_bg = str(self.settings.get("background_color", "") or "").strip()
-        legacy_bg = {"#F3F6F5", "#F8FAF8", ""}
-
-        GREEN = primary
-        GREEN_HOVER = hover
+        custom_bg = saved_color("background_color", {DEFAULT_BACKGROUND_COLOR.upper(), "#F8FAF8", "#F5F7F6"}) if mode == "light" else None
+        custom_text = saved_color("text_color", {"#173D32", "#132D23", "#101614"}) if mode == "light" else None
+        t = derive_theme_tokens(self._resolve_primary_hex(), mode, custom_bg, custom_text)
+        APP_BG, CARD_BG, BORDER, DARK, MUTED = t["APP_BG"], t["CARD_BG"], t["BORDER"], t["DARK"], t["MUTED"]
+        PRIMARY, PRIMARY_DARK, PRIMARY_LIGHT = t["PRIMARY"], t["PRIMARY_DARK"], t["PRIMARY_LIGHT"]
+        PRIMARY_TEXT, PRIMARY_INK, PRINT_INK = t["PRIMARY_TEXT"], t["PRIMARY_INK"], t["PRINT_INK"]
+        PALE = PRIMARY_SUBTLE = t["PALE"]
+        OK_INK, BAD_INK, WARN_INK, INFO_INK = t["OK_INK"], t["BAD_INK"], t["WARN_INK"], t["INFO_INK"]
         ACCENT = preset["accent"]
         ACCENT_HOVER = preset["accent_hover"]
         ACCENT_LIGHT = preset["accent_light"]
         GOLD = ACCENT_LIGHT
-
-        if mode == "dark":
-            APP_BG = preset.get("bg_dark", "#121A16")
-            CARD_BG = preset.get("card_dark", "#1D2823")
-            BORDER = preset.get("border_dark", "#2E3F37")
-            DARK = preset.get("text_dark", "#EAF2EE")
-            MUTED = preset.get("muted_dark", "#9BB0A6")
-            PALE = preset.get("card_dark", "#1D2823")
-            SOFT_GREEN = self._mix_color(GREEN, "#000000", 0.45) if hasattr(self, "root") else "#1D2823"
-        else:
-            APP_BG = preset.get("bg_light", "#F8FAF8")
-            CARD_BG = preset.get("card_light", "#FFFFFF")
-            BORDER = preset.get("border_light", "#DCE5E0")
-            DARK = preset.get("text_light", "#132D23")
-            MUTED = preset.get("muted_light", "#5D736A")
-            PALE = preset.get("primary_subtle", "#E8F4EE")
-            SOFT_GREEN = light
-            # Honour a custom background / text colour chosen in Settings (light mode).
-            try:
-                if user_bg and user_bg.upper() not in legacy_bg:
-                    self.root.winfo_rgb(user_bg)
-                    APP_BG = user_bg
-                    if on_color(user_bg, "#FFFFFF", "#000000") == "#FFFFFF":
-                        # Dark custom background: cards, borders and text follow it.
-                        CARD_BG = mix(user_bg, "#FFFFFF", 0.08)
-                        BORDER = mix(user_bg, "#FFFFFF", 0.22)
-                        MUTED = mix(user_bg, "#FFFFFF", 0.68)
-                        PALE = CARD_BG
-                        SOFT_GREEN = mix(user_bg, "#FFFFFF", 0.14)
-                        DARK = "#FFFFFF"
-                    else:
-                        DARK = "#000000"
-            except (tk.TclError, AttributeError):
-                pass
-            # An explicit text colour always wins; "auto" keeps the contrast choice above.
-            try:
-                if user_text and user_text.upper() not in legacy_text:
-                    self.root.winfo_rgb(user_text)
-                    DARK = user_text
-            except (tk.TclError, AttributeError):
-                pass
-
         try:
             if hasattr(self, "root") and self.root.winfo_exists():
                 self.root.configure(bg=APP_BG)
         except (tk.TclError, AttributeError):
             pass
+
+    def _persist_theme_keys(self, values):
+        self.db.conn.executemany(
+            "INSERT INTO app_settings(setting_key,setting_value) VALUES(?,?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value", values.items())
+        self.db.conn.commit()
+        self.settings.update(values)
+
+    def _rebuild_ui_keep_page(self):
+        """Rebuild the whole shell with the current tokens and return to the page the user was on."""
+        previous_page = getattr(self, "active_nav_label", None)
+        self._il_workspace_wallpaper_cache = LRUCache(8)
+        self.dashboard()
+        self._refresh_page_button_styles(force=True)
+        try:
+            self._refresh_active_header_wallpaper()
+        except Exception:
+            pass
+        if previous_page and previous_page in getattr(self, "nav_button_refs", {}):
+            initial = "🏠 Dashboard" if (self.user or {}).get("role") == "admin" else "👨‍🎓 My Students"
+            if previous_page != initial:
+                self.root.after_idle(lambda lab=previous_page: self.nav_button_refs.get(lab).invoke()
+                                     if self.nav_button_refs.get(lab) is not None else None)
+
+    def _apply_primary_live(self, primary, preset_key="custom", reset=False):
+        """Save a new primary color and restyle the WHOLE application immediately (no restart)."""
+        try:
+            self.root.winfo_rgb(primary)
+        except tk.TclError:
+            return
+        values = {"primary_color": primary, "theme_preset": preset_key}
+        if reset:
+            values.update({"background_color": DEFAULT_BACKGROUND_COLOR, "text_color": "#173D32"})
+        self._persist_theme_keys(values)
+        self._apply_theme_palette()
+        self.style()
+        self._rebuild_ui_keep_page()
 
     def style(self):
         """Consistent, crisp styling for the complete desktop application."""
@@ -2331,24 +2343,22 @@ class SchoolApp:
         s.configure("Workspace.TFrame", background=APP_BG)
         s.configure("Card.TFrame", background=CARD_BG)
         s.configure("TLabel", background=APP_BG, foreground=DARK, font=(style_font, fs(10)))
-        s.configure("Title.TLabel", background=APP_BG, foreground=GREEN, font=(style_font, fs(20), "bold"))
+        s.configure("Title.TLabel", background=APP_BG, foreground=PRIMARY_INK, font=(style_font, fs(21), "bold"))
         s.configure("Sub.TLabel", background=APP_BG, foreground=MUTED, font=(style_font, fs(10)))
         s.configure("Card.TLabel", background=CARD_BG, foreground=DARK, font=(style_font, fs(10)))
-        s.configure("TLabelframe", background=APP_BG, foreground=DARK, bordercolor=BORDER, relief="solid")
-        s.configure("TLabelframe.Label", background=APP_BG, foreground=GREEN, font=(style_font, fs(10), "bold"))
-        s.configure("Heading.TLabel", background=APP_BG, foreground=DARK, font=(style_font, fs(13), "bold"))
-        s.configure("Card.Heading.TLabel", background=CARD_BG, foreground=DARK, font=(style_font, fs(13), "bold"))
+        s.configure("TLabelframe", background=APP_BG, foreground=PRIMARY_INK, bordercolor=BORDER, relief="solid")
+        s.configure("TLabelframe.Label", background=APP_BG, foreground=PRIMARY_INK, font=(style_font, fs(10), "bold"))
         # Uniform default button color across the application. Semantic status controls
         # (Present/Absent/Leave) keep their separate state colors intentionally.
-        s.configure("TButton", font=(style_font, fs(10)), padding=(11, 7), background=GREEN,
-                    foreground=WHITE, bordercolor=GREEN, focusthickness=1, focuscolor="#9ACDBB",
+        s.configure("TButton", font=(style_font, fs(10)), padding=(11, 7), background=PRIMARY,
+                    foreground=PRIMARY_TEXT, bordercolor=PRIMARY, focusthickness=1, focuscolor=PRIMARY,
                     relief="flat", borderwidth=0)
-        s.map("TButton", background=[("disabled", "#DCE8E2"), ("pressed", GREEN_HOVER), ("active", GREEN_HOVER)],
+        s.map("TButton", background=[("disabled", BORDER), ("pressed", PRIMARY_DARK), ("active", PRIMARY_DARK)],
               foreground=[("disabled", "#8E9D96"), ("pressed", WHITE), ("active", WHITE)])
-        s.configure("Accent.TButton", background=GREEN, foreground=WHITE, padding=(13, 8),
-                    bordercolor=GREEN, font=(style_font, fs(10), "bold"), focusthickness=1,
-                    focuscolor="#9ACDBB", relief="flat", borderwidth=0)
-        s.map("Accent.TButton", background=[("disabled", "#DCE8E2"), ("pressed", GREEN_HOVER), ("active", GREEN_HOVER)],
+        s.configure("Accent.TButton", background=PRIMARY, foreground=PRIMARY_TEXT, padding=(13, 8),
+                    bordercolor=PRIMARY, font=(style_font, fs(10), "bold"), focusthickness=1,
+                    focuscolor=PRIMARY, relief="flat", borderwidth=0)
+        s.map("Accent.TButton", background=[("disabled", BORDER), ("pressed", PRIMARY_DARK), ("active", PRIMARY_DARK)],
               foreground=[("disabled", "#8E9D96"), ("active", WHITE), ("pressed", WHITE)])
         # Semantic button styles are reused by attendance controls throughout the app.
         for style_name, base, pale, text in (
@@ -2357,38 +2367,38 @@ class SchoolApp:
                 ("Leave.TButton", "#A15C07", "#FDF0D5", "#A15C07")):
             s.configure(style_name, background=pale, foreground=text, padding=(9, 6),
                         font=(style_font, fs(9), "bold"), relief="flat", borderwidth=0,
-                        focuscolor="#9ACDBB", focusthickness=1)
+                        focuscolor=PRIMARY, focusthickness=1)
             s.map(style_name, background=[("pressed", base), ("active", base)],
                   foreground=[("pressed", WHITE), ("active", WHITE), ("disabled", "#9AA6A0")])
         s.configure("Treeview", background=CARD_BG, fieldbackground=CARD_BG, foreground=DARK,
                     font=(style_font, fs(10)), rowheight=fs(34), borderwidth=0, bordercolor=CARD_BG,
                     lightcolor=BORDER, darkcolor=BORDER, relief="flat")
-        s.map("Treeview", background=[("selected", GREEN)], foreground=[("selected", on_color(GREEN, "#FFFFFF", "#000000"))])
-        s.configure("Treeview.Heading", background=GREEN, foreground=on_color(GREEN, "#FFFFFF", "#000000"),
-                    font=(style_font, fs(10), "bold"), padding=(10, 9), relief="flat",
-                    borderwidth=0, bordercolor=GREEN)
-        s.map("Treeview.Heading", background=[("pressed", GREEN_HOVER), ("active", GREEN_HOVER)],
-              foreground=[("active", on_color(GREEN_HOVER, "#FFFFFF", "#000000")), ("pressed", on_color(GREEN_HOVER, "#FFFFFF", "#000000"))])
+        s.map("Treeview", background=[("selected", PRIMARY)], foreground=[("selected", PRIMARY_TEXT)])
+        s.configure("Treeview.Heading", background=PRIMARY_LIGHT, foreground=PRIMARY_INK,
+                    font=(style_font, fs(10), "bold"), padding=(10, 8), relief="flat",
+                    borderwidth=0, bordercolor=PRIMARY_LIGHT)
+        s.map("Treeview.Heading", background=[("pressed", PALE), ("active", PALE)],
+              foreground=[("active", PRIMARY)])
         s.configure("TEntry", fieldbackground=CARD_BG, foreground=DARK, font=(style_font, fs(10)),
                     padding=(8, 7), bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER,
-                    insertcolor=GREEN, relief="flat")
-        s.map("TEntry", bordercolor=[("focus", GREEN)], lightcolor=[("focus", GREEN)],
-              darkcolor=[("focus", GREEN)])
+                    insertcolor=PRIMARY, relief="flat")
+        s.map("TEntry", bordercolor=[("focus", PRIMARY)], lightcolor=[("focus", PRIMARY)],
+              darkcolor=[("focus", PRIMARY)])
         s.configure("TCombobox", fieldbackground=CARD_BG, background=CARD_BG, foreground=DARK,
-                    font=(style_font, fs(10)), padding=(8, 6), arrowcolor=GREEN,
+                    font=(style_font, fs(10)), padding=(8, 6), arrowcolor=PRIMARY_INK,
                     bordercolor=BORDER, lightcolor=BORDER, darkcolor=BORDER, relief="flat")
         s.map("TCombobox", fieldbackground=[("readonly", CARD_BG), ("focus", CARD_BG)],
-              foreground=[("readonly", DARK)], bordercolor=[("focus", GREEN)])
+              foreground=[("readonly", DARK)], bordercolor=[("focus", PRIMARY)])
         s.map("TCombobox", fieldbackground=[("readonly", CARD_BG)], foreground=[("readonly", DARK)])
         s.configure("TCheckbutton", background=APP_BG, foreground=DARK, font=(style_font, fs(10)),
                     padding=(3, 3))
-        s.map("TCheckbutton", foreground=[("disabled", "#9AA6A0"), ("active", GREEN)])
+        s.map("TCheckbutton", foreground=[("disabled", "#9AA6A0"), ("active", PRIMARY)])
         s.configure("TRadiobutton", background=APP_BG, foreground=DARK, font=(style_font, fs(10)),
                     padding=(3, 3))
-        s.map("TRadiobutton", foreground=[("disabled", "#9AA6A0"), ("active", GREEN)])
-        s.configure("TScrollbar", background=BORDER, troughcolor=APP_BG, bordercolor=APP_BG,
-                    arrowcolor=GREEN, gripcount=0, relief="flat", borderwidth=0)
-        s.map("TScrollbar", background=[("active", MUTED), ("pressed", GREEN)])
+        s.map("TRadiobutton", foreground=[("disabled", "#9AA6A0"), ("active", PRIMARY)])
+        s.configure("TScrollbar", background=mix(PRIMARY, CARD_BG, 0.80), troughcolor=APP_BG, bordercolor=APP_BG,
+                    arrowcolor=PRIMARY_INK, gripcount=0, relief="flat", borderwidth=0)
+        s.map("TScrollbar", background=[("active", mix(PRIMARY, CARD_BG, 0.55)), ("pressed", PRIMARY)])
         self._install_wallpaper_button_styles(s, style_font, fs)
         if not getattr(self, "_il_dialog_palette_hooked", False):
             self._il_dialog_palette_hooked = True
@@ -2408,7 +2418,7 @@ class SchoolApp:
         except (tk.TclError, AttributeError):
             pass
 
-    def _button_texture_photos(self, width, height, tint=GREEN, wallpaper_mix=0.42):
+    def _button_texture_photos(self, width, height, tint=PRIMARY, wallpaper_mix=0.42):
         """Retired: buttons are flat solid colors now. Kept so old callers stay harmless."""
         return None
 
@@ -2426,9 +2436,7 @@ class SchoolApp:
           delete / dangerous    -> RED              (Danger.TButton)
           secondary             -> white + outline  (Secondary.TButton)
         """
-        disabled_bg, disabled_fg = "#DCE8E2", "#7C8B84"
-        if getattr(self, "theme_mode", "light") == "dark":
-            disabled_bg, disabled_fg = "#2A3731", "#7F948A"
+        disabled_bg, disabled_fg = mix(CARD_BG, DARK, 0.10), mix(CARD_BG, DARK, 0.42)
 
         def flat(name, base, fg=None, hover=None, pressed=None, bold=True, padding=(12, 8),
                  outline=None, anchor="center"):
@@ -2441,29 +2449,42 @@ class SchoolApp:
                                 lightcolor=edge, darkcolor=edge, relief="flat",
                                 borderwidth=1 if outline else 0, padding=padding, anchor=anchor,
                                 font=(style_font, fs(10), "bold" if bold else "normal"),
-                                focuscolor=GREEN, focusthickness=2)
+                                focuscolor=PRIMARY, focusthickness=2)
                 style.map(name,
                           background=[("disabled", disabled_bg), ("pressed", pressed), ("active", hover)],
                           foreground=[("disabled", disabled_fg), ("pressed", on_color(pressed)),
                                       ("active", on_color(hover))],
-                          bordercolor=[("focus", GREEN)] if outline else [])
+                          bordercolor=[("focus", PRIMARY)] if outline else [])
             except tk.TclError:
                 pass
 
-        flat("TButton", GREEN, hover=GREEN_HOVER, bold=False, padding=(11, 7))
-        flat("Accent.TButton", GREEN, hover=GREEN_HOVER, padding=(13, 8))
-        flat("Primary.TButton", GREEN, hover=GREEN_HOVER, padding=(13, 8))
+        flat("TButton", PRIMARY, hover=PRIMARY_DARK, bold=False, padding=(11, 7))
+        flat("Accent.TButton", PRIMARY, hover=PRIMARY_DARK, padding=(13, 8))
+        flat("Primary.TButton", PRIMARY, hover=PRIMARY_DARK, padding=(13, 8))
         flat("Info.TButton", SEM_BLUE, padding=(13, 8))
         flat("Export.TButton", SEM_ORANGE, padding=(13, 8))
         flat("Danger.TButton", SEM_RED, padding=(13, 8))
-        flat("Secondary.TButton", CARD_BG, fg=DARK, hover=SOFT_GREEN, pressed=PALE,
+        flat("Secondary.TButton", CARD_BG, fg=DARK, hover=PRIMARY_LIGHT, pressed=PALE,
              outline=BORDER, padding=(13, 8))
+        # Attendance / timetable calendar cells: white, tinted by status (Present / Absent / Leave).
+        dark_mode = getattr(self, "theme_mode", "light") == "dark"
+        def cal_colors(color):
+            if dark_mode:
+                return mix(CARD_BG, color, 0.30), mix(color, "#FFFFFF", 0.72)
+            return mix(color, "#FFFFFF", 0.86), mix(color, "#000000", 0.55)
+        flat("CalendarCell.TButton", CARD_BG, fg=DARK, hover=PRIMARY_LIGHT, pressed=PALE,
+             outline=BORDER, bold=False, padding=(6, 10))
+        for cal_name, cal_color in (("CalendarPresent", SEM_GREEN), ("CalendarAbsent", SEM_RED),
+                                    ("CalendarLeave", SEM_YELLOW), ("CalendarMarked", PRIMARY)):
+            cal_bg, cal_fg = cal_colors(cal_color)
+            flat(cal_name + ".TButton", cal_bg, fg=cal_fg, hover=shade(cal_bg, 0.06), pressed=shade(cal_bg, 0.12),
+                 outline=mix(cal_bg, cal_color, 0.45), padding=(6, 10))
         column = str(self.settings.get("nav_orientation", "row")).lower() == "column"
-        flat("Nav.TButton", CARD_BG, fg=DARK, hover=SOFT_GREEN, pressed=PALE,
+        flat("Nav.TButton", CARD_BG, fg=DARK, hover=PRIMARY_LIGHT, pressed=PALE,
              padding=(12, 9), anchor="w" if column else "center")
-        flat("NavActive.TButton", GREEN, hover=GREEN_HOVER, padding=(12, 9),
+        flat("NavActive.TButton", PRIMARY, hover=PRIMARY_DARK, padding=(12, 9),
              anchor="w" if column else "center")
-        self._il_active_button_style_signature = (GREEN, GREEN_HOVER, CARD_BG, APP_BG, SEM_BLUE,
+        self._il_active_button_style_signature = (PRIMARY, PRIMARY_DARK, CARD_BG, APP_BG, SEM_BLUE,
                                                   str(self.settings.get("theme_mode", "light")))
 
     _BUTTON_ROLE_WORDS = (
@@ -2472,8 +2493,8 @@ class SchoolApp:
         ("leave", r"\b(leave)\b|چھٹی"),
         ("danger", r"\b(delete|remove|reject|clear|deactivate|disable|erase|discard)\b|حذف|ہٹائیں"),
         ("secondary", r"\b(cancel|close|back|skip|later|no thanks|reset)\b|منسوخ|بند کریں|واپس"),
-        ("export", r"\b(print|export|download|certificates?|pdf|csv|excel|receipt|save as)\b|پرنٹ|ڈاؤن لوڈ|سرٹیفکیٹ|اسناد"),
-        ("info", r"\b(refresh|reload|open|view|show|details?|timetable|preview|select|browse|choose|search|filter)\b|ریفریش|تازہ|کھولیں|دیکھیں|تلاش"),
+        ("export", r"\b(print|export|download|certificates?|pdf|csv|excel|receipt)\b|پرنٹ|ڈاؤن لوڈ|سرٹیفکیٹ|اسناد"),
+        ("info", r"\b(refresh|reload|open|view all)\b|ریفریش|تازہ|کھولیں|سب دیکھیں"),
     )
     _LEGACY_BRAND_BGS = {"#0F5132", "#0A3622", "#0F7457", "#0B624A", "#10765B", "#174B3D",
                          "#16634B", "#1B6E53", "#0D6B50", "#16785B", "#1F6F55", "#0B5F49"}
@@ -2483,6 +2504,8 @@ class SchoolApp:
         text = str(text or "").casefold()
         for role, pattern in self._BUTTON_ROLE_WORDS:
             if re.search(pattern, text):
+                if not FUNCTION_BUTTON_COLORS and role in ("info", "export"):
+                    return "primary"
                 return role
         return "primary"
 
@@ -2502,9 +2525,9 @@ class SchoolApp:
         elif role == "leave":
             base = "#A15C07"
         elif role == "secondary":
-            return CARD_BG, DARK, SOFT_GREEN
+            return CARD_BG, DARK, PRIMARY_LIGHT
         else:
-            return GREEN, on_color(GREEN), GREEN_HOVER
+            return PRIMARY, on_color(PRIMARY), PRIMARY_DARK
         return base, on_color(base), shade(base, 0.12)
 
     def _is_brand_or_default_bg(self, color):
@@ -2512,7 +2535,7 @@ class SchoolApp:
         if not c:
             return True
         up = c.upper()
-        if up in self._LEGACY_BRAND_BGS or up in (str(GREEN).upper(), str(GREEN_HOVER).upper()):
+        if up in self._LEGACY_BRAND_BGS or up in (str(PRIMARY).upper(), str(PRIMARY_DARK).upper()):
             return True
         # Default (unstyled) Tk button faces.
         return c in ("SystemButtonFace", "#d9d9d9", "#D9D9D9", "#ececec", "#ECECEC")
@@ -2533,9 +2556,9 @@ class SchoolApp:
             cfg = dict(bg=bg, fg=fg, activebackground=hover, activeforeground=on_color(hover),
                        relief="flat", bd=0, cursor="hand2", takefocus=1)
             if role == "secondary":
-                cfg.update(highlightthickness=1, highlightbackground=BORDER, highlightcolor=GREEN)
+                cfg.update(highlightthickness=1, highlightbackground=BORDER, highlightcolor=PRIMARY_INK)
             else:
-                cfg.update(highlightthickness=0, highlightbackground=bg, highlightcolor=GREEN)
+                cfg.update(highlightthickness=0, highlightbackground=bg, highlightcolor=PRIMARY_INK)
             widget.configure(**cfg)
             widget._il_bg, widget._il_hover = bg, hover
             if not getattr(widget, "_il_hover_bound", False):
@@ -2803,10 +2826,10 @@ class SchoolApp:
             except Exception:
                 pass
         if not logo_drawn:
-            banner.create_oval(26, H // 2 - 30, 86, H // 2 + 30, fill=GREEN,
-                               outline=self._mix_color(GREEN, "#FFFFFF", 0.45), width=2, tags="fg")
+            banner.create_oval(26, H // 2 - 30, 86, H // 2 + 30, fill=PRIMARY,
+                               outline=self._mix_color(PRIMARY, "#FFFFFF", 0.45), width=2, tags="fg")
             banner.create_text(56, H // 2, text=(self._brand_display_name()[:1] or "T").upper(),
-                               fill=WHITE, font=(UI_FONT, 22, "bold"), tags="fg")
+                               fill=PRIMARY_TEXT, font=(UI_FONT, 22, "bold"), tags="fg")
 
         display_brand = self._brand_display_name()
         has_ur = APP_LANGUAGE == "ur"
@@ -2817,10 +2840,10 @@ class SchoolApp:
                            fill=text_color, font=(title_font, title_size, "bold"), tags="fg")
         self._banner_text(banner, text_x, top + (58 if has_ur else 43), subtitle, 10, "normal", sub_color)
 
-        chip_bg = GREEN
-        chip = tk.Frame(banner, bg=chip_bg, highlightbackground=self._mix_color(GREEN, "#FFFFFF", 0.35),
+        chip_bg = PRIMARY
+        chip = tk.Frame(banner, bg=chip_bg, highlightbackground=self._mix_color(PRIMARY, "#FFFFFF", 0.35),
                         highlightthickness=1, padx=14, pady=8)
-        smart_label(tk.Label, chip, text="LOCAL  •  OFFLINE", bg=chip_bg, fg=WHITE,
+        smart_label(tk.Label, chip, text="LOCAL  •  OFFLINE", bg=chip_bg, fg=PRIMARY_TEXT,
                     font=(UI_FONT, 9, "bold")).pack()
         chip_win = banner.create_window(0, H // 2, window=chip, anchor="e", tags="fg")
 
@@ -2831,8 +2854,8 @@ class SchoolApp:
             card = tk.Frame(banner, bg=CARD_BG, padx=4, pady=2,
                             highlightbackground=BORDER, highlightthickness=1, cursor="hand2")
             avatar = tk.Canvas(card, width=36, height=36, bg=CARD_BG, highlightthickness=0, bd=0)
-            avatar.create_oval(1, 1, 35, 35, fill=GREEN, outline="")
-            avatar.create_text(18, 18, text=(str(username)[:1] or "U").upper(), fill=WHITE,
+            avatar.create_oval(1, 1, 35, 35, fill=PRIMARY, outline="")
+            avatar.create_text(18, 18, text=(str(username)[:1] or "U").upper(), fill=PRIMARY_TEXT,
                                font=(UI_FONT, 12, "bold"))
             avatar.pack(side="left", padx=(0, 5))
             names = tk.Frame(card, bg=CARD_BG)
@@ -2841,7 +2864,7 @@ class SchoolApp:
                         font=(UI_FONT, 10, "bold"), anchor="w").pack(anchor="w")
             smart_label(tk.Label, names, text=str(role_label), bg=CARD_BG, fg=MUTED,
                         font=(UI_FONT, 9), anchor="w").pack(anchor="w")
-            tk.Label(card, text="▾", bg=CARD_BG, fg=GREEN,
+            tk.Label(card, text="▾", bg=CARD_BG, fg=PRIMARY_INK,
                      font=("Segoe UI Symbol", 11)).pack(side="left", padx=(5, 0))
             menu = tk.Menu(card, tearoff=0, font=(UI_FONT, 10))
             menu.add_command(label="Change Password / پاس ورڈ تبدیل کریں", command=self.change_password)
@@ -2886,7 +2909,7 @@ class SchoolApp:
                 paint_state["after"] = None
         banner.bind("<Configure>", schedule_paint)
         banner.after_idle(paint)
-        tk.Frame(inner, bg=GREEN, height=3).place(x=0, y=H, relwidth=1, height=3)
+        tk.Frame(inner, bg=PRIMARY, height=3).place(x=0, y=H, relwidth=1, height=3)
 
         return shell
 
@@ -3252,14 +3275,14 @@ class SchoolApp:
             t_win = tk.Toplevel(self.root)
             t_win.overrideredirect(True)
             t_win.attributes("-topmost", True)
-            t_win.configure(bg=GREEN)
+            t_win.configure(bg=PRIMARY)
             is_urdu = any(0x0600 <= ord(c) <= 0x06FF for c in str(message))
             f_family = URDU_FONT if is_urdu else UI_FONT
             f_size = 11 if is_urdu else 10
-            frame = tk.Frame(t_win, bg=GREEN, padx=16, pady=9, highlightbackground=WHITE, highlightthickness=1)
+            frame = tk.Frame(t_win, bg=PRIMARY, padx=16, pady=9, highlightbackground=WHITE, highlightthickness=1)
             frame.pack(fill="both", expand=True)
             icon = "✓ " if kind in ("info", "success") else ("⚠️ " if kind == "warning" else "ℹ️ ")
-            tk.Label(frame, text=icon + str(message), bg=GREEN, fg=WHITE,
+            tk.Label(frame, text=icon + str(message), bg=PRIMARY, fg=PRIMARY_TEXT,
                      font=(f_family, f_size, "bold" if is_urdu else "normal")).pack(side="left")
             t_win.update_idletasks()
             rw, rh = t_win.winfo_reqwidth(), t_win.winfo_reqheight()
@@ -3330,12 +3353,12 @@ class SchoolApp:
 
         # Keep the sign-in column compact and vertically balanced on desktop.
         # The logo lives only in the right identity panel so it is not duplicated.
-        tk.Label(left, text=display_brand, bg=CARD_BG, fg=GREEN,
+        tk.Label(left, text=display_brand, bg=CARD_BG, fg=PRIMARY_INK,
                  font=(brand_font, 18 if APP_LANGUAGE == "en" else 20, "bold"),
                  anchor="center", justify="center", wraplength=420).pack(fill="x", pady=(0, 0))
         tk.Label(left, text=("Academy Management System" if APP_LANGUAGE == "en" else "اکیڈمی مینجمنٹ سسٹم"),
                  bg=CARD_BG, fg=MUTED, font=(brand_font, 9), anchor="center").pack(fill="x", pady=(0, 3))
-        tk.Label(left, text=heading + " — " + helper, bg=SOFT_GREEN, fg=DARK,
+        tk.Label(left, text=heading + " — " + helper, bg=PRIMARY_LIGHT, fg=DARK,
                  font=(brand_font, 10), anchor="center", justify="center", wraplength=440,
                  padx=8, pady=2).pack(fill="x", pady=(0, 3))
 
@@ -3535,7 +3558,7 @@ class SchoolApp:
                 self._login_logo_image = None
         if self._login_logo_image is None:
             initials = (display_brand[:1] or "I").upper()
-            tk.Label(logo_area, text=initials, bg=PALE, fg=GREEN,
+            tk.Label(logo_area, text=initials, bg=PALE, fg=PRIMARY_INK,
                      font=(brand_font, 40, "bold"), bd=0, highlightthickness=0).pack(expand=True)
         # Restore the requested tagline beneath the logo; no arrows, stars, or guide lines.
         tagline = "Your school, your identity" if APP_LANGUAGE == "en" else "آپ کا ادارہ، آپ کی پہچان"
@@ -3923,10 +3946,10 @@ class SchoolApp:
             except (tk.TclError, AttributeError):
                 pass
             if self._nav_orientation == "column":
-                line = tk.Frame(holder, bg=GREEN, width=4)
+                line = tk.Frame(holder, bg=PRIMARY, width=4)
                 line.pack(side="right", fill="y")
             else:
-                line = tk.Frame(holder, bg=GREEN, height=3)
+                line = tk.Frame(holder, bg=PRIMARY, height=3)
                 line.pack(fill="x")
             self.nav_button_refs[label] = btn
             self.nav_underline_refs[label] = line
@@ -4453,7 +4476,7 @@ class SchoolApp:
         self.notification_window = win
         win.title("Notifications / نوٹیفیکیشنز")
         win.transient(self.root)
-        win.configure(bg="#DCE8E2")
+        win.configure(bg=BORDER)
         # A frameless drawer feels like an in-app notification center rather than a separate dialog.
         try:
             win.overrideredirect(True)
@@ -4485,7 +4508,7 @@ class SchoolApp:
         win.protocol("WM_DELETE_WINDOW", close_panel)
         win.bind("<Escape>", close_panel)
 
-        outer = tk.Frame(win, bg="#DCE8E2", padx=1, pady=1)
+        outer = tk.Frame(win, bg=BORDER, padx=1, pady=1)
         outer.pack(fill="both", expand=True)
         panel = tk.Frame(outer, bg=CARD_BG)
         panel.pack(fill="both", expand=True)
@@ -4495,36 +4518,36 @@ class SchoolApp:
         header.pack(fill="x")
         header_row = tk.Frame(header, bg=CARD_BG)
         header_row.pack(fill="x")
-        icon_wrap = tk.Frame(header_row, bg="#EAF4F0", width=42, height=42)
+        icon_wrap = tk.Frame(header_row, bg=PALE, width=42, height=42)
         icon_wrap.pack(side="left", padx=(0, 11))
         icon_wrap.pack_propagate(False)
-        tk.Label(icon_wrap, text="🔔", bg="#EAF4F0", fg=GREEN,
+        tk.Label(icon_wrap, text="🔔", bg=PALE, fg=PRIMARY_INK,
                  font=("Segoe UI Emoji", 20, "bold")).pack(expand=True)
         title_box = tk.Frame(header_row, bg=CARD_BG)
         title_box.pack(side="left", fill="x", expand=True)
         smart_label(tk.Label, title_box, text="Notifications / نوٹیفیکیشنز", bg=CARD_BG,
-                    fg="#173D32", font=(UI_FONT, 13, "bold")).pack(anchor="w")
+                    fg=DARK, font=(UI_FONT, 13, "bold")).pack(anchor="w")
         count_text = tk.Label(title_box, text="", bg=CARD_BG, fg=MUTED,
                               font=(UI_FONT, 9))
         count_text.pack(anchor="w", pady=(3, 0))
         close_btn = tk.Button(header_row, text="×", command=close_panel, width=3,
-                              bg=CARD_BG, fg="#66756D", activebackground="#F3F7F4",
+                              bg=CARD_BG, fg=MUTED, activebackground="#F3F7F4",
                               activeforeground=DARK, relief="flat", bd=0,
                               font=(UI_FONT, 19), cursor="hand2")
         close_btn.pack(side="right", anchor="n", padx=(0, 0))
-        tk.Frame(panel, bg="#DCE8E2", height=1).pack(fill="x")
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x")
 
         # Search field styled as a soft inset control.
         search_area = tk.Frame(panel, bg=CARD_BG, padx=18, pady=12)
         search_area.pack(fill="x")
-        search_shell = tk.Frame(search_area, bg="#F3F6F8",
+        search_shell = tk.Frame(search_area, bg=mix(CARD_BG, DARK, 0.04),
                                 highlightbackground="#E2E8EC", highlightthickness=1)
         search_shell.pack(fill="x")
-        tk.Label(search_shell, text="⌕", bg="#F3F6F8", fg="#66756D",
+        tk.Label(search_shell, text="⌕", bg=mix(CARD_BG, DARK, 0.04), fg=MUTED,
                  font=("Segoe UI Symbol", 19)).pack(side="left", padx=(11, 7))
         search_var = tk.StringVar(value=str(query or ""))
         search_entry = tk.Entry(search_shell, textvariable=search_var, relief="flat", bd=0,
-                                bg="#F3F6F8", fg="#173D32", insertbackground=GREEN,
+                                bg=mix(CARD_BG, DARK, 0.04), fg=DARK, insertbackground=PRIMARY_INK,
                                 font=(UI_FONT, 10))
         search_entry.pack(side="left", fill="x", expand=True, ipady=10, padx=(0, 10))
         if not str(query or ""):
@@ -4533,7 +4556,7 @@ class SchoolApp:
         def search_focus_in(_event=None):
             if search_entry.get() == "Search alerts...":
                 search_entry.delete(0, "end")
-                search_entry.configure(fg="#173D32")
+                search_entry.configure(fg=DARK)
         def search_focus_out(_event=None):
             if not search_entry.get().strip():
                 search_entry.insert(0, "Search alerts...")
@@ -4544,7 +4567,7 @@ class SchoolApp:
         # Category chips make fees, classes and system alerts easy to scan.
         filters = tk.Frame(panel, bg=CARD_BG, padx=18, pady=0)
         filters.pack(fill="x", pady=(0, 12))
-        list_holder = tk.Frame(panel, bg="#EAF4F0")
+        list_holder = tk.Frame(panel, bg=PALE)
         list_holder.pack(fill="both", expand=True)
         chip_buttons = {}
         category_var = {"value": str(category or "All")}
@@ -4559,9 +4582,9 @@ class SchoolApp:
             win._taha_notif_filter = name
             for filter_name, button in chip_buttons.items():
                 chosen = filter_name == name
-                button.configure(bg=GREEN if chosen else WHITE,
+                button.configure(bg=PRIMARY if chosen else WHITE,
                                  fg=WHITE if chosen else "#506159",
-                                 activebackground=GREEN if chosen else "#EAF4F0",
+                                 activebackground=PRIMARY if chosen else PALE,
                                  activeforeground=WHITE if chosen else DARK)
             render_items()
 
@@ -4570,23 +4593,23 @@ class SchoolApp:
             chip = tk.Button(filters,
                 text=f"{filter_name}  {counts[filter_name]}",
                 command=lambda n=filter_name: select_filter(n),
-                bg=GREEN if chosen else WHITE,
+                bg=PRIMARY if chosen else WHITE,
                 fg=WHITE if chosen else "#506159",
-                activebackground=GREEN if chosen else "#EAF4F0",
+                activebackground=PRIMARY if chosen else PALE,
                 activeforeground=WHITE, relief="flat", bd=0,
                 font=(UI_FONT, 9, "bold" if chosen else "normal"),
                 padx=10, pady=7, cursor="hand2")
             chip.pack(side="left", padx=(0, 6))
             chip_buttons[filter_name] = chip
 
-        body_shell = tk.Frame(list_holder, bg="#EAF4F0", padx=12, pady=10)
+        body_shell = tk.Frame(list_holder, bg=PALE, padx=12, pady=10)
         body_shell.pack(fill="both", expand=True)
-        scroll_canvas = tk.Canvas(body_shell, bg="#EAF4F0", highlightthickness=0, bd=0)
+        scroll_canvas = tk.Canvas(body_shell, bg=PALE, highlightthickness=0, bd=0)
         scroll = ttk.Scrollbar(body_shell, orient="vertical", command=scroll_canvas.yview)
         scroll_canvas.configure(yscrollcommand=scroll.set)
         scroll.pack(side="right", fill="y")
         scroll_canvas.pack(side="left", fill="both", expand=True)
-        inner = tk.Frame(scroll_canvas, bg="#EAF4F0")
+        inner = tk.Frame(scroll_canvas, bg=PALE)
         inner_window = scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda _e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")))
         scroll_canvas.bind("<Configure>", lambda e: scroll_canvas.itemconfigure(inner_window, width=e.width))
@@ -4625,7 +4648,7 @@ class SchoolApp:
                 empty_icon.pack(pady=(1, 10))
                 title = "You're all caught up" if not term and selected_group == "All" else "No matching notifications"
                 smart_label(tk.Label, empty, text=title + " / فی الحال کوئی الرٹ نہیں",
-                            bg=CARD_BG, fg="#173D32", font=(UI_FONT, 11, "bold"),
+                            bg=CARD_BG, fg=DARK, font=(UI_FONT, 11, "bold"),
                             wraplength=340, justify="center").pack(fill="x")
                 smart_label(tk.Label, empty,
                             text="Important fee, class and system alerts will appear here.",
@@ -4651,7 +4674,7 @@ class SchoolApp:
                 top_line = tk.Frame(main, bg=CARD_BG)
                 top_line.pack(fill="x")
                 title = str(item.get("title", "Notification"))
-                smart_label(tk.Label, top_line, text=title, bg=CARD_BG, fg="#173D32",
+                smart_label(tk.Label, top_line, text=title, bg=CARD_BG, fg=DARK,
                             font=(UI_FONT, 10, "bold"), wraplength=265,
                             justify="left").pack(side="left", fill="x", expand=True, anchor="w")
                 dismiss_key = str(item.get("dismiss_key", ""))
@@ -4681,8 +4704,8 @@ class SchoolApp:
                     }.get(action, "View details  →")
                     tk.Button(main, text=button_text,
                               command=lambda lab=target_label, w=win: self._open_notification_target(lab, w),
-                              bg=CARD_BG, fg=GREEN, activebackground="#EAF4F0",
-                              activeforeground=GREEN, relief="flat", bd=0,
+                              bg=CARD_BG, fg=PRIMARY_INK, activebackground=PALE,
+                              activeforeground=PRIMARY_INK, relief="flat", bd=0,
                               font=(UI_FONT, 9, "bold"), cursor="hand2",
                               anchor="w", padx=0, pady=2).pack(anchor="w")
 
@@ -4690,14 +4713,14 @@ class SchoolApp:
         render_items()
 
         # Footer stays visible while the list scrolls.
-        tk.Frame(panel, bg="#DCE8E2", height=1).pack(fill="x")
+        tk.Frame(panel, bg=BORDER, height=1).pack(fill="x")
         footer = tk.Frame(panel, bg=CARD_BG, padx=16, pady=10)
         footer.pack(fill="x")
         tk.Label(footer, text="Saved locally  •  Refreshes every minute", bg=CARD_BG,
                  fg="#819087", font=(UI_FONT, 8)).pack(side="left")
         tk.Button(footer, text="↻ Refresh", command=lambda w=win: self._refresh_notification_panel(w),
-                  bg="#EAF4F0", fg=GREEN, activebackground="#DCE8E2",
-                  activeforeground=GREEN, relief="flat", bd=0,
+                  bg=PALE, fg=PRIMARY_INK, activebackground=BORDER,
+                  activeforeground=PRIMARY_INK, relief="flat", bd=0,
                   font=(UI_FONT, 9, "bold"), cursor="hand2", padx=12, pady=6).pack(side="right")
         try:
             win.lift()
@@ -4766,32 +4789,32 @@ class SchoolApp:
         radius = 22
 
         # One continuous pill track, with only a restrained lower shadow.
-        rounded_rect(3, 4, width - 3, height - 1, 17, mix(GREEN, "#FFFFFF", 0.72), "")
-        rounded_rect(1, 1, width - 2, height - 5, 16, GREEN, shade(GREEN, 0.2), 1)
+        rounded_rect(3, 4, width - 3, height - 1, 17, "#D4E1DB", "")
+        rounded_rect(1, 1, width - 2, height - 5, 16, PRIMARY, PRIMARY_DARK, 1)
 
         inactive_text = "EN" if is_urdu else "اردو"
         inactive_font = (UI_FONT, 9, "bold") if inactive_text == "EN" else (URDU_FONT, 10, "bold")
         canvas.create_text(
             inactive_center, height / 2 - 1, text=inactive_text,
-            fill=on_color(GREEN, "#FFFFFF", "#000000"), font=inactive_font
+            fill="#FFFFFF", font=inactive_font
         )
 
         # The selected language sits on one raised white thumb. No sliding animation.
         rounded_rect(
             active_center - radius + 1, 3,
             active_center + radius + 1, height - 7,
-            14, shade(GREEN, 0.4), ""
+            14, "#07503C", ""
         )
         rounded_rect(
             active_center - radius, 2,
             active_center + radius, height - 8,
-            13, "#FFFFFF", mix(GREEN, "#FFFFFF", 0.8), 1
+            13, "#FFFFFF", "#D8E7E1", 1
         )
         active_text = "اردو" if is_urdu else "EN"
         active_font = (URDU_FONT, 10, "bold") if is_urdu else (UI_FONT, 9, "bold")
         canvas.create_text(
             active_center, height / 2 - 2, text=active_text,
-            fill=(GREEN if contrast_ratio(GREEN, "#FFFFFF") >= 3 else "#000000"), font=active_font
+            fill=PRIMARY_INK, font=active_font
         )
 
         def click(_event=None):
@@ -4805,7 +4828,7 @@ class SchoolApp:
         canvas.bind("<Button-1>", click)
         canvas.bind("<Return>", click)
         canvas.bind("<space>", click)
-        canvas.bind("<Enter>", lambda _event: canvas.configure(highlightthickness=1, highlightbackground=mix(GREEN, "#FFFFFF", 0.6)))
+        canvas.bind("<Enter>", lambda _event: canvas.configure(highlightthickness=1, highlightbackground="#B8D7CC"))
         canvas.bind("<Leave>", lambda _event: canvas.configure(highlightthickness=0))
         return canvas
 
@@ -4848,8 +4871,8 @@ class SchoolApp:
             inner = tk.Frame(canvas, bg=CARD_BG)
             canvas.create_window((0, 0), window=inner, anchor="nw")
             def make_arrow(text, direction):
-                return tk.Button(shell, text=text, command=lambda: self._nav_scroll(direction), bg=GREEN, fg=WHITE,
-                                 activebackground=GREEN_HOVER, activeforeground=WHITE,
+                return tk.Button(shell, text=text, command=lambda: self._nav_scroll(direction), bg=PRIMARY, fg=PRIMARY_TEXT,
+                                 activebackground=PRIMARY_DARK, activeforeground=PRIMARY_TEXT,
                                  relief="flat", bd=0, cursor="hand2", takefocus=0, font=(UI_FONT, 16, "bold"), padx=10)
             left, right = make_arrow("‹", -1), make_arrow("›", 1)
             self._nav_canvas, self._nav_inner = canvas, inner
@@ -4982,7 +5005,7 @@ class SchoolApp:
                 pass
             line = underlines.get(name)
             if line is not None:
-                line.configure(bg=GOLD if active else GREEN)
+                line.configure(bg=GOLD if active else PRIMARY)
         self.root.after_idle(lambda lab=label: self._nav_ensure_visible(lab))
 
     def _page_key_from_label(self, label=None):
@@ -5029,7 +5052,7 @@ class SchoolApp:
     def _refresh_page_button_styles(self, force=False):
         """Re-apply the flat button styles only when a color token actually changed."""
         try:
-            signature = (GREEN, GREEN_HOVER, CARD_BG, APP_BG, SEM_BLUE,
+            signature = (PRIMARY, PRIMARY_DARK, CARD_BG, APP_BG, SEM_BLUE,
                          str(self.settings.get("theme_mode", "light")))
             if not force and signature == getattr(self, "_il_active_button_style_signature", None):
                 return
@@ -5119,9 +5142,6 @@ class SchoolApp:
     def _install_page_wallpaper(self, parent):
         """Tile a cached viewport-sized wallpaper behind content without allocating a full-page bitmap."""
         if Image is None or ImageTk is None:
-            return None
-        if str(self.settings.get("wallpaper_enabled", "0")) != "1":
-            # Plain solid background: smooth, flicker-free scrolling.
             return None
         try:
             canvas = getattr(parent, '_il_wallpaper_canvas', None)
@@ -5276,7 +5296,7 @@ class SchoolApp:
         tk.Frame(card, bg=GOLD, width=4).pack(side="left", fill="y", padx=(0, 14))
         text_area = tk.Frame(card, bg=CARD_BG)
         text_area.pack(side="left", fill="x", expand=True)
-        smart_label(tk.Label, text_area, text=title, bg=CARD_BG, fg=GREEN,
+        smart_label(tk.Label, text_area, text=title, bg=CARD_BG, fg=PRIMARY_INK,
                  font=(UI_FONT, 19, "bold"), anchor="w").pack(anchor="w")
         if subtitle:
             smart_label(tk.Label, text_area, text=subtitle, bg=CARD_BG, fg=MUTED,
@@ -5287,10 +5307,10 @@ class SchoolApp:
         card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1,
                         padx=18, pady=16)
         card.grid(row=0, column=column, sticky="nsew", padx=6, pady=6)
-        tk.Frame(card, bg=GOLD if column == 0 else GREEN, height=3).pack(fill="x", pady=(0, 12))
+        tk.Frame(card, bg=GOLD if column == 0 else PRIMARY, height=3).pack(fill="x", pady=(0, 12))
         smart_label(tk.Label, card, text=title.upper(), bg=CARD_BG, fg=MUTED,
                  font=(UI_FONT, 9, "bold")).pack(anchor="w")
-        smart_label(tk.Label, card, text=str(value), bg=CARD_BG, fg=GREEN,
+        smart_label(tk.Label, card, text=str(value), bg=CARD_BG, fg=PRIMARY_INK,
                  font=(UI_FONT, 25, "bold")).pack(anchor="w", pady=(5, 0))
         parent.grid_columnconfigure(column, weight=1)
 
@@ -5477,7 +5497,7 @@ class SchoolApp:
         logo_photo = None
         if configured_logo and Image is not None and ImageTk is not None:
             try:
-                logo_photo = self._circular_logo_photo(configured_logo, 64, GREEN, 2)
+                logo_photo = self._circular_logo_photo(configured_logo, 64, PRIMARY, 2)
             except Exception:
                 logo_photo = None
         if logo_photo is not None:
@@ -5487,7 +5507,7 @@ class SchoolApp:
             logo_frame = tk.Frame(hero, bg=PALE, width=64, height=64, highlightbackground=BORDER, highlightthickness=1)
             logo_frame.pack(side="left", padx=(0, 14))
             logo_frame.pack_propagate(False)
-            tk.Label(logo_frame, text="📖", font=("Segoe UI Emoji", 24), bg=PALE, fg=GREEN).pack(expand=True)
+            tk.Label(logo_frame, text="📖", font=("Segoe UI Emoji", 24), bg=PALE, fg=PRIMARY_INK).pack(expand=True)
         hero_info = tk.Frame(hero, bg=CARD_BG)
         hero_info.pack(side="left", fill="both", expand=True)
         smart_label(tk.Label, hero_info, text=f"{self.brand_name} • {self.brand_name_ur}",
@@ -5552,10 +5572,10 @@ class SchoolApp:
                                      ("level", "Level", 90), ("teacher", "Teacher", 120), ("status", "Attendance", 110)):
                 tree.heading(key, text=text)
                 tree.column(key, width=width, minwidth=60, anchor="w", stretch=True)
-            tree.tag_configure("present", **row_tag_opts("present"))
-            tree.tag_configure("absent", **row_tag_opts("absent"))
-            tree.tag_configure("leave", **row_tag_opts("leave"))
-            tree.tag_configure("pending", **row_tag_opts("pending"))
+            tree.tag_configure("present", foreground=DARK)
+            tree.tag_configure("absent", foreground=BAD_INK)
+            tree.tag_configure("leave", foreground=INFO_INK)
+            tree.tag_configure("pending", foreground=WARN_INK)
             labels = {"Present": ("● Present", "present"), "Absent": ("● Absent", "absent")}
             by_iid = {}
             for index, item in enumerate(classes):
@@ -5586,9 +5606,9 @@ class SchoolApp:
                                      ("amount", "Amount", 100), ("status", "Status", 80)):
                 ptree.heading(key, text=text)
                 ptree.column(key, width=width, minwidth=50, anchor="w", stretch=True)
-            ptree.tag_configure("paid", **row_tag_opts("paid"))
-            ptree.tag_configure("partial", **row_tag_opts("partial"))
-            ptree.tag_configure("unpaid", **row_tag_opts("unpaid"))
+            ptree.tag_configure("paid", foreground=DARK)
+            ptree.tag_configure("partial", foreground=WARN_INK)
+            ptree.tag_configure("unpaid", foreground=BAD_INK)
             for row in data["recent"]:
                 status = str(row["status"] or "")
                 tag = status.lower() if status.lower() in ("paid", "partial", "unpaid") else "paid"
@@ -5684,7 +5704,7 @@ class SchoolApp:
         # The soft mint fill is used only as a backdrop/fallback; the image itself remains borderless.
         canvas.create_oval(pad, pad, size-pad, size-pad, fill="#DDF3E5", outline="", width=0, tags="frame")
         initials = "".join(part[:1] for part in str(display_name or "I").split()[:2]).upper() or "I"
-        text_item = canvas.create_text(size/2, size/2, text=initials, fill=GREEN,
+        text_item = canvas.create_text(size/2, size/2, text=initials, fill=PRIMARY,
                                        font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_BOLD_FONT,
                                              max(15, size//3), "bold"), tags="initials")
         image_item = canvas.create_image(size/2, size/2, image="", tags="profile_image")
@@ -5754,13 +5774,13 @@ class SchoolApp:
         win.title("Adjust photo or logo / تصویر یا لوگو ایڈجسٹ کریں")
         win.transient(self.root)
         win.resizable(False, False)
-        win.configure(bg="#EAF4F0")
-        outer = tk.Frame(win, bg="#EAF4F0", padx=18, pady=16)
+        win.configure(bg=PALE)
+        outer = tk.Frame(win, bg=PALE, padx=18, pady=16)
         outer.pack(fill="both", expand=True)
         tk.Label(outer, text="Adjust photo or logo / تصویر یا لوگو ایڈجسٹ کریں",
-                 bg="#EAF4F0", fg="#173D32", font=(UI_FONT, 15, "bold")).pack(anchor="w")
+                 bg=PALE, fg=DARK, font=(UI_FONT, 15, "bold")).pack(anchor="w")
         tk.Label(outer, text="Drag the photo inside the circle. Use the zoom slider to fit it your way.\nتصویر کو دائرے کے اندر گھسیٹیں اور زوم سلائیڈر سے سائز اپنی پسند کے مطابق کریں۔",
-                 bg="#EAF4F0", fg="#475569", font=(UI_FONT, 9), justify="left").pack(anchor="w", pady=(4, 12))
+                 bg=PALE, fg=MUTED, font=(UI_FONT, 9), justify="left").pack(anchor="w", pady=(4, 12))
         canvas = tk.Canvas(outer, width=canvas_size, height=canvas_size,
                            bg="#0F172A", bd=0, highlightthickness=0)
         canvas.pack()
@@ -5812,7 +5832,7 @@ class SchoolApp:
         canvas.bind("<B1-Motion>", drag_move)
 
         zoom_var = tk.DoubleVar(value=1.0)
-        tk.Label(outer, text="Zoom / زوم", bg="#EAF4F0", fg="#173D32",
+        tk.Label(outer, text="Zoom / زوم", bg=PALE, fg=DARK,
                  font=(UI_FONT, 10, "bold")).pack(anchor="w", pady=(12, 2))
         def change_zoom(value):
             try:
@@ -5829,7 +5849,7 @@ class SchoolApp:
             render_preview()
         ttk.Scale(outer, from_=0.60, to=3.5, variable=zoom_var, command=change_zoom).pack(fill="x")
 
-        button_row = tk.Frame(outer, bg="#EAF4F0")
+        button_row = tk.Frame(outer, bg=PALE)
         button_row.pack(fill="x", pady=(14, 0))
         def save_crop():
             try:
@@ -5855,9 +5875,9 @@ class SchoolApp:
             except Exception as exc:
                 messagebox.showerror("Logo could not be saved / لوگو محفوظ نہیں ہوا", str(exc), parent=win)
         tk.Button(button_row, text="Cancel / منسوخ", command=win.destroy,
-                  bg="#E2E8F0", fg="#173D32", relief="flat", padx=14, pady=7).pack(side="right", padx=(8, 0))
+                  bg=mix(CARD_BG, DARK, 0.08), fg=DARK, relief="flat", padx=14, pady=7).pack(side="right", padx=(8, 0))
         tk.Button(button_row, text="Use this crop / یہ فریم محفوظ کریں", command=save_crop,
-                  bg=GREEN, fg=on_color(GREEN, "#FFFFFF", "#000000"), activebackground=GREEN_HOVER, activeforeground=on_color(GREEN_HOVER, "#FFFFFF", "#000000"),
+                  bg=PRIMARY, fg=PRIMARY_TEXT, activebackground=PRIMARY_DARK, activeforeground=PRIMARY_TEXT,
                   relief="flat", padx=14, pady=7, font=(UI_FONT, 10, "bold")).pack(side="right")
         render_preview()
         win.update_idletasks()
@@ -6009,7 +6029,7 @@ class SchoolApp:
         mapping.geometry('850x' + str(min(680, max(400, 160 + 58 * len(collections)))))
         mapping.minsize(700, 380)
         heading = 'Choose which course each image folder belongs to' if APP_LANGUAGE == 'en' else 'منتخب کریں کہ ہر تصویری فولڈر کس کورس کا ہے'
-        tk.Label(mapping, text=heading, bg=APP_BG, fg=GREEN, font=(UI_FONT, 14, 'bold')).pack(anchor='w', padx=18, pady=(16, 6))
+        tk.Label(mapping, text=heading, bg=APP_BG, fg=PRIMARY_INK, font=(UI_FONT, 14, 'bold')).pack(anchor='w', padx=18, pady=(16, 6))
         summary = (f'{len(collections)} folders · {total_count:,} images · about {total_mb:,.1f} MB. Original files will not be changed.' if APP_LANGUAGE == 'en'
                    else f'{len(collections)} فولڈرز · {total_count:,} تصاویر · تقریباً {total_mb:,.1f} MB۔ اصل فائلیں تبدیل نہیں ہوں گی۔')
         tk.Label(mapping, text=summary, bg=APP_BG, fg=MUTED, font=(UI_FONT, 10), wraplength=800, justify='left').pack(anchor='w', padx=18, pady=(0, 10))
@@ -6073,7 +6093,7 @@ class SchoolApp:
                 tk.Label(picker,
                          text=('Select every course where this image collection should appear' if APP_LANGUAGE == 'en'
                                else 'وہ تمام کورس منتخب کریں جہاں یہ تصویری مجموعہ دکھانا ہے'),
-                         bg=APP_BG, fg=GREEN, font=(UI_FONT, 11, 'bold'),
+                         bg=APP_BG, fg=PRIMARY_INK, font=(UI_FONT, 11, 'bold'),
                          wraplength=430, justify='left').pack(fill='x', padx=16, pady=(15, 8))
                 tk.Label(picker, text=collection_name, bg=APP_BG, fg=MUTED,
                          font=(UI_FONT, 10, 'bold'), wraplength=430, justify='left').pack(anchor='w', padx=16, pady=(0, 8))
@@ -6090,7 +6110,7 @@ class SchoolApp:
                     check = tk.Checkbutton(check_area, text=display_label, variable=value,
                                            onvalue=True, offvalue=False, anchor='w', justify='left',
                                            bg=CARD_BG, fg=DARK, activebackground=CARD_BG,
-                                           activeforeground=GREEN, selectcolor=PALE,
+                                           activeforeground=PRIMARY_INK, selectcolor=PALE,
                                            font=(UI_FONT, 10), padx=6, pady=7, wraplength=185)
                     check.grid(row=course_index // 2, column=course_index % 2, sticky='ew', padx=4, pady=3)
                 action_row = tk.Frame(picker, bg=APP_BG)
@@ -6105,10 +6125,10 @@ class SchoolApp:
                         variable.set(False)
 
                 tk.Button(action_row, text=('Select all' if APP_LANGUAGE == 'en' else 'سب منتخب کریں'),
-                          command=select_all, bg=SOFT_GREEN, fg=GREEN, relief='flat',
+                          command=select_all, bg=PRIMARY_LIGHT, fg=PRIMARY_INK, relief='flat',
                           padx=10, pady=6, cursor='hand2').pack(side='left')
                 tk.Button(action_row, text=('Clear all' if APP_LANGUAGE == 'en' else 'سب ختم کریں'),
-                          command=clear_all, bg='#EEF2EF', fg=DARK, relief='flat',
+                          command=clear_all, bg=mix(CARD_BG, DARK, 0.07), fg=DARK, relief='flat',
                           padx=10, pady=6, cursor='hand2').pack(side='left', padx=(6, 0))
 
                 def apply_selection():
@@ -6118,14 +6138,14 @@ class SchoolApp:
                     picker.destroy()
 
                 tk.Button(action_row, text=('Apply selection' if APP_LANGUAGE == 'en' else 'انتخاب لاگو کریں'),
-                          command=apply_selection, bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER,
+                          command=apply_selection, bg=PRIMARY, fg=PRIMARY_TEXT, activebackground=PRIMARY_DARK,
                           relief='flat', padx=13, pady=7, cursor='hand2',
                           font=(UI_FONT, 10, 'bold')).pack(side='right')
                 picker.protocol('WM_DELETE_WINDOW', picker.destroy)
                 picker.grab_set()
                 picker.wait_window()
 
-            tk.Button(row, textvariable=button_var, command=choose_courses, bg=SOFT_GREEN, fg=GREEN,
+            tk.Button(row, textvariable=button_var, command=choose_courses, bg=PRIMARY_LIGHT, fg=PRIMARY_INK,
                       activebackground=PALE, relief='flat', padx=12, pady=8,
                       cursor='hand2', font=(UI_FONT, 9, 'bold')).pack(side='right', anchor='center')
             refresh_selection()
@@ -6137,7 +6157,7 @@ class SchoolApp:
             except tk.TclError: pass
             mapping.destroy()
         tk.Button(actions, text=('Cancel' if APP_LANGUAGE == 'en' else 'منسوخ'), command=cancel_mapping,
-                  bg='#EEF2EF', fg=DARK, relief='flat', padx=16, pady=7).pack(side='right', padx=(6, 0))
+                  bg=mix(CARD_BG, DARK, 0.07), fg=DARK, relief='flat', padx=16, pady=7).pack(side='right', padx=(6, 0))
         def start_import():
             chosen = []
             for collection, selected_keys in entries:
@@ -6155,7 +6175,7 @@ class SchoolApp:
             mapping.destroy()
             self._curriculum_copy_image_collections(chosen, source_root, after_import=after_import)
         tk.Button(actions, text=('Import selected folders' if APP_LANGUAGE == 'en' else 'منتخب فولڈرز درآمد کریں'),
-                  command=start_import, bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER,
+                  command=start_import, bg=PRIMARY, fg=PRIMARY_TEXT, activebackground=PRIMARY_DARK,
                   relief='flat', padx=16, pady=8, cursor='hand2', font=(UI_FONT, 10, 'bold')).pack(side='right')
         mapping.wait_window()
 
@@ -6310,18 +6330,18 @@ class SchoolApp:
         label = tk.Label(toolbar, text='', bg=CARD_BG, fg=DARK, font=(UI_FONT, 9, 'bold'), anchor='w')
         label.pack(side='left', padx=(4, 8))
         def tool_button(text, command, primary=False):
-            return tk.Button(toolbar, text=text, command=command, bg=GREEN if primary else '#F1F6F3',
-                fg=WHITE if primary else DARK, activebackground=GREEN_HOVER if primary else PALE,
-                activeforeground=WHITE if primary else GREEN, relief='flat', bd=0, padx=8, pady=5,
+            return tk.Button(toolbar, text=text, command=command, bg=PRIMARY if primary else '#F1F6F3',
+                fg=WHITE if primary else DARK, activebackground=PRIMARY_DARK if primary else PALE,
+                activeforeground=WHITE if primary else PRIMARY, relief='flat', bd=0, padx=8, pady=5,
                 cursor='hand2', font=(UI_FONT, 9, 'bold'))
         prev_btn = tool_button('‹' if APP_LANGUAGE == 'ur' else 'Previous', lambda: change_page(-1))
         prev_btn.pack(side='left', padx=2)
         next_btn = tool_button('اگلا' if APP_LANGUAGE == 'ur' else 'Next', lambda: change_page(1), primary=True)
         next_btn.pack(side='left', padx=2)
-        tk.Label(toolbar, textvariable=page_var, bg=CARD_BG, fg=GREEN, font=(UI_FONT, 9, 'bold')).pack(side='left', padx=6)
+        tk.Label(toolbar, textvariable=page_var, bg=CARD_BG, fg=PRIMARY_INK, font=(UI_FONT, 9, 'bold')).pack(side='left', padx=6)
         tool_button('−', lambda: adjust_zoom(-10)).pack(side='left', padx=2)
         zoom_var = tk.StringVar(value='Fit width' if APP_LANGUAGE == 'en' else 'پوری چوڑائی')
-        tk.Label(toolbar, textvariable=zoom_var, bg=CARD_BG, fg=GREEN, font=(UI_FONT, 9, 'bold'), width=10).pack(side='left', padx=3)
+        tk.Label(toolbar, textvariable=zoom_var, bg=CARD_BG, fg=PRIMARY_INK, font=(UI_FONT, 9, 'bold'), width=10).pack(side='left', padx=3)
         tool_button('+', lambda: adjust_zoom(10)).pack(side='left', padx=2)
         tool_button('Fit width' if APP_LANGUAGE == 'en' else 'پوری چوڑائی', lambda: fit_width()).pack(side='left', padx=2)
         collections = sorted({r['collection_name'] for r in rows}, key=self._curriculum_natural_key)
@@ -6372,7 +6392,7 @@ class SchoolApp:
                 messagebox.showerror('Could not save topic link' if APP_LANGUAGE == 'en' else 'موضوع محفوظ نہیں ہوا', str(exc), parent=viewer)
         if can_manage_images:
             tk.Button(topic_bar, text=('Save link' if APP_LANGUAGE == 'en' else 'منسلک کریں'), command=save_topic_link,
-                      bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER, relief='flat', padx=12, pady=6,
+                      bg=PRIMARY, fg=PRIMARY_TEXT, activebackground=PRIMARY_DARK, relief='flat', padx=12, pady=6,
                       cursor='hand2', font=(UI_FONT, 9, 'bold')).pack(side='left', padx=3)
         def current_row():
             return rows[state['index']] if rows and 0 <= state['index'] < len(rows) else None
@@ -6491,7 +6511,7 @@ class SchoolApp:
         tk.Button(topic_bar, text=('Open linked lesson' if APP_LANGUAGE == 'en' else 'منسلک سبق کھولیں'),
                   command=lambda: self._open_curriculum_lesson(course_key, current_row().get('topic_index'))
                       if current_row() and current_row().get('topic_index') is not None else messagebox.showinfo('Not linked', 'Link this page to a topic first.', parent=viewer),
-                  bg='#EAF4F0', fg=GREEN, relief='flat', padx=10, pady=6, cursor='hand2', font=(UI_FONT, 9)).pack(side='right', padx=3)
+                  bg=PALE, fg=PRIMARY_INK, relief='flat', padx=10, pady=6, cursor='hand2', font=(UI_FONT, 9)).pack(side='right', padx=3)
         def on_resize(event):
             if state['fit'] and event.widget is canvas:
                 if state['render_job']:
@@ -7188,16 +7208,16 @@ class SchoolApp:
         except tk.TclError:
             pass
 
-        titlebar = tk.Frame(win, bg=GREEN, padx=18, pady=7)
+        titlebar = tk.Frame(win, bg=PRIMARY, padx=18, pady=7)
         titlebar.pack(fill="x")
         titlebar.grid_columnconfigure(0, weight=1)
-        tk.Label(titlebar, text=guide.get("topic", ""), bg=GREEN, fg=WHITE,
+        tk.Label(titlebar, text=guide.get("topic", ""), bg=PRIMARY, fg=PRIMARY_TEXT,
                  font=(base_family, 15 if is_urdu else 13, "bold"),
                  anchor="e" if is_urdu else "w", justify="right" if is_urdu else "left"
                  ).grid(row=0, column=0, sticky="ew")
         meta = (f"{guide.get('course', '')}  •  سبق {unit_index + 1} / {guide.get('unit_count', len(sections))}" if is_urdu
                 else f"{guide.get('course', '')}  •  Topic {unit_index + 1} of {guide.get('unit_count', len(sections))}")
-        tk.Label(titlebar, text=meta, bg=GREEN, fg="#E7F3EE", font=(base_family, 9),
+        tk.Label(titlebar, text=meta, bg=PRIMARY, fg="#E7F3EE", font=(base_family, 9),
                  anchor="e" if is_urdu else "w", justify="right" if is_urdu else "left"
                  ).grid(row=1, column=0, sticky="ew", pady=(2, 0))
 
@@ -7217,14 +7237,14 @@ class SchoolApp:
 
         def btn(parent, label, command, primary=False):
             return tk.Button(parent, text=label, command=command,
-                             bg=GREEN if primary else "#F1F6F3", fg=WHITE if primary else DARK,
-                             activebackground=GREEN_HOVER if primary else PALE,
-                             activeforeground=WHITE if primary else GREEN,
+                             bg=PRIMARY if primary else "#F1F6F3", fg=WHITE if primary else DARK,
+                             activebackground=PRIMARY_DARK if primary else PALE,
+                             activeforeground=WHITE if primary else PRIMARY,
                              relief="flat", bd=0, padx=9, pady=3, cursor="hand2",
                              font=(UI_FONT, 9, "bold"))
 
         btn(toolbar, "A−", lambda: set_zoom(zoom_state["percent"] - 10)).pack(side="left", padx=2)
-        tk.Label(toolbar, textvariable=zoom_pct, bg=CARD_BG, fg=GREEN,
+        tk.Label(toolbar, textvariable=zoom_pct, bg=CARD_BG, fg=PRIMARY_INK,
                  font=(UI_FONT, 9, "bold"), width=5).pack(side="left", padx=3)
         tk.Label(toolbar, text="60%", bg=CARD_BG, fg=MUTED, font=(UI_FONT, 8)).pack(side="left", padx=(5, 1))
         slider = ttk.Scale(toolbar, from_=60, to=200, orient="horizontal", variable=slider_value,
@@ -7724,17 +7744,17 @@ class SchoolApp:
                 current_body["text"] = ("اس حصے کے لیے ابھی متن موجود نہیں۔" if is_urdu
                                          else "No text is available for this section yet.")
             for i, b in enumerate(section_buttons):
-                b.configure(bg=GREEN if i == index else "#EAF4F0",
-                            fg=WHITE if i == index else GREEN,
-                            activebackground=GREEN if i == index else PALE,
-                            activeforeground=WHITE if i == index else GREEN)
+                b.configure(bg=PRIMARY if i == index else PALE,
+                            fg=WHITE if i == index else PRIMARY,
+                            activebackground=PRIMARY if i == index else PALE,
+                            activeforeground=WHITE if i == index else PRIMARY)
             queue_render(preserve_scroll=False)
 
         for i, (section_heading, _content) in enumerate(sections):
             label = fallback_labels[i] if i < len(fallback_labels) else str(section_heading)
             b = tk.Button(section_bar, text=label, command=lambda ix=i: show_section(ix),
-                          bg="#EAF4F0", fg=GREEN, activebackground=PALE,
-                          activeforeground=GREEN, relief="flat", bd=0, padx=10, pady=5,
+                          bg=PALE, fg=PRIMARY_INK, activebackground=PALE,
+                          activeforeground=PRIMARY_INK, relief="flat", bd=0, padx=10, pady=5,
                           cursor="hand2", font=(base_family, 9, "bold"))
             b.pack(side="right" if is_urdu else "left", padx=2)
             section_buttons.append(b)
@@ -7762,11 +7782,11 @@ class SchoolApp:
         labels = guide.get("labels", {})
         if unit_index > 0:
             tk.Button(footer, text=labels.get("previous", "Previous" if not is_urdu else "پچھلا موضوع"),
-                      command=lambda: go_to(-1), bg="#EAF4F0", fg=GREEN, relief="flat",
+                      command=lambda: go_to(-1), bg=PALE, fg=PRIMARY_INK, relief="flat",
                       padx=10, pady=4, cursor="hand2", font=(base_family, 9)).pack(side="left", padx=(0, 5))
         if unit_index + 1 < int(guide.get("unit_count", 0)):
             tk.Button(footer, text=labels.get("next", "Next" if not is_urdu else "اگلا موضوع"),
-                      command=lambda: go_to(1), bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER,
+                      command=lambda: go_to(1), bg=PRIMARY, fg=PRIMARY_TEXT, activebackground=PRIMARY_DARK,
                       relief="flat", padx=10, pady=4, cursor="hand2", font=(base_family, 9, "bold")).pack(side="left", padx=(0, 5))
         tk.Button(footer, text=("Lesson images" if not is_urdu else "سبق کی تصاویر"),
                   command=lambda: self._open_curriculum_images(course_key, topic_index=unit_index),
@@ -7841,7 +7861,7 @@ class SchoolApp:
         sidebar.pack(side="left", fill="y", padx=(0, 12), pady=2)
         sidebar.pack_propagate(False)
         side_title = "Course library" if APP_LANGUAGE == "en" else "کورس لائبریری"
-        smart_label(tk.Label, sidebar, text=side_title, bg=CARD_BG, fg=GREEN,
+        smart_label(tk.Label, sidebar, text=side_title, bg=CARD_BG, fg=PRIMARY_INK,
                     font=(UI_FONT, 12, "bold")).pack(anchor="w", padx=13, pady=(14, 8))
         search_var = tk.StringVar()
         search_entry = ttk.Entry(sidebar, textvariable=search_var)
@@ -7872,7 +7892,7 @@ class SchoolApp:
             for widget in detail.winfo_children():
                 widget.destroy()
 
-        def section_card(parent_frame, heading, accent=GREEN):
+        def section_card(parent_frame, heading, accent=PRIMARY):
             card = tk.Frame(parent_frame, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=15, pady=12)
             card.pack(fill="x", pady=(0, 10))
             tk.Frame(card, bg=accent, height=3).pack(fill="x", pady=(0, 10))
@@ -7883,11 +7903,11 @@ class SchoolApp:
             key = selected["key"]
             item = self._curriculum_lang(key)
             clear_detail()
-            hero = tk.Frame(detail, bg=GREEN, padx=20, pady=17)
+            hero = tk.Frame(detail, bg=PRIMARY, padx=20, pady=17)
             hero.pack(fill="x", pady=(2, 10))
-            smart_label(tk.Label, hero, text=item["title"], bg=GREEN, fg=WHITE,
+            smart_label(tk.Label, hero, text=item["title"], bg=PRIMARY, fg=PRIMARY_TEXT,
                         font=(UI_FONT, 19, "bold"), wraplength=760).pack(anchor="w")
-            smart_label(tk.Label, hero, text=item["summary"], bg=GREEN, fg="#EAF4F0",
+            smart_label(tk.Label, hero, text=item["summary"], bg=PRIMARY, fg=PRIMARY_TEXT,
                         font=(UI_FONT, 10), wraplength=820, justify="left").pack(anchor="w", pady=(6, 0))
 
             goal_heading = "Learning goal" if APP_LANGUAGE == "en" else "تعلیمی مقصد"
@@ -7896,22 +7916,22 @@ class SchoolApp:
                         font=(UI_FONT, 10), wraplength=820, justify="left").pack(anchor="w", pady=(7, 0))
 
             units_heading = "Course outline" if APP_LANGUAGE == "en" else "نصاب کی تفصیل"
-            units_card = section_card(detail, units_heading, GREEN)
+            units_card = section_card(detail, units_heading, PRIMARY)
             for idx, unit in enumerate(item["units"], 1):
                 topic_row = tk.Frame(units_card, bg=CARD_BG)
                 topic_row.pack(fill="x", pady=3)
-                marker = tk.Label(topic_row, text=f"{idx:02d}", bg=SOFT_GREEN, fg=GREEN,
+                marker = tk.Label(topic_row, text=f"{idx:02d}", bg=PRIMARY_LIGHT, fg=PRIMARY_INK,
                                   font=(UI_FONT, 9, "bold"), width=4, padx=3, pady=6)
                 marker.pack(side="left", padx=(0, 8))
                 open_text = ("سبق کھولیں  ›" if APP_LANGUAGE == "ur" else "Open lesson  ›")
                 topic_button = tk.Button(topic_row, text=unit, anchor="w", justify="right" if APP_LANGUAGE == "ur" else "left",
                     command=lambda course=key, lesson_index=idx - 1: self._open_curriculum_lesson(course, lesson_index),
-                    bg=CARD_BG, fg=DARK, activebackground=SOFT_GREEN, activeforeground=GREEN,
+                    bg=CARD_BG, fg=DARK, activebackground=PRIMARY_LIGHT, activeforeground=PRIMARY_INK,
                     relief="flat", bd=0, highlightthickness=1, highlightbackground=BORDER,
                     padx=10, pady=7, wraplength=650, cursor="hand2",
                     font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 10, "bold"))
                 topic_button.pack(side="left", fill="x", expand=True)
-                tk.Label(topic_row, text=open_text, bg=CARD_BG, fg=GREEN,
+                tk.Label(topic_row, text=open_text, bg=CARD_BG, fg=PRIMARY_INK,
                          font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 8, "bold")).pack(side="left", padx=(7, 0))
 
             outcomes_heading = "Expected learning outcomes" if APP_LANGUAGE == "en" else "متوقعہ تعلیمی نتائج"
@@ -7936,18 +7956,18 @@ class SchoolApp:
             image_actions = tk.Frame(image_card, bg=CARD_BG)
             image_actions.pack(fill="x", anchor="w")
             tk.Button(image_actions, text=("Open image pages" if APP_LANGUAGE == "en" else "تصویری صفحات کھولیں"),
-                      command=lambda k=key: self._open_curriculum_images(k), bg=GREEN, fg=WHITE,
-                      activebackground=GREEN_HOVER, activeforeground=WHITE, relief="flat",
+                      command=lambda k=key: self._open_curriculum_images(k), bg=PRIMARY, fg=PRIMARY_TEXT,
+                      activebackground=PRIMARY_DARK, activeforeground=PRIMARY_TEXT, relief="flat",
                       padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
             if is_admin:
                 tk.Button(image_actions, text=("Import folder" if APP_LANGUAGE == "en" else "فولڈر درآمد کریں"),
                           command=lambda k=key: self._curriculum_import_image_tree(default_course=k, after_import=render_selected),
-                          bg=SOFT_GREEN, fg=GREEN, activebackground=PALE, relief="flat",
+                          bg=PRIMARY_LIGHT, fg=PRIMARY_INK, activebackground=PALE, relief="flat",
                           padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
                 if key == "Noorani Qaida":
                     tk.Button(image_actions, text=("Import supplied Qaida pages" if APP_LANGUAGE == "en" else "بھیجے گئے قاعدے کے صفحات شامل کریں"),
                               command=lambda: self._curriculum_import_bundled_noorani_pages(after_import=render_selected),
-                              bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER, relief="flat",
+                              bg=PRIMARY, fg=PRIMARY_TEXT, activebackground=PRIMARY_DARK, relief="flat",
                               padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
 
             # Separate curriculum-upload/library option. PDFs are stored in the same
@@ -7965,12 +7985,12 @@ class SchoolApp:
                 action_row = tk.Frame(pdf_card, bg=CARD_BG)
                 action_row.pack(fill="x", anchor="w")
                 tk.Button(action_row, text=("Open as page images" if APP_LANGUAGE == "en" else "تصویری صفحات میں کھولیں"),
-                          command=lambda k=key: self._open_curriculum_pdf(k), bg=GREEN, fg=WHITE,
-                          activebackground=GREEN_HOVER, activeforeground=WHITE, relief="flat",
+                          command=lambda k=key: self._open_curriculum_pdf(k), bg=PRIMARY, fg=PRIMARY_TEXT,
+                          activebackground=PRIMARY_DARK, activeforeground=PRIMARY_TEXT, relief="flat",
                           padx=12, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
                 if is_admin:
                     tk.Button(action_row, text=("Replace PDF" if APP_LANGUAGE == "en" else "PDF تبدیل کریں"),
-                              command=lambda k=key: upload_pdf(k), bg=SOFT_GREEN, fg=GREEN,
+                              command=lambda k=key: upload_pdf(k), bg=PRIMARY_LIGHT, fg=PRIMARY_INK,
                               activebackground=PALE, relief="flat", padx=12, pady=8,
                               cursor="hand2", font=(UI_FONT, 9, "bold")).pack(side="left", padx=(0, 7))
                     tk.Button(action_row, text=("Remove PDF" if APP_LANGUAGE == "en" else "PDF ہٹائیں"),
@@ -7984,8 +8004,8 @@ class SchoolApp:
                             font=(UI_FONT, 10), wraplength=780, justify="left").pack(anchor="w", pady=(7, 8))
                 if is_admin:
                     tk.Button(pdf_card, text=("Upload curriculum PDF" if APP_LANGUAGE == "en" else "نصاب کی PDF اپ لوڈ کریں"),
-                              command=lambda k=key: upload_pdf(k), bg=GREEN, fg=WHITE,
-                              activebackground=GREEN_HOVER, activeforeground=WHITE, relief="flat",
+                              command=lambda k=key: upload_pdf(k), bg=PRIMARY, fg=PRIMARY_TEXT,
+                              activebackground=PRIMARY_DARK, activeforeground=PRIMARY_TEXT, relief="flat",
                               padx=13, pady=8, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(anchor="w")
             if not is_admin and not (row and row["pdf_name"]):
                 viewer_note = ("Ask the administrator to attach the official PDF if your class requires one." if APP_LANGUAGE == "en"
@@ -8062,8 +8082,8 @@ class SchoolApp:
                     continue
                 active = selected["key"] == key
                 button = tk.Button(list_inner, text=item["title"], anchor="w", justify="left",
-                    command=lambda k=key: choose_course(k), bg=GREEN if active else WHITE,
-                    fg=WHITE if active else DARK, activebackground=SOFT_GREEN, activeforeground=GREEN,
+                    command=lambda k=key: choose_course(k), bg=PRIMARY if active else WHITE,
+                    fg=WHITE if active else DARK, activebackground=PRIMARY_LIGHT, activeforeground=PRIMARY_INK,
                     relief="flat", bd=0, padx=12, pady=10, wraplength=210,
                     font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 10, "bold"), cursor="hand2")
                 button.pack(fill="x", padx=3, pady=2)
@@ -8140,9 +8160,9 @@ class SchoolApp:
         page_total = document.page_count
         page_text = tk.StringVar(value=f"1 / {page_total}")
         def control(text, command, accent=False):
-            return tk.Button(toolbar, text=text, command=command, bg=GREEN if accent else WHITE,
-                fg=WHITE if accent else DARK, activebackground=GREEN_HOVER if accent else SOFT_GREEN,
-                activeforeground=WHITE if accent else GREEN, relief="flat", bd=0, padx=10, pady=7,
+            return tk.Button(toolbar, text=text, command=command, bg=PRIMARY if accent else WHITE,
+                fg=WHITE if accent else DARK, activebackground=PRIMARY_DARK if accent else PRIMARY_LIGHT,
+                activeforeground=WHITE if accent else PRIMARY, relief="flat", bd=0, padx=10, pady=7,
                 cursor="hand2", font=(URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT, 9, "bold"))
         prev_btn = control("‹  " + ("Previous" if APP_LANGUAGE == "en" else "پچھلا"), lambda: change_page(-1))
         prev_btn.pack(side="left", padx=3)
@@ -8432,7 +8452,7 @@ class SchoolApp:
                 try:
                     with open(self.logo_path, "rb") as lf:
                         b64_logo = base64.b64encode(lf.read()).decode("ascii")
-                        logo_img_tag = f'<img src="data:image/png;base64,{b64_logo}" style="width:90px;height:90px;border-radius:50%;border:3px solid #0F5132;margin-bottom:10px;">'
+                        logo_img_tag = f'<img src="data:image/png;base64,{b64_logo}" style="width:90px;height:90px;border-radius:50%;border:3px solid {PRIMARY};margin-bottom:10px;">'
                 except Exception:
                     logo_img_tag = ""
 
@@ -8446,18 +8466,18 @@ class SchoolApp:
 <style>
 @page {{ size: landscape; margin: 15mm; }}
 body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, Arial, sans-serif; background: #FAF9F6; margin: 0; padding: 20px; text-align: center; color: #1A3026; }}
-.cert-border {{ border: 12px double #0F5132; padding: 25px; background: #FFFFFF; box-shadow: 0 0 20px rgba(0,0,0,0.1); max-width: 950px; margin: 0 auto; position: relative; }}
+.cert-border {{ border: 12px double {PRIMARY}; padding: 25px; background: #FFFFFF; box-shadow: 0 0 20px rgba(0,0,0,0.1); max-width: 950px; margin: 0 auto; position: relative; }}
 .inner-border {{ border: 2px solid #D4AF37; padding: 30px; position: relative; }}
-.bismillah {{ font-size: 26px; color: #0F5132; margin-bottom: 8px; font-weight: bold; }}
-.inst-title {{ font-size: 28px; font-weight: bold; color: #0F5132; margin: 4px 0; }}
+.bismillah {{ font-size: 26px; color: {PRINT_INK}; margin-bottom: 8px; font-weight: bold; }}
+.inst-title {{ font-size: 28px; font-weight: bold; color: {PRINT_INK}; margin: 4px 0; }}
 .inst-subtitle {{ font-size: 16px; color: #5D736A; margin-bottom: 12px; }}
 .cert-header {{ font-size: 32px; font-weight: bold; color: #D4AF37; text-transform: uppercase; margin: 15px 0 20px 0; letter-spacing: 2px; text-shadow: 1px 1px 1px #8C7320; }}
 .cert-body {{ font-size: 18px; line-height: 2.2; margin: 20px 40px; text-align: center; }}
-.stu-name {{ font-size: 26px; font-weight: bold; color: #0F5132; border-bottom: 2px dashed #0F5132; display: inline-block; padding: 0 20px; }}
+.stu-name {{ font-size: 26px; font-weight: bold; color: {PRINT_INK}; border-bottom: 2px dashed {PRIMARY}; display: inline-block; padding: 0 20px; }}
 .signatures {{ display: flex; justify-content: space-between; margin-top: 50px; padding: 0 50px; }}
 .sig-block {{ width: 220px; text-align: center; border-top: 1px solid #1A3026; padding-top: 8px; font-size: 16px; }}
-.print-btn {{ margin-top: 25px; padding: 10px 24px; background: #0F5132; color: #FFF; border: none; font-size: 16px; border-radius: 6px; cursor: pointer; }}
-@media print {{ .print-btn {{ display: none; }} body {{ background: #FFF; padding: 0; }} .cert-border {{ box-shadow: none; border: 8px double #0F5132; }} }}
+.print-btn {{ margin-top: 25px; padding: 10px 24px; background: {PRIMARY}; color: {PRIMARY_TEXT}; border: none; font-size: 16px; border-radius: 6px; cursor: pointer; }}
+@media print {{ .print-btn {{ display: none; }} body {{ background: #FFF; padding: 0; }} .cert-border {{ box-shadow: none; border: 8px double {PRIMARY}; }} }}
 </style>
 </head>
 <body>
@@ -8568,13 +8588,13 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, Arial, sans-s
 <title>Progress Report - {stu_name} - {month}</title>
 <style>
 body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; background: #F8FAF8; padding: 25px; color: #132D23; }}
-.card {{ background: #FFF; border: 2px solid #0F5132; max-width: 800px; margin: 0 auto; padding: 30px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border-radius: 8px; }}
+.card {{ background: #FFF; border: 2px solid {PRIMARY}; max-width: 800px; margin: 0 auto; padding: 30px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); border-radius: 8px; }}
 .header {{ text-align: center; border-bottom: 2px solid #D4AF37; padding-bottom: 15px; margin-bottom: 20px; }}
-.inst-name {{ font-size: 26px; font-weight: bold; color: #0F5132; }}
+.inst-name {{ font-size: 26px; font-weight: bold; color: {PRINT_INK}; }}
 .table {{ width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 16px; }}
 .table th, .table td {{ border: 1px solid #DCE5E0; padding: 10px 14px; text-align: right; }}
-.table th {{ background: #E8F4EE; color: #0F5132; font-weight: bold; }}
-.print-btn {{ display: block; margin: 20px auto 0 auto; padding: 10px 24px; background: #0F5132; color: #FFF; border: none; font-size: 16px; border-radius: 6px; cursor: pointer; }}
+.table th {{ background: {tint(PRIMARY, 0.88)}; color: {PRINT_INK}; font-weight: bold; }}
+.print-btn {{ display: block; margin: 20px auto 0 auto; padding: 10px 24px; background: {PRIMARY}; color: {PRIMARY_TEXT}; border: none; font-size: 16px; border-radius: 6px; cursor: pointer; }}
 @media print {{ .print-btn {{ display: none; }} body {{ padding: 0; background: #FFF; }} .card {{ box-shadow: none; }} }}
 </style>
 </head>
@@ -8591,7 +8611,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
     <tr><th>سبقی کی کیفیت / Recent Revision (Sabqi)</th><td colspan="3">{sabqi_var.get()}</td></tr>
     <tr><th>منزل کی کیفیت / Old Revision (Manzil)</th><td colspan="3">{manzil_var.get()}</td></tr>
     <tr><th>ماہانہ حاضری / Attendance</th><td colspan="3">{att_pct} ({present_days}/{total_days} دن حاضر)</td></tr>
-    <tr><th>استاد کا تبصرہ / Teacher Remarks</th><td colspan="3" style="color:#0F5132;font-weight:bold;">{remarks_var.get()}</td></tr>
+    <tr><th>استاد کا تبصرہ / Teacher Remarks</th><td colspan="3" style="color:{PRINT_INK};font-weight:bold;">{remarks_var.get()}</td></tr>
   </table>
   <div style="display:flex;justify-content:space-between;margin-top:40px;padding:0 30px;">
     <div>دستخط نگران استاد: _______________</div>
@@ -8775,7 +8795,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         slogan_en_var = tk.StringVar(value=self.settings.get("institution_slogan_en", getattr(self, "slogan_en", "")) or "")
         slogan_ur_var = tk.StringVar(value=self.settings.get("institution_slogan_ur", getattr(self, "slogan_ur", "")) or "")
         logo_var = tk.StringVar(value=self.logo_path)
-        primary_var = tk.StringVar(value=self.settings.get("primary_color", GREEN))
+        primary_var = tk.StringVar(value=self.settings.get("primary_color", PRIMARY))
         bg_var = tk.StringVar(value=self.settings.get("background_color", APP_BG))
         text_color_var = tk.StringVar(value=self.settings.get("text_color", DARK))
         font_size_var = tk.StringVar(value=str(self.settings.get("font_size", "12")))
@@ -8797,8 +8817,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         try:
             installed_fonts = sorted({str(x) for x in self.root.tk.call("font", "families")}, key=str.casefold)
         except Exception:
-            installed_fonts = ["Arial", "Aptos", "Segoe UI", "Tahoma", "Jameel Noori Nastaleeq", "Noto Nastaliq Urdu"]
-        english_options = [x for x in ("Arial", "Aptos", "Segoe UI", "Tahoma", "Calibri") if x.casefold() in {f.casefold() for f in installed_fonts}]
+            installed_fonts = ["Aptos", "Segoe UI", "Arial", "Tahoma", "Jameel Noori Nastaleeq", "Noto Nastaliq Urdu"]
+        english_options = [x for x in ("Aptos", "Segoe UI", "Arial", "Tahoma", "Calibri") if x.casefold() in {f.casefold() for f in installed_fonts}]
         english_options += [x for x in installed_fonts if x not in english_options and x.casefold() not in {y.casefold() for y in english_options}]
         urdu_options = [x for x in ("Jameel Noori Nastaleeq", "Noto Nastaliq Urdu", "Noto Nastaliq Urdu UI", "Urdu Typesetting", "Nafees Nastaleeq", "Segoe UI") if x.casefold() in {f.casefold() for f in installed_fonts}]
         if not urdu_options:
@@ -8836,14 +8856,14 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             preview_canvas.delete("all")
             if path and os.path.isfile(path) and Image is not None and ImageTk is not None:
                 try:
-                    photo = self._circular_logo_photo(path, 76, GREEN, 2)
+                    photo = self._circular_logo_photo(path, 76, PRIMARY, 2)
                     preview_ref["img"] = photo
                     preview_canvas.create_image(42, 42, image=photo)
                     return
                 except Exception:
                     pass
             # Fallback circle
-            preview_canvas.create_oval(8, 8, 76, 76, fill=PALE, outline=GREEN, width=2)
+            preview_canvas.create_oval(8, 8, 76, 76, fill=PALE, outline=PRIMARY, width=2)
             preview_canvas.create_text(42, 42, text="📖", font=("Segoe UI Emoji", 26))
 
         logo_controls = ttk.Frame(logo_area)
@@ -8904,14 +8924,30 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             if chosen_key in THEME_PRESETS:
                 p_col = THEME_PRESETS[chosen_key]["primary"]
                 primary_var.set(p_col)
+                self.root.after_idle(apply_primary_now)
 
         preset_combo.bind("<<ComboboxSelected>>", on_preset_selected)
 
         def reset_to_emerald():
             theme_preset_var.set(preset_labels["emerald"])
             primary_var.set(THEME_PRESETS["emerald"]["primary"])
-            bg_var.set(DEFAULT_BACKGROUND_COLOR)
-            text_color_var.set(DEFAULT_TEXT_COLOR)
+            bg_var.set("#F8FAF8")
+            text_color_var.set("#132D23")
+            self.root.after_idle(lambda: self._apply_primary_live(THEME_PRESETS["emerald"]["primary"], "emerald", reset=True))
+
+        def apply_primary_now(_e=None):
+            """Live preview: restyle the whole UI with the primary color currently in the box."""
+            value = primary_var.get().strip()
+            try:
+                self.root.winfo_rgb(value)
+            except tk.TclError:
+                return
+            key = "custom"
+            for k, preset in THEME_PRESETS.items():
+                if k != "custom" and str(preset["primary"]).upper() == value.upper():
+                    key = k
+                    break
+            self.root.after_idle(lambda: self._apply_primary_live(value, key))
 
         ttk.Button(preset_row, text="Reset to Default Theme / اصل تھیم", command=reset_to_emerald, state=entry_state).pack(side="left", padx=(8, 0))
 
@@ -8920,7 +8956,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         color_row = ttk.Frame(form)
         color_row.grid(row=6, column=1, sticky="ew", padx=7, pady=6)
         ttk.Entry(color_row, textvariable=primary_var, width=16, state=entry_state).pack(side="left")
-        ttk.Button(color_row, text="Choose…", command=lambda: self._choose_color(primary_var), state=entry_state).pack(side="left", padx=6)
+        ttk.Button(color_row, text="Choose…", command=lambda: (self._choose_color(primary_var), apply_primary_now()), state=entry_state).pack(side="left", padx=6)
 
         # Row 7: Background & Text Colors
         smart_label(ttk.Label, form, text="Background color / پس منظر کا رنگ").grid(row=7, column=0, sticky="w", padx=7, pady=6)
@@ -8991,16 +9027,21 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             pc = primary_var.get().strip()
             bc = bg_var.get().strip()
             tc = text_color_var.get().strip()
-            try:
-                self.root.winfo_rgb(pc)
-                self.root.winfo_rgb(bc)
-                if tc.lower() not in ("", "auto"):
-                    self.root.winfo_rgb(tc)
-                else:
-                    tc = "auto"
-            except tk.TclError:
-                messagebox.showerror("Invalid color", "Enter valid Tk color values, such as #0F7457 and #EAF4F0.", parent=self.root)
+            def _valid_color(value):
+                try:
+                    r_, g_, b_ = self.root.winfo_rgb(str(value).strip())
+                    return "#%02X%02X%02X" % (r_ // 257, g_ // 257, b_ // 257)
+                except (tk.TclError, ValueError):
+                    return None
+            pc_ok = _valid_color(pc)
+            if pc_ok is None:
+                messagebox.showerror("Invalid color", "Primary color is not valid: '%s'. Use a value like #0F5132 or choose it with the Choose button." % pc, parent=self.root)
                 return
+            # Background / text colors: if empty or invalid, fall back to the defaults instead of blocking the whole save.
+            bc_ok = _valid_color(bc) or _valid_color(DEFAULT_BACKGROUND_COLOR) or "#F8FAF8"
+            tc_ok = _valid_color(tc) or "#173D32"
+            pc, bc, tc = pc_ok, bc_ok, tc_ok
+            primary_var.set(pc); bg_var.set(bc); text_color_var.set(tc)
             lp = logo_var.get().strip()
             if lp and not os.path.isfile(lp):
                 if not messagebox.askyesno("Logo not found", "The selected logo file is not currently accessible. Save its path anyway?", parent=self.root):
@@ -9018,6 +9059,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 if label == theme_preset_var.get():
                     sel_preset = k
                     break
+            if sel_preset in THEME_PRESETS and sel_preset != "custom" and \
+                    str(THEME_PRESETS[sel_preset]["primary"]).upper() != pc.upper():
+                sel_preset = "custom"   # the typed / chosen color wins over the preset name
 
             area_sizes = {}
             try:
@@ -9040,7 +9084,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 "primary_color": pc,
                 "background_color": bc,
                 "text_color": tc,
-                "english_font": english_font_var.get().strip() or "Arial",
+                "english_font": english_font_var.get().strip() or "Aptos",
                 "urdu_font": urdu_font_var.get().strip() or "Jameel Noori Nastaleeq",
                 "font_size": str(chosen_font_size),
                 **area_sizes
@@ -9054,11 +9098,11 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             self.slogan_ur = s_ur
             self.logo_path = lp
 
-            global GREEN, GREEN_HOVER, APP_BG, DARK, FONT_SCALE, UI_FONT, UI_BOLD_FONT, URDU_FONT
-            GREEN = pc
-            GREEN_HOVER = pc
+            global PRIMARY, PRIMARY_DARK, APP_BG, DARK, FONT_SCALE, UI_FONT, UI_BOLD_FONT, URDU_FONT
+            PRIMARY = pc
+            PRIMARY_DARK = pc
             APP_BG = bc
-            DARK = tc if tc != "auto" else DARK
+            DARK = tc
             FONT_SCALE = chosen_font_size / 10.0
             self.root._taha_font_sizes = {
                 "global": chosen_font_size,
@@ -9075,7 +9119,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             self.root.title(en)
             self.style()
             messagebox.showinfo("Settings saved / ترتیبات محفوظ", "Institution identity and branding saved locally. Changes are applied live across the dashboard and reports.", parent=self.root)
-            self.dashboard()
+            self._rebuild_ui_keep_page()
             apply_script_fonts(self.root)
 
         if is_admin:
@@ -9166,8 +9210,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             transparency_value.configure(text=f"{amount}%")
             self._refresh_page_wallpaper(parent, wallpaper_path_var.get(), amount)
         tk.Scale(appearance_box, from_=0, to=100, resolution=1, orient="horizontal", variable=wallpaper_trans_var,
-                 command=on_transparency, showvalue=True, bg=APP_BG, fg=DARK, activebackground=GREEN,
-                 troughcolor="#DCE8E2", highlightthickness=0, font=(UI_FONT, 9)).pack(fill="x", padx=6)
+                 command=on_transparency, showvalue=True, bg=APP_BG, fg=DARK, activebackground=PRIMARY,
+                 troughcolor=BORDER, highlightthickness=0, font=(UI_FONT, 9)).pack(fill="x", padx=6)
 
         # Individual page backgrounds: each tab stores its own image/transparency,
         # with the global wallpaper remaining the fallback for pages not customized.
@@ -9207,7 +9251,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         ttk.Label(alpha_row, text="Wallpaper visibility / تصویر کی نمایاں مقدار").pack(side="left", padx=(0, 8))
         ttk.Label(alpha_row, textvariable=page_alpha_var, width=5).pack(side="right")
         tk.Scale(page_bg_box, from_=0, to=100, resolution=1, orient="horizontal", variable=page_alpha_var,
-                 showvalue=True, bg=APP_BG, fg=DARK, activebackground=GREEN, troughcolor=BORDER,
+                 showvalue=True, bg=APP_BG, fg=DARK, activebackground=PRIMARY, troughcolor=BORDER,
                  highlightthickness=0, font=(UI_FONT, 9)).pack(fill="x", padx=6)
         page_picker.bind("<<ComboboxSelected>>", load_selected_page_wallpaper)
         load_selected_page_wallpaper()
@@ -9242,11 +9286,6 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         ttk.Radiobutton(theme_row, text="Light / دن", variable=theme_mode_var, value="light").pack(side="left", padx=5)
         ttk.Radiobutton(theme_row, text="Dark / رات", variable=theme_mode_var, value="dark").pack(side="left", padx=5)
 
-        wallpaper_on_var = tk.BooleanVar(value=str(self.settings.get("wallpaper_enabled", "0")) == "1")
-        wp_row = ttk.Frame(appearance_box); wp_row.pack(fill="x", pady=(7, 4))
-        ttk.Checkbutton(wp_row, text="Show background wallpaper (may flicker while scrolling on slow PCs) / پس منظر کی تصویر دکھائیں",
-                        variable=wallpaper_on_var).pack(side="left")
-
         layout_row = ttk.Frame(appearance_box)
         layout_row.pack(fill="x", pady=(7, 4))
         ttk.Label(layout_row, text="Navigation tabs / نیویگیشن ٹیبز").pack(side="left", padx=(0, 8))
@@ -9275,8 +9314,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             if selected_mode not in ("light", "dark"):
                 selected_mode = "light"
             values = {"background_image_path": selected_path, "background_transparency": str(trans_value),
-                      "nav_orientation": nav_orientation_var.get(), "theme_mode": selected_mode,
-                      "wallpaper_enabled": "1" if wallpaper_on_var.get() else "0"}
+                      "nav_orientation": nav_orientation_var.get(), "theme_mode": selected_mode}
             self.db.conn.executemany("INSERT INTO app_settings(setting_key,setting_value) VALUES(?,?) ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value", values.items())
             self.db.conn.commit(); self.settings.update(values)
             self._il_button_texture_cache = LRUCache(160)
@@ -9379,7 +9417,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
 
     def _choose_color(self, variable):
         try: initial=variable.get()
-        except Exception: initial="#0F7457"
+        except Exception: initial=PRIMARY
         chosen=colorchooser.askcolor(color=initial,parent=self.root,title="Choose color")
         if chosen and chosen[1]: variable.set(chosen[1].upper())
 
@@ -9426,7 +9464,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             x0 = 150
             available = 230
             width = max(3, int(available * int(row["n"] or 0) / max_n))
-            canvas.create_rectangle(x0, y, x0 + width, y + 17, fill=GREEN, outline="")
+            canvas.create_rectangle(x0, y, x0 + width, y + 17, fill=PRIMARY, outline="")
             canvas.create_text(x0 + width + 6, y + 8, text=str(row["n"]), anchor="w",
                                fill=DARK, font=(UI_FONT, 9, "bold"))
         return box
@@ -9558,10 +9596,10 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             def add_card(r, i):
                 card=tk.Frame(inner,bg=PALE,highlightbackground=BORDER,highlightthickness=1,padx=14,pady=12)
                 card.grid(row=i//3,column=i%3,sticky="nsew",padx=7,pady=7)
-                smart_label(tk.Label, card,text="👤  "+(r["full_name"] or "Unnamed student"),bg=PALE,fg=GREEN,font=(UI_FONT,12,"bold"),wraplength=210).pack(anchor="w")
+                smart_label(tk.Label, card,text="👤  "+(r["full_name"] or "Unnamed student"),bg=PALE,fg=PRIMARY_INK,font=(UI_FONT,12,"bold"),wraplength=210).pack(anchor="w")
                 for label,value in (("📘 Course",r["course"]),("🎓 Level",r["level"]),("🕒 Class time",r["class_time"]),("● Status",r["status"])):
                     smart_label(tk.Label, card,text=f"{label}: {value or '—'}",bg=PALE,fg=DARK,font=(UI_FONT,9)).pack(anchor="w",pady=2)
-                tk.Button(card,text="👁 Open Profile / پروفائل",bg=GREEN,fg=WHITE,relief="flat",command=lambda sid=r["id"]:self.student_profile(sid)).pack(anchor="w",pady=(7,0))
+                tk.Button(card,text="👁 Open Profile / پروفائل",bg=PRIMARY,fg=PRIMARY_TEXT,relief="flat",command=lambda sid=r["id"]:self.student_profile(sid)).pack(anchor="w",pady=(7,0))
             page_state = {"offset": 0}
             load_more_button = ttk.Button(inner, text="Load more students / مزید طلبہ دکھائیں")
             def load_next_cards():
@@ -9680,16 +9718,16 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         status_color = {
             "active": "#DDF3E5", "paused": "#FFF0CC", "complete": "#DDE8F8",
             "inactive": "#F8DFDF", "pending": "#FFF0CC"
-        }.get(status_key, "#EAF4F0")
+        }.get(status_key, PALE)
 
         # Header: keep the established school-green identity and make the status easy to scan.
-        header = tk.Frame(win, bg=GREEN, padx=18, pady=12)
+        header = tk.Frame(win, bg=PRIMARY, padx=18, pady=12)
         header.pack(fill="x")
-        photo_holder = tk.Frame(header, bg=GREEN)
+        photo_holder = tk.Frame(header, bg=PRIMARY)
         photo_holder.pack(side="left", padx=(0, 12))
         image_path = row["image_path"] if "image_path" in row.keys() else ""
         photo_widget = self._make_profile_photo(
-            photo_holder, value("full_name", "Student"), image_path, size=72, background=GREEN)
+            photo_holder, value("full_name", "Student"), image_path, size=72, background=PRIMARY)
         photo_widget.pack()
 
         def load_student_photo(path):
@@ -9712,17 +9750,17 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 messagebox.showerror("Photo not saved", str(exc), parent=win)
 
         tk.Button(photo_holder, text="Choose Photo / تصویر منتخب کریں", command=choose_student_photo,
-                  bg=CARD_BG, fg=GREEN, activebackground="#EAF4F0", relief="flat",
+                  bg=CARD_BG, fg=PRIMARY_INK, activebackground=PALE, relief="flat",
                   padx=8, pady=5, cursor="hand2", font=(UI_FONT, 9, "bold")).pack(pady=(6, 0))
-        heading = tk.Frame(header, bg=GREEN)
+        heading = tk.Frame(header, bg=PRIMARY)
         heading.pack(side="left", fill="x", expand=True)
-        smart_label(tk.Label, heading, text=value("full_name", "Unnamed Student"), bg=GREEN,
-                    fg=WHITE, font=(UI_FONT, 17, "bold")).pack(anchor="w")
+        smart_label(tk.Label, heading, text=value("full_name", "Unnamed Student"), bg=PRIMARY,
+                    fg=PRIMARY_TEXT, font=(UI_FONT, 17, "bold")).pack(anchor="w")
         smart_label(tk.Label, heading,
                     text=ui_text(f"Student ID: {student_id}\nAdministrator profile",
                                  f"طالب علم نمبر: {student_id}\nایڈمن پروفائل"),
-                    bg=GREEN, fg="#EAF4F0", font=(UI_FONT, 10), justify="left").pack(anchor="w", pady=(4, 0))
-        smart_label(tk.Label, header, text=display_status(status), bg=status_color, fg=GREEN,
+                    bg=PRIMARY, fg=PRIMARY_TEXT, font=(UI_FONT, 10), justify="left").pack(anchor="w", pady=(4, 0))
+        smart_label(tk.Label, header, text=display_status(status), bg=status_color, fg=PRIMARY_INK,
                     font=(UI_FONT, 10, "bold"), padx=12, pady=7).pack(side="right", anchor="n")
 
         # A robust standard Tk canvas hosts the scrollable profile. Avoid embedding the
@@ -9766,7 +9804,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             frame.pack(fill="x", expand=True, pady=pad_y)
             return frame
 
-        def add_card(parent, title, icon, items, accent=GREEN, column=0, row_num=0, span=1):
+        def add_card(parent, title, icon, items, accent=PRIMARY, column=0, row_num=0, span=1):
             """Plain Tk card with restrained accent rule; content stays reliable and resizable."""
             card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, bd=0)
             card._taha_grid_meta = (column, row_num, span)
@@ -9964,7 +10002,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 ("Course / کورس", value("course")), ("Level / Grade / درجہ", value("level")),
                 ("Class time / وقت", value("class_time")), ("Admission date / تاریخِ داخلہ", value("admission_date")),
                 ("Age / عمر", value("age")),
-            ], GREEN),
+            ], PRIMARY),
             add_card(core_cards_frame, "Parent & Contact / سرپرست اور رابطہ", "♙", [
                 ("Parent / Guardian / والدین یا سرپرست", value("guardian_name")),
                 ("Contact phone (admin only) / رابطہ نمبر (صرف ایڈمن)", value("phone")),
@@ -9989,7 +10027,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
 
         detail_frame = create_grid(content, (0, 2))
         detail_cards = [
-            add_card(detail_frame, "Weekly class schedule / ہفتہ وار شیڈول", "◷", schedule_items, GREEN),
+            add_card(detail_frame, "Weekly class schedule / ہفتہ وار شیڈول", "◷", schedule_items, PRIMARY),
             add_card(detail_frame, "Attendance overview / حاضری", "✓", [
                 ("Total attendance records / حاضری کے کل اندراجات", str(attendance_total)),
                 ("Present / حاضر", str(present_count)),
@@ -9999,8 +10037,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 ("Latest attendance date / آخری حاضری کی تاریخ", latest_attendance),
             ], "#2F7F8F"),
             add_card(detail_frame, "Recent payments / حالیہ ادائیگیاں", "¤", payment_items, "#B18A2B"),
-            add_card(detail_frame, "Learning progress / تعلیمی پیش رفت", "✦", progress_items, GREEN),
-            add_card(detail_frame, "Quran progress / قرآنی پیش رفت", "۞", quran_items, GREEN),
+            add_card(detail_frame, "Learning progress / تعلیمی پیش رفت", "✦", progress_items, PRIMARY),
+            add_card(detail_frame, "Quran progress / قرآنی پیش رفت", "۞", quran_items, PRIMARY),
             add_card(detail_frame, "Extra and make-up classes / اضافی کلاسیں", "◷", session_items, "#2F7F8F"),
         ]
         detail_frame.bind("<Configure>", lambda e: layout_cards(detail_frame, detail_cards, e))
@@ -10012,7 +10050,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         notes_body = tk.Frame(notes_frame, bg=CARD_BG, padx=16, pady=12)
         notes_body.pack(fill="x")
         bind_profile_wheel(notes_frame)
-        smart_label(tk.Label, notes_body, text="Additional notes / اضافی نوٹس", bg=CARD_BG, fg=GREEN,
+        smart_label(tk.Label, notes_body, text="Additional notes / اضافی نوٹس", bg=CARD_BG, fg=PRIMARY_INK,
                     font=(UI_FONT, 10, "bold")).pack(anchor="w")
         smart_label(tk.Label, notes_body,
                     text=notes if notes.strip() else "No additional notes saved. Use Edit Profile to add notes.",
@@ -10022,10 +10060,10 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         footer = tk.Frame(win, bg=CARD_BG, padx=16, pady=10, highlightbackground=BORDER, highlightthickness=1)
         footer.pack(fill="x", side="bottom")
         tk.Button(footer, text="✎  Edit Profile / پروفائل تبدیل کریں",
-                  bg=GREEN, fg=WHITE, activebackground=GREEN_HOVER, activeforeground=WHITE,
+                  bg=PRIMARY, fg=PRIMARY_TEXT, activebackground=PRIMARY_DARK, activeforeground=PRIMARY_TEXT,
                   relief="flat", padx=14, pady=8, font=(UI_FONT, 10, "bold"), cursor="hand2",
                   command=lambda: edit_profile()).pack(side="left", padx=(0, 8))
-        tk.Button(footer, text="Close / بند کریں", bg="#EEF2EF", fg=DARK, activebackground=BORDER,
+        tk.Button(footer, text="Close / بند کریں", bg=mix(CARD_BG, DARK, 0.07), fg=DARK, activebackground=BORDER,
                   relief="flat", padx=17, pady=8, font=(UI_FONT, 10), cursor="hand2",
                   command=win.destroy).pack(side="right")
 
@@ -10101,6 +10139,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         ttk.Radiobutton(top,text="▦ Cards / کارڈز",variable=view_var,value="cards",command=lambda:load(search.get().strip())).pack(side="left",padx=3)
         ttk.Radiobutton(top,text="☷ List / فہرست",variable=view_var,value="list",command=lambda:load(search.get().strip())).pack(side="left",padx=3)
         ttk.Button(top,text="🔍 Search",command=lambda:load(search.get().strip())).pack(side="left",padx=5)
+        tt_image_btn=ttk.Button(top,text="🖼 Timetable Image / ٹائم ٹیبل تصویر",command=lambda:self.teacher_timetable_image_dialog(parent))
+        tt_image_btn._il_role="export"
+        tt_image_btn.pack(side="right",padx=6)
         ttk.Button(top,text="👥 Assign Students",command=self.assign_students).pack(side="right",padx=6)
         ttk.Button(top,text="➕ Add Teacher",style="Accent.TButton",command=self.add_teacher).pack(side="right")
         area=ttk.Frame(parent); area.pack(fill="both",expand=True)
@@ -10127,12 +10168,12 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 canvas.create_window((0,0),window=inner,anchor="nw"); canvas.configure(yscrollcommand=vs.set)
                 canvas.pack(side="left",fill="both",expand=True); vs.pack(side="right",fill="y")
                 def add_card(r, i):
-                    card=tk.Frame(inner,bg=PALE,highlightbackground="#DCE8E2",highlightthickness=1,padx=14,pady=12)
+                    card=tk.Frame(inner,bg=PALE,highlightbackground=BORDER,highlightthickness=1,padx=14,pady=12)
                     card.grid(row=i//3,column=i%3,sticky="nsew",padx=7,pady=7)
-                    smart_label(tk.Label, card,text="🧑‍🏫  "+(r["full_name"] or "Unnamed teacher"),bg=PALE,fg=GREEN,font=(UI_FONT,12,"bold"),wraplength=210).pack(anchor="w")
+                    smart_label(tk.Label, card,text="🧑‍🏫  "+(r["full_name"] or "Unnamed teacher"),bg=PALE,fg=PRIMARY_INK,font=(UI_FONT,12,"bold"),wraplength=210).pack(anchor="w")
                     for label,value in (("🎓 Qualification",r["qualification"]),("🗓️ Availability",r["availability"]),("● Status",r["status"])):
                         smart_label(tk.Label, card,text=f"{label}: {value or '—'}",bg=PALE,fg=DARK,font=(UI_FONT,9),wraplength=230,justify="left").pack(anchor="w",pady=2)
-                    tk.Button(card,text="👁 Open Profile / پروفائل",bg=GREEN,fg=WHITE,relief="flat",command=lambda tid=r["id"]:self.teacher_profile(tid)).pack(anchor="w",pady=(7,0))
+                    tk.Button(card,text="👁 Open Profile / پروفائل",bg=PRIMARY,fg=PRIMARY_TEXT,relief="flat",command=lambda tid=r["id"]:self.teacher_profile(tid)).pack(anchor="w",pady=(7,0))
                 self._run_in_batches(inner, rows, add_card, batch_size=4, delay_ms=3)
                 for col in range(3): inner.grid_columnconfigure(col,weight=1)
         load()
@@ -10156,12 +10197,12 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             win.geometry("980x720")
             win.minsize(780, 600)
 
-            header = tk.Frame(win, bg=GREEN, padx=20, pady=16)
+            header = tk.Frame(win, bg=PRIMARY, padx=20, pady=16)
             header.pack(fill="x")
-            photo_holder = tk.Frame(header, bg=GREEN)
+            photo_holder = tk.Frame(header, bg=PRIMARY)
             photo_holder.pack(side="left", padx=(0, 12))
             photo_widget = self._make_profile_photo(photo_holder, val("full_name", "Teacher"),
-                                                    val("image_path", ""), size=94, background=GREEN)
+                                                    val("image_path", ""), size=94, background=PRIMARY)
             photo_widget.pack()
             def load_photo(path):
                 photo_widget._taha_set_profile_image(path)
@@ -10184,16 +10225,16 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 except Exception as exc:
                     messagebox.showerror("Photo not saved", str(exc), parent=win)
             tk.Button(photo_holder, text="Choose Photo / تصویر منتخب کریں", command=choose_photo,
-                      bg=CARD_BG, fg=GREEN, relief="flat", cursor="hand2").pack(pady=(6, 0))
+                      bg=CARD_BG, fg=PRIMARY_INK, relief="flat", cursor="hand2").pack(pady=(6, 0))
 
-            title_box = tk.Frame(header, bg=GREEN)
+            title_box = tk.Frame(header, bg=PRIMARY)
             title_box.pack(side="left", fill="x", expand=True)
-            smart_label(tk.Label, title_box, text=val("full_name", "Teacher"), bg=GREEN, fg=WHITE,
+            smart_label(tk.Label, title_box, text=val("full_name", "Teacher"), bg=PRIMARY, fg=PRIMARY_TEXT,
                      font=(UI_BOLD_FONT, 20, "bold")).pack(anchor="w")
             smart_label(tk.Label, title_box, text=f"Teacher ID: {teacher_id}  •  Administrator Profile",
-                     bg=GREEN, fg="#EAF4F0", font=(UI_FONT, 10)).pack(anchor="w", pady=(5, 0))
+                     bg=PRIMARY, fg=PRIMARY_TEXT, font=(UI_FONT, 10)).pack(anchor="w", pady=(5, 0))
             status = val("status", "Pending")
-            smart_label(tk.Label, header, text=f"● {status}", bg=SOFT_GREEN, fg=GREEN,
+            smart_label(tk.Label, header, text=f"● {status}", bg=PRIMARY_LIGHT, fg=PRIMARY_INK,
                      font=(UI_BOLD_FONT, 10, "bold"), padx=12, pady=8).pack(side="right", anchor="n")
 
             body = ttk.Frame(win, padding=14)
@@ -10208,11 +10249,11 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
             canvas.bind("<Configure>", lambda e: canvas.itemconfigure(canvas_window, width=e.width))
 
-            def section(parent, title, rows, accent=GREEN):
+            def section(parent, title, rows, accent=PRIMARY):
                 card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
                 card.pack(fill="x", expand=True, padx=4, pady=6)
                 tk.Frame(card, bg=accent, height=4).pack(fill="x")
-                smart_label(tk.Label, card, text=title, bg=CARD_BG, fg=GREEN,
+                smart_label(tk.Label, card, text=title, bg=CARD_BG, fg=PRIMARY_INK,
                          font=(UI_BOLD_FONT, 12, "bold"), padx=14, pady=10).pack(anchor="w")
                 grid = tk.Frame(card, bg=CARD_BG, padx=10, pady=8)
                 grid.pack(fill="x", expand=True)
@@ -10273,9 +10314,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
 
         win = tk.Toplevel(self.root)
         win.title("Assign Teacher & Class Slot / استاد اور وقت متعین کریں")
-        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        win.geometry(f"{min(900, sw - 80)}x{min(680, sh - 120)}")
-        win.minsize(700, 520)
+        win.geometry(f"{min(820, max(640, self.root.winfo_screenwidth() - 80))}x{min(600, max(460, self.root.winfo_screenheight() - 120))}")
+        win.minsize(640, 440)
         win.configure(bg=CARD_BG)
         win.transient(self.root)
         win.grab_set()
@@ -10301,20 +10341,21 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         student_box.grid(row=0, column=3, sticky="w", padx=6, pady=4)
         student_box.current(0)
 
-        # Button bar is packed FIRST (bottom) so it can never be pushed out of view.
+        # The action bar and the filter are packed FIRST (side=bottom). The slot list takes only the
+        # space that is left, so Save can never be pushed out of the window (large fonts, 125%/150%).
         btn_row = ttk.Frame(body)
-        btn_row.pack(side="bottom", fill="x", pady=(10, 0))
-        assign_btn = ttk.Button(btn_row, text="✔ Assign Student to Selected Slot / منتخب وقت پر تفویض کریں",
-                                style="Accent.TButton", command=lambda: save_assignment())
-        assign_btn.pack(side="left")
-        ttk.Button(btn_row, text="Close / بند کریں", style="Secondary.TButton", command=win.destroy).pack(side="right")
-        hint_lbl = ttk.Label(body, text="Tip: select an AVAILABLE row, then press Assign (or double-click the row).", style="Sub.TLabel")
-        hint_lbl.pack(side="bottom", anchor="w", pady=(6, 0))
+        btn_row.pack(side="bottom", fill="x", pady=(8, 0))
+        only_free_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(body, text="Show only available free slots / صرف خالی اوقات دکھائیں",
+                        variable=only_free_var, command=lambda: refresh_slots()).pack(side="bottom", anchor="w", pady=(2, 6))
+        ttk.Button(btn_row, text="💾 Assign Slot & Update Timetable / تفویض اور محفوظ کریں",
+                   style="Accent.TButton", command=lambda: save_assignment()).pack(side="left")
+        ttk.Button(btn_row, text="Close / بند کریں", command=win.destroy).pack(side="right")
 
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True, pady=6)
         cols = ("slot", "status", "booked_by")
-        stree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=10, selectmode="browse")
+        stree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8)
         stree.heading("slot", text="Day and Time Slot / دن اور وقت")
         stree.heading("status", text="Availability / صورتحال")
         stree.heading("booked_by", text="Booked By / متعین طالب علم")
@@ -10326,15 +10367,10 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         stree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
 
-        _dark_card = on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF"
-        stree.tag_configure("available", **row_tag_opts("available"))
-        stree.tag_configure("current", **row_tag_opts("current"))
-        stree.tag_configure("booked", **row_tag_opts("booked"))
-        stree.tag_configure("off", **row_tag_opts("off"))
-
-        only_free_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(body, text="Show only available free slots / صرف خالی اوقات دکھائیں",
-                        variable=only_free_var, command=lambda: refresh_slots()).pack(anchor="w", pady=(2, 6))
+        stree.tag_configure("available", foreground=OK_INK)
+        stree.tag_configure("current", foreground=INFO_INK)
+        stree.tag_configure("booked", foreground=BAD_INK)
+        stree.tag_configure("off", foreground=MUTED)
 
         def refresh_slots(_e=None):
             stree.delete(*stree.get_children())
@@ -10355,6 +10391,11 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         teacher_box.bind("<<ComboboxSelected>>", refresh_slots)
         student_box.bind("<<ComboboxSelected>>", refresh_slots)
         refresh_slots()
+        # Fit the window to the content at any Windows scaling (125% / 150% make the drop-downs wider).
+        win.update_idletasks()
+        fit_w = min(max(820, win.winfo_reqwidth() + 8), max(640, self.root.winfo_screenwidth() - 60))
+        fit_h = min(max(600, win.winfo_reqheight() + 8), max(460, self.root.winfo_screenheight() - 100))
+        win.geometry(f"{fit_w}x{fit_h}")
 
         def save_assignment():
             selected = stree.selection()
@@ -10387,8 +10428,6 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 win.destroy()
             except Exception as exc:
                 messagebox.showerror("Assignment Error", str(exc), parent=win)
-
-        stree.bind("<Double-1>", lambda _e: save_assignment())
 
     def add_teacher(self):
         fields = [
@@ -10498,18 +10537,16 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             tree.heading(c, text=h, anchor=align)
             tree.column(c, width=120 if is_money else 140, minwidth=60, anchor=align, stretch=True)
         # Semantic color tags
-        tree.tag_configure("paid", **row_tag_opts("paid"))
-        tree.tag_configure("present", **row_tag_opts("present"))
-        # Plain data rows (e.g. Active students) are always black on light cards, white on dark ones.
-        _row_text = "#FFFFFF" if on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF" else "#000000"
-        tree.tag_configure("active", **row_tag_opts("active"))
-        tree.tag_configure("partial", **row_tag_opts("partial"))
-        tree.tag_configure("pending", **row_tag_opts("pending"))
-        tree.tag_configure("late", **row_tag_opts("late"))
-        tree.tag_configure("unpaid", **row_tag_opts("unpaid"))
-        tree.tag_configure("absent", **row_tag_opts("absent"))
-        tree.tag_configure("overdue", **row_tag_opts("overdue"))
-        tree.tag_configure("leave", **row_tag_opts("leave"))
+        tree.tag_configure("paid", foreground=DARK)
+        tree.tag_configure("present", foreground=DARK)
+        tree.tag_configure("active", foreground=DARK)
+        tree.tag_configure("partial", foreground=WARN_INK)
+        tree.tag_configure("pending", foreground=WARN_INK)
+        tree.tag_configure("late", foreground=WARN_INK)
+        tree.tag_configure("unpaid", foreground=BAD_INK)
+        tree.tag_configure("absent", foreground=BAD_INK)
+        tree.tag_configure("overdue", foreground=BAD_INK)
+        tree.tag_configure("leave", foreground=INFO_INK)
         vs = ttk.Scrollbar(wrap, orient="vertical", command=tree.yview)
         hs = ttk.Scrollbar(wrap, orient="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
@@ -10528,8 +10565,12 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                    command=lambda: self.allocate_class_time(parent)).pack(side="right", padx=3)
         ttk.Button(bar, text="Weekly Schedule / ہفتہ وار شیڈول", style="Accent.TButton",
                    command=lambda: self.manage_weekly_schedule(parent)).pack(side="right", padx=3)
-        ttk.Button(bar, text="Add Extra / Make-up Class", 
+        ttk.Button(bar, text="Add Extra / Make-up Class",
                    command=lambda: self.add_class_session(parent)).pack(side="right", padx=3)
+        tt_image_btn = ttk.Button(bar, text="🖼 Teacher Timetable Image / ٹیچر ٹائم ٹیبل تصویر",
+                                  command=lambda: self.teacher_timetable_image_dialog(parent))
+        tt_image_btn._il_role = "export"      # download / export = ORANGE
+        tt_image_btn.pack(side="right", padx=3)
         ttk.Button(bar, text="Daily View", command=lambda: self.set_calendar_mode(parent, "day")).pack(side="left", padx=3)
         ttk.Button(bar, text="Weekly View", command=lambda: self.set_calendar_mode(parent, "week")).pack(side="left", padx=3)
         ttk.Button(bar, text="Monthly View", command=lambda: self.set_calendar_mode(parent, "month")).pack(side="left", padx=3)
@@ -10539,6 +10580,485 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         self.calendar_area = ttk.Frame(parent)
         self.calendar_area.pack(fill="x", expand=False, pady=5)
         self.render_class_calendar(parent)
+
+    # ------------------------------------------------------------------
+    # Teacher timetable as a downloadable picture (PNG)
+    # ------------------------------------------------------------------
+    _TT_DAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+    _TT_DAYS_UR = ("پیر", "منگل", "بدھ", "جمعرات", "جمعہ", "ہفتہ", "اتوار")
+
+    @staticmethod
+    def _tt_time_key(text):
+        value = str(text or "").strip().upper()
+        for fmt in ("%I:%M %p", "%I:%M%p", "%H:%M", "%I %p"):
+            try:
+                parsed = datetime.strptime(value, fmt)
+                return (0, parsed.hour * 60 + parsed.minute, "")
+            except ValueError:
+                continue
+        return (1, 0, value.lower())
+
+    def _teacher_week_classes(self, teacher_id, week_start, with_dates=True):
+        """[(date, weekday name, [class dicts])] for Monday..Sunday of one teacher.
+
+        Regular weekly classes, legacy single class-time entries and (for a dated week) the
+        extra / make-up sessions of that teacher. Cancelled sessions are left out."""
+        names = self._TT_DAYS
+        by_day = {n: [] for n in names}
+        conn = self.db.conn
+        scheduled_any = {r[0] for r in conn.execute("SELECT DISTINCT student_id FROM weekly_class_schedule")}
+        for r in conn.execute("""SELECT w.weekday,w.start_time,w.end_time,s.full_name,s.course,s.level
+                FROM weekly_class_schedule w JOIN students s ON s.id=w.student_id
+                WHERE w.teacher_id=? AND s.status='Active'""", (teacher_id,)):
+            if r["weekday"] in by_day:
+                by_day[r["weekday"]].append({"start": r["start_time"] or "", "end": r["end_time"] or "",
+                    "student": r["full_name"] or "", "course": r["course"] or "", "level": r["level"] or "",
+                    "kind": "regular", "tag": ""})
+        for r in conn.execute("""SELECT s.id,s.full_name,s.course,s.level,s.class_time
+                FROM students s JOIN teacher_students ts ON ts.student_id=s.id
+                WHERE ts.teacher_id=? AND COALESCE(s.class_time,'')<>'' AND s.status='Active'
+                GROUP BY s.id""", (teacher_id,)):
+            if r["id"] in scheduled_any:
+                continue
+            slot = str(r["class_time"] or "").strip()
+            for n in names:
+                if slot.lower().startswith(n.lower() + " "):
+                    by_day[n].append({"start": slot[len(n):].strip(), "end": "", "student": r["full_name"] or "",
+                        "course": r["course"] or "", "level": r["level"] or "", "kind": "regular", "tag": ""})
+        week = [week_start + timedelta(days=i) for i in range(7)]
+        if with_dates:
+            for r in conn.execute("""SELECT cs.session_date,cs.start_time,cs.end_time,cs.session_type,cs.status,
+                        s.full_name,s.course,s.level
+                    FROM class_sessions cs JOIN students s ON s.id=cs.student_id
+                    WHERE cs.teacher_id=? AND cs.session_date BETWEEN ? AND ?""",
+                    (teacher_id, week[0].isoformat(), week[-1].isoformat())):
+                if str(r["status"] or "").lower().startswith("cancel"):
+                    continue
+                try:
+                    d = date.fromisoformat(str(r["session_date"])[:10])
+                except ValueError:
+                    continue
+                by_day[names[d.weekday()]].append({"start": r["start_time"] or "", "end": r["end_time"] or "",
+                    "student": r["full_name"] or "", "course": r["course"] or "", "level": r["level"] or "",
+                    "kind": "extra", "tag": r["session_type"] or "Extra"})
+        result = []
+        for i, n in enumerate(names):
+            items = sorted(by_day[n], key=lambda x: (self._tt_time_key(x["start"]), x["student"].lower()))
+            result.append((week[i], n, items))
+        return result
+
+    def _render_teacher_timetable(self, teacher_id, week_start, with_dates=True, language="both"):
+        """Draw one teacher's weekly timetable as a PIL image (white paper, brand-colored header)."""
+        if Image is None or ImageDraw is None or ImageFont is None:
+            raise RuntimeError("Pillow is required")
+        teacher = self.db.conn.execute("SELECT * FROM teachers WHERE id=?", (teacher_id,)).fetchone()
+        if teacher is None:
+            raise RuntimeError("Teacher not found")
+        week = self._teacher_week_classes(teacher_id, week_start, with_dates)
+        self._tt_notes = []
+        en_path = self._receipt_font_path("english")
+        ur_path = self._receipt_font_path("urdu")
+        bold_path = ""
+        if en_path:
+            for fname in ("Aptos-Bold.ttf", "Aptos-SemiBold.ttf", "arialbd.ttf"):
+                cand = os.path.join(os.path.dirname(en_path), fname)
+                if os.path.isfile(cand):
+                    bold_path = cand
+                    break
+        bold_path = bold_path or en_path
+        if language in ("urdu", "both") and not ur_path:
+            self._tt_notes.append("Urdu font not found (assets/fonts). The image was created in English.")
+            language = "english"
+        show_en, show_ur = language in ("english", "both"), language in ("urdu", "both")
+
+        INK, SUB, LINE = "#101614", "#44524B", "#D9DEDC"
+        TINT, TINT2 = tint(PRIMARY, 0.90), tint(PRIMARY, 0.82)
+        BLUE_T, BLUE_INK = tint(SEM_BLUE, 0.86), "#1E3A8A"
+        ON_P = PRIMARY_TEXT
+        ON_P_SOFT = mix(PRIMARY_TEXT, PRIMARY, 0.22)
+        W, M = 1700, 56
+
+        cache = {}
+        def font(kind, size):
+            key = (kind, size)
+            if kind == "ur":
+                size = int(round(size * 1.38))     # Nastaleeq looks small next to Latin text
+            if key not in cache:
+                path = {"en": en_path, "enb": bold_path, "ur": ur_path}.get(kind) or en_path
+                try:
+                    cache[key] = ImageFont.truetype(path, size) if path else ImageFont.load_default()
+                except Exception:
+                    cache[key] = ImageFont.load_default()
+            return cache[key]
+        def is_ur(text):
+            return any(0x0600 <= ord(c) <= 0x077F or 0xFB50 <= ord(c) <= 0xFEFF for c in str(text))
+        scratch = ImageDraw.Draw(Image.new("RGB", (8, 8)))
+        def tw(text, kind, size):
+            kw = {"direction": "rtl", "language": "ur"} if kind == "ur" else {}
+            try:
+                return scratch.textlength(text, font=font(kind, size), **kw)
+            except Exception:
+                return len(text) * size * 0.55
+        def fit(text, bold, size, max_w, force_ur=None, min_scale=0.62):
+            text = str(text)
+            kind = "ur" if (is_ur(text) if force_ur is None else force_ur) else ("enb" if bold else "en")
+            s = size
+            while tw(text, kind, s) > max_w and s > size * min_scale:
+                s -= 2
+            if tw(text, kind, s) > max_w:      # still too wide: shorten with an ellipsis, never clip
+                while len(text) > 1 and tw(text + "…", kind, s) > max_w:
+                    text = text[:-1]
+                text = text.rstrip() + "…"
+            return text, kind, s
+        def put(draw, x, y, text, size, fill, bold=False, align="l", max_w=None, force_ur=None, min_scale=0.62):
+            t, kind, s = fit(text, bold, size, max_w if max_w else 10 ** 6, force_ur, min_scale)
+            kw = {"direction": "rtl", "language": "ur"} if kind == "ur" else {}
+            draw.text((x, y), t, font=font(kind, s), fill=fill, anchor={"l": "la", "r": "ra", "c": "ma"}[align], **kw)
+            return tw(t, kind, s)
+        def lh(kind_ur, size):
+            return int(size * (2.3 if kind_ur else 1.32))
+
+        # ---- measure the layout first
+        names_ur = any(is_ur(it["student"]) or is_ur(it["course"]) for _d, _n, items in week for it in items)
+        E = 138 if names_ur else (126 if show_ur else 106)    # height of one class line
+        P, GAP = 24, 10
+        label_w = 340
+        lines = []
+        if show_en: lines.append(52)
+        if show_ur: lines.append(96)
+        if with_dates: lines.append(42)
+        label_h = sum(lines) + 2 * P
+        row_heights = []
+        for _d, _n, items in week:
+            n = len(items)
+            body_h = 2 * P + n * E + max(0, n - 1) * GAP if n else 124
+            row_heights.append(max(label_h, body_h))
+        header_h, teacher_h, footer_h = 270, 210, 150
+        top = 40
+        H = top + header_h + 26 + teacher_h + 26 + sum(row_heights) + 24 + footer_h
+        img = Image.new("RGB", (W, H), "white")
+        d = ImageDraw.Draw(img)
+
+        # ---- header band
+        d.rounded_rectangle((M, top, W - M, top + header_h), radius=36, fill=PRIMARY)
+        logo_x, logo_size = M + 44, 170
+        title_x = M + 56
+        logo_ok = False
+        if self.logo_path and os.path.isfile(self.logo_path):
+            try:
+                logo = self._prepare_circular_logo(self.logo_path, logo_size, ON_P_SOFT, 6)
+                img.paste(logo, (logo_x, top + 50), logo)
+                logo_ok = True
+            except Exception:
+                logo_ok = False
+        if not logo_ok:
+            d.ellipse((logo_x, top + 50, logo_x + logo_size, top + 50 + logo_size), fill=TINT, outline=ON_P_SOFT, width=6)
+            put(d, logo_x + logo_size // 2, top + 50 + 40, (self.brand_name[:1] or "I").upper(), 84, PRINT_INK, True, "c")
+        title_x = logo_x + logo_size + 38
+        right_x = W - M - 48
+        brand_en = str(self.brand_name or APP_NAME)
+        brand_ur = str(getattr(self, "brand_name_ur", "") or "").strip()
+        avail = right_x - title_x
+        both_names = show_en and show_ur and bool(brand_ur)
+        if show_en or not brand_ur:
+            put(d, title_x, top + 34, brand_en, 58, ON_P, True, "l", avail)
+        else:
+            put(d, right_x, top + 20, brand_ur, 58, ON_P, False, "r", avail, True)
+        if both_names:
+            put(d, right_x, top + 84, brand_ur, 56, ON_P, False, "r", avail, True)
+        if show_en:
+            put(d, title_x, top + (190 if both_names else 130), "TEACHER TIMETABLE" if with_dates else "WEEKLY TIMETABLE",
+                30, ON_P_SOFT, True, "l", avail // 2)
+        if show_ur:
+            put(d, right_x, top + (176 if (both_names or not show_en) else 150), "ٹیچر کا ٹائم ٹیبل" if with_dates else "ہفتہ وار ٹائم ٹیبل",
+                38, ON_P_SOFT, False, "r", avail // 2, True)
+
+        # ---- teacher card
+        y = top + header_h + 26
+        d.rounded_rectangle((M, y, W - M, y + teacher_h), radius=28, fill="white", outline=LINE, width=3)
+        d.rounded_rectangle((M, y, M + 16, y + teacher_h), radius=8, fill=PRIMARY)
+        tname = str(teacher["full_name"] or "Teacher")
+        if show_en:
+            put(d, M + 52, y + 22, "Teacher", 28, SUB, False, "l")
+        if show_ur:
+            put(d, W - M - 52, y + 14, "استاد", 32, SUB, False, "r", None, True)
+        put(d, M + 52, y + 66, tname, 66, PRINT_INK, True, "l", 880)
+        total = sum(len(items) for _d, _n, items in week)
+        students = len({it["student"] for _d, _n, items in week for it in items})
+        chip_y = y + teacher_h - 62
+        chip_x = M + 52
+        for txt in (f"{total} classes / week" if show_en else f"{total} کلاسیں",
+                    f"{students} students" if show_en else f"{students} طلبہ"):
+            w_ = tw(txt, "ur" if is_ur(txt) else "en", 28) + 40
+            d.rounded_rectangle((chip_x, chip_y, chip_x + w_, chip_y + 44), radius=22, fill=TINT)
+            put(d, chip_x + 20, chip_y + (2 if not is_ur(txt) else -6), txt, 28, PRINT_INK, True, "l")
+            chip_x += w_ + 16
+        if with_dates:
+            a, b = week[0][0], week[-1][0]
+            span = f"{a.strftime('%d %b')} – {b.strftime('%d %b %Y')}"
+            put(d, W - M - 52, y + 76, span, 50, INK, True, "r", 640)
+            put(d, W - M - 52, y + 140, "Weekly schedule" if show_en else "ہفتہ وار شیڈول", 28, SUB, False, "r", 640, None if show_en else True)
+        else:
+            put(d, W - M - 52, y + 90, "Regular weekly timetable" if show_en else "مستقل ہفتہ وار ٹائم ٹیبل", 38, INK, True, "r", 640, None if show_en else True)
+
+        # ---- day rows
+        y += teacher_h + 26
+        today = date.today()
+        for idx, (day, name, items) in enumerate(week):
+            rh = row_heights[idx]
+            d.rectangle((M, y, W - M, y + rh), fill="white" if idx % 2 == 0 else "#F6F8F7")
+            d.line((M, y + rh, W - M, y + rh), fill=LINE, width=2)
+            d.rectangle((M, y, M + label_w, y + rh), fill=TINT)
+            d.rectangle((M, y, M + 10, y + rh), fill=PRIMARY)
+            ly = y + P
+            if show_en:
+                put(d, M + 36, ly, name, 42, PRINT_INK, True, "l", label_w - 60)
+                ly += 52
+            if show_ur:
+                put(d, M + 36, ly - (8 if show_en else 0), self._TT_DAYS_UR[idx], 44, PRINT_INK, False, "l", label_w - 60, True)
+                ly += 96
+            if with_dates:
+                put(d, M + 36, ly, day.strftime("%d %b %Y"), 28, SUB, False, "l", label_w - 60)
+                if day == today:
+                    bw = 118
+                    d.rounded_rectangle((M + label_w - bw - 16, y + 14, M + label_w - 16, y + 54), radius=20, fill=PRIMARY)
+                    put(d, M + label_w - bw // 2 - 16, y + 17, "TODAY" if show_en else "آج", 22 if show_en else 26,
+                        ON_P, True, "c", None, None if show_en else True)
+            ex, ex_r = M + label_w + 30, W - M - 30
+            if not items:
+                if show_en:
+                    put(d, ex, y + rh // 2 - 22, "No classes", 32, SUB, False, "l")
+                if show_ur:
+                    put(d, ex_r, y + rh // 2 - 40, "کوئی کلاس نہیں", 36, SUB, False, "r", None, True)
+            for k, it in enumerate(items):
+                ey = y + P + k * (E + GAP)
+                extra = it["kind"] == "extra"
+                pill_fill, pill_ink = (BLUE_T, BLUE_INK) if extra else (TINT2, PRINT_INK)
+                d.rounded_rectangle((ex, ey + 8, ex + 372, ey + E - 8), radius=22, fill=pill_fill)
+                start, end = str(it["start"] or "").strip(), str(it["end"] or "").strip()
+                when = f"{start} – {end}" if (start and end) else (start or "Time not set")
+                put(d, ex + 186, ey + 8 + ((E - 16) - lh(False, 31)) // 2, when, 31, pill_ink, True, "c", 340)
+                tag_w = 0
+                if extra:
+                    tag = str(it["tag"] or "Extra")
+                    tag_w = int(tw(tag, "ur" if is_ur(tag) else "enb", 24)) + 40
+                    d.rounded_rectangle((ex_r - tag_w, ey + 14, ex_r, ey + 56), radius=21, fill=BLUE_T)
+                    put(d, ex_r - tag_w // 2, ey + 18, tag, 24, BLUE_INK, True, "c", tag_w - 20)
+                nx = ex + 372 + 30
+                max_w = ex_r - nx - (tag_w + 20 if extra else 0)
+                sub = " · ".join(p for p in (it["course"], it["level"]) if p)
+                if is_ur(it["student"]):
+                    put(d, nx + max_w, ey + 2, it["student"], 40, INK, False, "r", max_w, True, 0.72)
+                    if sub:
+                        put(d, nx + max_w, ey + 2 + lh(True, 40), sub, 27, SUB, False, "r", max_w)
+                else:
+                    put(d, nx, ey + 8, it["student"], 40, INK, True, "l", max_w, None, 0.72)
+                    if sub:
+                        put(d, nx, ey + 8 + lh(False, 40), sub, 27, SUB, False, "l", max_w)
+            y += rh
+
+        # ---- footer
+        y += 24
+        d.line((M, y, W - M, y), fill=PRIMARY, width=5)
+        stamp = today.strftime("%d %b %Y")
+        if show_en:
+            put(d, M, y + 22, f"Total classes: {total}   •   Students: {students}", 30, INK, True, "l", W // 2)
+            put(d, W - M, y + 22, f"Generated on {stamp}", 28, SUB, False, "r", W // 2 - 40)
+        if show_ur:
+            put(d, W - M if not show_en else W - M, y + (62 if show_en else 14), f"کل کلاسیں:  {total}      طلبہ:  {students}", 34, INK, False, "r", W - 2 * M, True)
+        slogan = str((self.slogan_en if show_en else (getattr(self, "slogan_ur", "") or self.slogan_en)) or "").strip()
+        if slogan:
+            put(d, W // 2, y + footer_h - 56, slogan, 26, SUB, False, "c", W - 2 * M, None if show_en else True)
+        self._tt_stats = (total, students)
+        return img
+
+    def teacher_timetable_image_dialog(self, parent=None, teacher_id=None):
+        """Pick a teacher and a week, preview the timetable picture and download it as a PNG."""
+        if Image is None or ImageDraw is None or ImageTk is None:
+            messagebox.showerror("Pillow required / Pillow درکار ہے",
+                                 "Install Pillow first: py -m pip install pillow\nتصویر بنانے کے لیے Pillow درکار ہے۔", parent=self.root)
+            return
+        role = self.user.get("role")
+        own = self.user.get("teacher_id") if role == "teacher" else None
+        if role == "teacher":
+            if not own:
+                messagebox.showerror("Teacher account / ٹیچر اکاؤنٹ",
+                                     "This login is not linked to a teacher record.", parent=self.root)
+                return
+            teacher_rows = self.db.conn.execute("SELECT id,full_name FROM teachers WHERE id=?", (own,)).fetchall()
+            teacher_id = own
+        else:
+            teacher_rows = self.db.conn.execute(
+                "SELECT id,full_name FROM teachers ORDER BY CASE status WHEN 'Active' THEN 0 ELSE 1 END, full_name").fetchall()
+        if not teacher_rows:
+            messagebox.showwarning("No teachers / کوئی ٹیچر نہیں",
+                                   "Add a teacher first. / پہلے ٹیچر شامل کریں۔", parent=self.root)
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Teacher Timetable Image / ٹیچر ٹائم ٹیبل کی تصویر")
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        win.geometry(f"{min(1000, max(720, sw - 80))}x{min(840, max(560, sh - 100))}")
+        win.minsize(680, 520)
+        win.configure(bg=CARD_BG)
+        win.transient(self.root)
+        body = ttk.Frame(win, padding=14)
+        body.pack(fill="both", expand=True)
+        smart_label(ttk.Label, body, text="Teacher Timetable Image / ٹیچر ٹائم ٹیبل کی تصویر", style="Title.TLabel").pack(anchor="w")
+        smart_label(ttk.Label, body, wraplength=900, style="Sub.TLabel",
+                    text="Create a ready-to-share picture of one teacher's timetable: weekdays, dates, class times and student names. "
+                         "Send it to the teacher on WhatsApp or print it.").pack(anchor="w", pady=(2, 8))
+
+        # Action bar is packed FIRST (side=bottom) so it can never be pushed out of the window.
+        actions = ttk.Frame(body)
+        actions.pack(side="bottom", fill="x", pady=(10, 0))
+        status_var = tk.StringVar(value="")
+        smart_label(ttk.Label, body, textvariable=status_var, style="Sub.TLabel").pack(side="bottom", anchor="w", pady=(6, 0))
+
+        choices = [f"{r['id']} - {r['full_name']}" for r in teacher_rows]
+        controls = ttk.Frame(body)
+        controls.pack(fill="x")
+        smart_label(ttk.Label, controls, text="Teacher / استاد").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        teacher_box = ttk.Combobox(controls, values=choices, width=40, state="disabled" if role == "teacher" else "readonly")
+        teacher_box.grid(row=0, column=1, columnspan=4, sticky="w", padx=4, pady=4)
+        pick = 0
+        for i, r in enumerate(teacher_rows):
+            if teacher_id is not None and int(r["id"]) == int(teacher_id):
+                pick = i
+        teacher_box.current(pick)
+
+        today = date.today()
+        state = {"week": today - timedelta(days=today.weekday()), "img": None, "photo": None, "job": None}
+        week_label = tk.StringVar()
+        mode_var = tk.StringVar(value="dated")
+        lang_var = tk.StringVar(value="both")
+
+        smart_label(ttk.Label, controls, text="Week / ہفتہ").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        prev_btn = ttk.Button(controls, text="◀ Previous", command=lambda: shift(-7))
+        prev_btn.grid(row=1, column=1, sticky="w", padx=4)
+        smart_label(ttk.Label, controls, textvariable=week_label, font=(UI_FONT, 11, "bold")).grid(row=1, column=2, padx=10)
+        ttk.Button(controls, text="Next ▶", command=lambda: shift(7)).grid(row=1, column=3, sticky="w", padx=4)
+        ttk.Button(controls, text="This week / اس ہفتے", command=lambda: shift(0)).grid(row=1, column=4, sticky="w", padx=4)
+
+        smart_label(ttk.Label, controls, text="Type / قسم").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        type_row = ttk.Frame(controls)
+        type_row.grid(row=2, column=1, columnspan=4, sticky="w")
+        ttk.Radiobutton(type_row, text="Week with dates / تاریخوں کے ساتھ", variable=mode_var, value="dated",
+                        command=lambda: refresh()).pack(side="left", padx=4)
+        ttk.Radiobutton(type_row, text="Regular weekly pattern (no dates) / مستقل ہفتہ وار", variable=mode_var, value="regular",
+                        command=lambda: refresh()).pack(side="left", padx=10)
+
+        smart_label(ttk.Label, controls, text="Language / زبان").grid(row=3, column=0, sticky="w", padx=4, pady=4)
+        lang_row = ttk.Frame(controls)
+        lang_row.grid(row=3, column=1, columnspan=4, sticky="w")
+        for text, value in (("English", "english"), ("اردو", "urdu"), ("English + اردو", "both")):
+            ttk.Radiobutton(lang_row, text=text, variable=lang_var, value=value, command=lambda: refresh()).pack(side="left", padx=4)
+
+        frame = tk.Frame(body, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1)
+        frame.pack(fill="both", expand=True, pady=(8, 0))
+        canvas = tk.Canvas(frame, bg=PALE, highlightthickness=0)
+        vbar = ttk.Scrollbar(frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120) or (-1 if e.delta > 0 else 1), "units"))
+        canvas.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        canvas.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+
+        def current():
+            try:
+                tid = int(teacher_box.get().split(" - ", 1)[0])
+                return tid, teacher_box.get().split(" - ", 1)[1]
+            except (ValueError, IndexError):
+                return None, ""
+
+        def week_text():
+            a, b = state["week"], state["week"] + timedelta(days=6)
+            week_label.set(f"{a.strftime('%d %b')} – {b.strftime('%d %b %Y')}")
+
+        def show_preview():
+            img = state["img"]
+            if img is None or not canvas.winfo_exists():
+                return
+            pw = max(320, min(canvas.winfo_width() - 6, 900))
+            ph = int(img.height * pw / img.width)
+            resample = getattr(Image, "Resampling", Image).LANCZOS
+            state["photo"] = ImageTk.PhotoImage(img.resize((pw, ph), resample), master=self.root)
+            canvas.delete("all")
+            canvas.create_image(0, 0, anchor="nw", image=state["photo"])
+            canvas.configure(scrollregion=(0, 0, pw, ph))
+
+        def render_now():
+            tid, _name = current()
+            if tid is None:
+                return False
+            try:
+                state["img"] = self._render_teacher_timetable(tid, state["week"], mode_var.get() == "dated", lang_var.get())
+            except Exception as exc:
+                state["img"] = None
+                status_var.set(f"Could not create the image: {exc}")
+                return False
+            total, studs = getattr(self, "_tt_stats", (0, 0))
+            note = ("  " + " ".join(getattr(self, "_tt_notes", []))) if getattr(self, "_tt_notes", []) else ""
+            status_var.set((f"{total} classes • {studs} students." if total else
+                            "This teacher has no classes in this period. / اس مدت میں کوئی کلاس نہیں۔") + note)
+            show_preview()
+            return True
+
+        def refresh(*_):
+            week_text()
+            if state["job"] is not None:
+                try:
+                    win.after_cancel(state["job"])
+                except tk.TclError:
+                    pass
+            state["job"] = win.after(120, render_now)
+
+        def shift(days):
+            if days == 0:
+                t = date.today()
+                state["week"] = t - timedelta(days=t.weekday())
+            else:
+                state["week"] = state["week"] + timedelta(days=days)
+            refresh()
+
+        def save(open_after=False):
+            if not render_now() or state["img"] is None:
+                return
+            _tid, tname = current()
+            safe = re.sub(r"[^\w\-]+", "_", tname, flags=re.UNICODE).strip("_") or "teacher"
+            stamp = state["week"].isoformat() if mode_var.get() == "dated" else "weekly"
+            path = filedialog.asksaveasfilename(parent=win, title="Save timetable image / ٹائم ٹیبل کی تصویر محفوظ کریں",
+                                                defaultextension=".png", initialfile=f"Timetable_{safe}_{stamp}.png",
+                                                filetypes=[("PNG image", "*.png")])
+            if not path:
+                return
+            try:
+                state["img"].save(path, "PNG", dpi=(200, 200))
+            except OSError as exc:
+                messagebox.showerror("Save failed / محفوظ نہیں ہوا", str(exc), parent=win)
+                return
+            if open_after:
+                try:
+                    from pathlib import Path
+                    if sys.platform == "win32" and hasattr(os, "startfile"):
+                        os.startfile(path)
+                    else:
+                        webbrowser.open_new_tab(Path(path).resolve().as_uri())
+                except Exception as exc:
+                    messagebox.showwarning("Image saved / تصویر محفوظ", f"Saved, but could not open it:\n{path}\n\n{exc}", parent=win)
+                    return
+            messagebox.showinfo("Image saved / تصویر محفوظ", f"Timetable image saved to:\n{path}", parent=win)
+
+        ttk.Button(actions, text="⬇ Download Timetable Image / تصویر ڈاؤن لوڈ کریں",
+                   command=lambda: save(False)).pack(side="left", padx=(0, 6))
+        ttk.Button(actions, text="⬇ Download & Open / ڈاؤن لوڈ کر کے کھولیں",
+                   command=lambda: save(True)).pack(side="left", padx=6)
+        ttk.Button(actions, text="Close / بند کریں", command=win.destroy).pack(side="right")
+        teacher_box.bind("<<ComboboxSelected>>", refresh)
+        canvas.bind("<Configure>", lambda e: win.after(150, show_preview))
+        win.bind("<Escape>", lambda e: win.destroy())
+        week_text()
+        win.after(60, render_now)
 
     def set_calendar_mode(self, parent, mode):
         self.calendar_mode = mode
@@ -10755,7 +11275,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 smart_label(tk.Label, info,text=c['start'] or 'Time not set',bg='#FFF1E5',fg='#B85C00',
                          font=(UI_FONT,9,'bold'),padx=8,pady=3).pack(anchor='w')
                 tk.Button(info,text=f"{c['student']}  ({c['course'] or 'Course not set'})",anchor='w',
-                          bg='#FFFFFF',fg='#173D32',activebackground='#EAF4F0',relief='flat',bd=0,
+                          bg='#FFFFFF',fg=DARK,activebackground=PALE,relief='flat',bd=0,
                           font=(UI_FONT,11,'bold'),cursor='hand2',
                           command=lambda item=c:self.show_class_details(item,parent)).pack(anchor='w',pady=(4,0))
                 smart_label(tk.Label, row,text='Attendance',bg='#FFFFFF',fg='#64748B',font=(UI_FONT,8)).pack(side='left',padx=(6,2))
@@ -10801,7 +11321,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                     card=tk.Frame(daybox,bg='#FFFFFF',highlightbackground='#D9E2E7',highlightthickness=1)
                     card.pack(fill='x',pady=4)
                     b=tk.Button(card,text=f"{c['start']}\n{c['student']}\n{c['type']}",anchor='w',justify='left',wraplength=125,
-                        bg=('#EAF4F0' if c['kind']=='regular' else '#EAF4F0'),fg=DARK,relief='flat',bd=0,
+                        bg=(PALE if c['kind']=='regular' else PALE),fg=DARK,relief='flat',bd=0,
                         font=(UI_FONT,9,'bold'),command=lambda item=c:self.show_class_details(item,parent))
                     b.pack(fill='x',padx=5,pady=(5,2))
                     self._attendance_bubbles(card, c, parent).pack(anchor='center', pady=(0,4))
@@ -10926,12 +11446,12 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         win.geometry(f'{dialog_w}x{dialog_h}+{x}+{y}')
 
         # Compact branded heading.
-        header = tk.Frame(win, bg=GREEN, padx=18, pady=13)
+        header = tk.Frame(win, bg=PRIMARY, padx=18, pady=13)
         header.pack(fill='x')
         smart_label(tk.Label, header, text='Class Details / کلاس کی تفصیلات',
-                    bg=GREEN, fg=WHITE, font=(UI_FONT, 16, 'bold')).pack(anchor='w')
+                    bg=PRIMARY, fg=PRIMARY_TEXT, font=(UI_FONT, 16, 'bold')).pack(anchor='w')
         smart_label(tk.Label, header, text=str(item.get('student') or ''),
-                    bg=GREEN, fg='#EAF4F0', font=(UI_FONT, 10)).pack(anchor='w', pady=(3, 0))
+                    bg=PRIMARY, fg=PRIMARY_TEXT, font=(UI_FONT, 10)).pack(anchor='w', pady=(3, 0))
 
         # Scrollable information area; actions are deliberately kept outside it.
         area = tk.Frame(win, bg=APP_BG, padx=12, pady=10)
@@ -11105,10 +11625,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             return
         win = tk.Toplevel(self.root)
         win.title("Allocate Class Time / کلاس کا وقت مقرر کریں")
-        _sw, _sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
-        win.geometry(f"{min(820, _sw - 80)}x{min(700, _sh - 120)}")
-        win.minsize(650, 520)
-        win.configure(bg=APP_BG)
+        win.geometry("760x620")
+        win.minsize(650, 480)
         win.transient(self.root)
         win.grab_set()
         body = ttk.Frame(win, padding=14)
@@ -11130,17 +11648,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         pick.grid_columnconfigure(1, weight=1)
         smart_label(ttk.Label, body, text="Teacher availability can be entered as comma-separated slots, e.g. Monday 03:00 PM, Tuesday 04:00 PM. If blank, all unbooked slots are considered available.",
                   wraplength=700, style="Sub.TLabel").pack(anchor="w", pady=(4, 8))
-        # Buttons are packed first (bottom) so they can never fall outside the window.
-        bottom = ttk.Frame(body)
-        bottom.pack(side="bottom", fill="x", pady=(10, 0))
-        ttk.Button(bottom, text="✔ Save Class Time / محفوظ کریں", style="Accent.TButton",
-                   command=lambda: save_slot()).pack(side="left")
-        ttk.Button(bottom, text="Cancel / منسوخ", style="Secondary.TButton", command=win.destroy).pack(side="right")
-        ttk.Label(body, text="Tip: select an AVAILABLE slot, then press Save (or double-click the slot).",
-                  style="Sub.TLabel").pack(side="bottom", anchor="w", pady=(6, 0))
         slot_frame = ttk.Frame(body)
         slot_frame.pack(fill="both", expand=True)
-        slot_tree = ttk.Treeview(slot_frame, columns=("slot", "status"), show="headings", height=10, selectmode="browse")
+        slot_tree = ttk.Treeview(slot_frame, columns=("slot", "status"), show="headings", height=14)
         slot_tree.heading("slot", text="Day and time")
         slot_tree.heading("status", text="Availability")
         slot_tree.column("slot", width=220)
@@ -11194,9 +11704,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                     slot_tree.item(item, tags=("available",))
                 else:
                     slot_tree.item(item, tags=("unavailable",))
-            _dk = on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF"
-            slot_tree.tag_configure("available", **row_tag_opts("available"))
-            slot_tree.tag_configure("unavailable", **row_tag_opts("unavailable"))
+            slot_tree.tag_configure("available", foreground=OK_INK)
+            slot_tree.tag_configure("unavailable", foreground=BAD_INK)
 
         student_box.bind("<<ComboboxSelected>>", refresh_slots)
         teacher_box.bind("<<ComboboxSelected>>", refresh_slots)
@@ -11245,7 +11754,10 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             if parent is not None and parent.winfo_exists():
                 self.show_page(parent, lambda p: self.timetable_page(p))
 
-        slot_tree.bind("<Double-1>", lambda _e: save_slot())
+        bottom = ttk.Frame(body)
+        bottom.pack(fill="x", pady=(10, 0))
+        ttk.Button(bottom, text="Save Class Time / محفوظ کریں", style="Accent.TButton", command=save_slot).pack(side="right")
+        ttk.Button(bottom, text="Cancel", command=win.destroy).pack(side="right", padx=8)
 
     def fees_page(self, parent):
         self.page_title(parent, "Fees & Payments / فیس اور ادائیگیاں",
@@ -11386,7 +11898,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             return
         phone = normalize_whatsapp_number(student["phone"])
         if not phone:
-            messagebox.showwarning("Phone number needed / فون نمبر درکار", 
+            messagebox.showwarning("Phone number needed / فون نمبر درکار",
                 "This student's guardian phone is missing or invalid. Enter the country code (for example +923001234567).\nسرپرست کا درست فون نمبر ملک کے کوڈ کے ساتھ درج کریں۔", parent=parent)
             return
         guardian = str(student["guardian_name"] or "Parent/Guardian").strip()
@@ -11616,7 +12128,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             canvas.create_text(3, y+8, text=label, anchor="w", fill=DARK, font=(UI_FONT, 9))
             x0, avail = 150, 190
             width = max(2, int(avail * value / max_value))
-            canvas.create_rectangle(x0, y, x0+width, y+17, fill=GREEN, outline="")
+            canvas.create_rectangle(x0, y, x0+width, y+17, fill=PRIMARY, outline="")
             canvas.create_text(x0+width+5, y+8, text=f"{value:,.0f}", anchor="w", fill=DARK, font=(UI_FONT, 9, "bold"))
 
     def _refresh_fee_summary(self, tree, month, status_filter="All"):
@@ -11937,7 +12449,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         ttk.Button(buttons, text="Save as Text / متن محفوظ کریں", command=save_receipt_text).pack(side="left", padx=(0, 6))
         ttk.Button(buttons, text="Save PDF / PDF محفوظ کریں", style="Accent.TButton",
                    command=lambda: self._save_receipt_pdf(payment_id, row, due, paid_total, balance, parent=win)).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Save & Open to Print / محفوظ کرکے پرنٹ کے لیے کھولیں", 
+        ttk.Button(buttons, text="Save & Open to Print / محفوظ کرکے پرنٹ کے لیے کھولیں",
                    command=lambda: self._save_receipt_pdf(payment_id, row, due, paid_total, balance, open_after=True, parent=win)).pack(side="left", padx=6)
 
     def _receipt_font_path(self, family):
@@ -12000,7 +12512,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             ur_title = font_at(urdu_path, 48)
             ur_label = font_at(urdu_path, 28)
             ur_value = font_at(urdu_path, 35)
-            green = ImageColor.getrgb(GREEN)
+            green = ImageColor.getrgb(PRIMARY)
             dark = ImageColor.getrgb(DARK)
             muted = ImageColor.getrgb(MUTED)
             pale = ImageColor.getrgb(PALE)
@@ -12011,7 +12523,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             logo_drawn = False
             if self.logo_path and os.path.isfile(self.logo_path):
                 try:
-                    logo = self._prepare_circular_logo(self.logo_path, 210, GREEN, 6)
+                    logo = self._prepare_circular_logo(self.logo_path, 210, PRIMARY, 6)
                     img.paste(logo, (112, 112), logo)
                     logo_drawn = True
                 except Exception:
@@ -12138,6 +12650,19 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             cache.setdefault(row['class_date'], {}).setdefault(row['student_id'], row['status'])
         self._attendance_calendar_range_cache = cache
 
+    def _calendar_cell_style(self, statuses):
+        """Calendar day button style from that day's attendance statuses."""
+        values = list(statuses.values()) if statuses else []
+        if not values:
+            return "CalendarCell.TButton"
+        if any(v == "Absent" for v in values):
+            return "CalendarAbsent.TButton"
+        if any(str(v).startswith("Leave") for v in values):
+            return "CalendarLeave.TButton"
+        if all(v == "Present" for v in values):
+            return "CalendarPresent.TButton"
+        return "CalendarMarked.TButton"
+
     def _attendance_for_date(self, day):
         range_cache = getattr(self, '_attendance_calendar_range_cache', None)
         if range_cache is not None:
@@ -12210,7 +12735,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                         marks.append({'Present':'✓','Absent':'✕','Leave / Class not held':'—'}.get(st,'•'))
                     caption=str(num)+(('\n'+' '.join(marks[:8])) if marks else '')
                     btn=ttk.Button(grid,text=caption,
-                                   style=('CalendarMarked.TButton' if marks else 'CalendarCell.TButton'),
+                                   style=self._calendar_cell_style(statuses),
                                    command=lambda chosen=d:self._move_attendance_anchor(parent,chosen,'day'))
                     btn.grid(row=ri,column=ci,sticky='nsew',padx=2,pady=2,ipady=8)
 
@@ -12231,7 +12756,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         for item in classes:
             status=statuses.get(item['student_id'],'Not marked')
             symbol={'Present':'✓','Absent':'✕','Leave / Class not held':'—'}.get(status,'○')
-            color={'Present':'#0F7457','Absent':'#B42318','Leave / Class not held':'#B7791F'}.get(status,DARK)
+            color={'Present':OK_INK,'Absent':'#B42318','Leave / Class not held':'#B7791F'}.get(status,DARK)
             card=ttk.Frame(box); card.pack(fill='x',pady=2)
             btn=tk.Button(card,text=f"{item['start']}\n{item['student']}",anchor='w',justify='left',wraplength=130,
                           bg=CARD_BG,fg=color,relief='groove',command=lambda c=item:self.show_class_details(c))
@@ -12306,7 +12831,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             return
         for item in classes:
             current = self._class_attendance_status(item)
-            color = {"Present": GREEN, "Absent": "#B42318", "Leave / Class not held": "#B7791F", "Not marked": MUTED}.get(current, MUTED)
+            color = {"Present": PRIMARY, "Absent": "#B42318", "Leave / Class not held": "#B7791F", "Not marked": MUTED}.get(current, MUTED)
             card = tk.Frame(parent, bg=CARD_BG, highlightbackground=BORDER, highlightthickness=1, padx=12, pady=9)
             card.pack(fill="x", pady=4)
             left = tk.Frame(card, bg=CARD_BG); left.pack(side="left", fill="x", expand=True)
@@ -12460,6 +12985,10 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         if not tid:
             smart_label(ttk.Label, parent, text="This teacher login is not linked to a teacher record. Ask the administrator to create/link the account.", style="Sub.TLabel").pack(anchor="w", pady=10)
             return
+        my_tt_btn = ttk.Button(parent, text="🖼 My Timetable Image / میرا ٹائم ٹیبل تصویر",
+                               command=lambda: self.teacher_timetable_image_dialog(parent, tid))
+        my_tt_btn._il_role = "export"
+        my_tt_btn.pack(anchor="e", pady=(0, 6))
         rows = self.db.conn.execute("""SELECT s.id,s.full_name,s.class_time,s.level,s.course
             FROM students s JOIN teacher_students ts ON ts.student_id=s.id
             WHERE ts.teacher_id=? GROUP BY s.id ORDER BY s.full_name""", (tid,)).fetchall()
@@ -12467,9 +12996,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             smart_label(ttk.Label, parent, text="No assigned students yet. Admin must assign students to this teacher through attendance/records.", style="Sub.TLabel").pack(anchor="w", pady=10)
             return
         for i, r in enumerate(rows):
-            card = tk.Frame(parent, bg=PALE, padx=14, pady=12, highlightbackground="#DCE8E2", highlightthickness=1)
+            card = tk.Frame(parent, bg=PALE, padx=14, pady=12, highlightbackground=BORDER, highlightthickness=1)
             card.pack(fill="x", pady=5)
-            smart_label(tk.Label, card, text=r["full_name"], bg=PALE, fg=GREEN, font=(UI_FONT, 12, "bold")).pack(anchor="w")
+            smart_label(tk.Label, card, text=r["full_name"], bg=PALE, fg=PRIMARY_INK, font=(UI_FONT, 12, "bold")).pack(anchor="w")
             smart_label(tk.Label, card, text=f"Class time: {r['class_time'] or 'Not set'}  |  Level: {r['level'] or 'Beginner'}  |  Course: {r['course'] or 'Not assigned'}", bg=PALE, fg=DARK).pack(anchor="w", pady=(5,0))
 
     def teacher_attendance(self, parent):
@@ -12480,26 +13009,16 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                         "Record lesson progress, level and optional score. Quran-specific Sabaq, Sabqi, Manzil and Qaida/Nazra records are available separately.")
         tools = ttk.Frame(parent); tools.pack(fill="x", pady=5)
         ttk.Button(tools, text="Add Progress / پیش رفت درج کریں", style="Accent.TButton",
-                   command=lambda: self.add_progress(admin=True, refresh=lambda: self.show_page(parent, lambda p: self.progress_page(p)))).pack(side="right", padx=4)
+                   command=lambda: self.add_progress(admin=True)).pack(side="right", padx=4)
         ttk.Button(tools, text="Quran Progress Records / قرآنی ریکارڈ",
                    command=lambda: self._open_quran_progress("admin")).pack(side="right", padx=4)
         tree = self.make_tree(parent, ("id","student","course","level","lesson","score","date"),
                               ("ID","Student / طالب علم","Course / کورس","Level / درجہ","Lesson / سبق","Score / اسکور","Date / تاریخ"))
         rows = self.db.conn.execute("""SELECT p.id,COALESCE(s.full_name,'Unknown'),p.course,p.level,p.lesson,p.score,p.entry_date
             FROM progress p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.id DESC""").fetchall()
-        rows = [tuple(r) for r in rows]
-        try:
-            qrows = self.db.conn.execute("""SELECT 'Q'||q.id, COALESCE(s.full_name,'Unknown'), 'Quran', q.record_type,
-                TRIM(COALESCE(q.surah,'')||' '||COALESCE(q.ayah_from,'')||'-'||COALESCE(q.ayah_to,'')||' '||COALESCE(q.lesson_number,'')),
-                q.quality, q.session_date
-                FROM quran_progress q LEFT JOIN students s ON s.id=q.student_id ORDER BY q.id DESC""").fetchall()
-            rows += [tuple(r) for r in qrows]
-        except Exception:
-            pass
-        rows.sort(key=lambda r: str(r[6] or ""), reverse=True)
         self._run_in_batches(tree, rows, lambda r, _i: tree.insert("", "end", values=tuple(r)), batch_size=60, delay_ms=1)
 
-    def add_progress(self, admin=False, refresh=None):
+    def add_progress(self, admin=False):
         if admin:
             students = self.db.conn.execute("SELECT id,full_name,course,level FROM students ORDER BY full_name").fetchall()
         else:
@@ -12522,10 +13041,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             self.db.conn.execute("INSERT INTO progress(student_id,course,level,lesson,score,teacher_id,notes,entry_date) VALUES(?,?,?,?,?,?,?,?)",
                 (sid,v["course"],v["level"],v["lesson"],score,tid,v["notes"],v["entry_date"]))
             self.db.conn.commit()
-            messagebox.showinfo("Saved", "Progress saved.", parent=win)
-            if callable(refresh):
-                self.root.after(150, refresh)   # reload the table so the new row shows at once
-            return True
+            messagebox.showinfo("Saved", "Progress saved.", parent=win); return True
         self.form_dialog("Add Progress", fields, save, {"student": opts, "course": COURSES, "level": LEVELS})
 
     def teacher_progress(self, parent):
@@ -12534,7 +13050,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         tid = self.user.get("teacher_id")
         tools = ttk.Frame(parent); tools.pack(fill="x", pady=5)
         ttk.Button(tools, text="Add Progress / پیش رفت درج کریں", style="Accent.TButton",
-                   command=lambda: self.add_progress(admin=False, refresh=lambda: self.show_page(parent, lambda p: self.teacher_progress(p)))).pack(side="left", padx=4)
+                   command=lambda: self.add_progress(admin=False)).pack(side="left", padx=4)
         ttk.Button(tools, text="Quran Progress Records / قرآنی ریکارڈ",
                    command=lambda: self._open_quran_progress("teacher")).pack(side="left", padx=4)
         tree = self.make_tree(parent, ("student","course","level","lesson","score","date"),
@@ -12748,9 +13264,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         row = self.db.conn.execute("SELECT full_name,course,level,class_time,status,admission_date FROM students WHERE id=?", (sid,)).fetchone()
         if not row:
             smart_label(ttk.Label, parent, text="Student profile not found. Please contact the administrator.", style="Sub.TLabel").pack(anchor="w", pady=10); return
-        card = tk.Frame(parent, bg=PALE, padx=20, pady=18, highlightbackground="#DCE8E2", highlightthickness=1)
+        card = tk.Frame(parent, bg=PALE, padx=20, pady=18, highlightbackground=BORDER, highlightthickness=1)
         card.pack(fill="x", pady=8)
-        smart_label(tk.Label, card, text=row["full_name"], bg=PALE, fg=GREEN, font=(UI_FONT, 16, "bold")).pack(anchor="w")
+        smart_label(tk.Label, card, text=row["full_name"], bg=PALE, fg=PRIMARY_INK, font=(UI_FONT, 16, "bold")).pack(anchor="w")
         for label, value in [("Course",row["course"]),("Level",row["level"]),("Class time",row["class_time"]),("Status",row["status"]),("Admission date",row["admission_date"] )]:
             smart_label(tk.Label, card, text=f"{label}: {value or 'Not set'}", bg=PALE, fg=DARK, font=(UI_FONT, 10)).pack(anchor="w", pady=2)
         tools = ttk.Frame(parent); tools.pack(fill="x", pady=(10, 0))
@@ -12820,7 +13336,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         self._reports_logo_image = None
         if self.logo_path and os.path.isfile(self.logo_path) and Image is not None:
             try:
-                self._reports_logo_image = self._circular_logo_photo(self.logo_path, 58, GREEN, 3)
+                self._reports_logo_image = self._circular_logo_photo(self.logo_path, 58, PRIMARY, 3)
                 if self._reports_logo_image is not None:
                     tk.Label(logo_box, image=self._reports_logo_image, bg=CARD_BG, bd=0).pack(expand=True)
             except Exception:
@@ -12828,8 +13344,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         if self._reports_logo_image is None:
             mark = tk.Canvas(logo_box, width=54, height=54, bg=CARD_BG, highlightthickness=0, bd=0)
             mark.pack(expand=True)
-            mark.create_oval(2, 2, 52, 52, fill=GREEN, outline="#DCE8E2", width=2)
-            mark.create_text(27, 27, text=(self.brand_name[:1] or "I").upper(), fill=WHITE, font=(UI_FONT, 19, "bold"))
+            mark.create_oval(2, 2, 52, 52, fill=PRIMARY, outline=BORDER, width=2)
+            mark.create_text(27, 27, text=(self.brand_name[:1] or "I").upper(), fill=PRIMARY_TEXT, font=(UI_FONT, 19, "bold"))
         identity_text = tk.Frame(identity, bg=CARD_BG)
         identity_text.pack(side="left", fill="x", expand=True)
         smart_label(tk.Label, identity_text, text=self._brand_display_name(), bg=CARD_BG, fg=DARK, font=((URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT), 14, "bold")).pack(anchor="w")
@@ -12962,15 +13478,15 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 document = f"""<!doctype html><html lang="{language}" dir="{direction}"><head><meta charset="utf-8">
     <title>{html.escape(title)}</title><style>
     @page {{ size: landscape; margin: 14mm; }}
-    body {{ font-family:{font_family}; font-size:{font_size}pt; color:#173D32; margin:22px; direction:{direction}; }}
-    .brand {{ display:flex; align-items:center; gap:18px; border-bottom:3px solid #0F7457; padding-bottom:10px; margin-bottom:18px; }}
+    body {{ font-family:{font_family}; font-size:{font_size}pt; color:#16201B; margin:22px; direction:{direction}; }}
+    .brand {{ display:flex; align-items:center; gap:18px; border-bottom:3px solid {PRIMARY}; padding-bottom:10px; margin-bottom:18px; }}
     .institution-logo {{ width:72px; height:72px; object-fit:contain; border-radius:12px; }}
-    h1 {{ color:#0F7457; font-size:{font_size+7}pt; margin:0 0 4px 0; }}
+    h1 {{ color:{PRINT_INK}; font-size:{font_size+7}pt; margin:0 0 4px 0; }}
     .subtitle {{ color:#63766F; margin-bottom:0; }}
     table {{ border-collapse:collapse; width:100%; table-layout:auto; }}
-    th {{ background:#0F7457; color:white; text-align:start; }}
+    th {{ background:{PRIMARY}; color:{PRIMARY_TEXT}; text-align:start; }}
     th,td {{ border:1px solid #DCE8E2; padding:7px 9px; vertical-align:top; overflow-wrap:anywhere; }}
-    tr:nth-child(even) td {{ background:#EAF4F0; }}
+    tr:nth-child(even) td {{ background:{tint(PRIMARY, 0.92)}; }}
     @media print {{ body {{ margin:0; }} .brand {{ break-inside:avoid; }} }}
     </style></head><body>{brand_block}
     <table><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_html)}</tbody></table>
@@ -13482,11 +13998,11 @@ def choose_initial_data_mode(root, saved_hint=""):
     new_box = tk.Frame(frame, bg="#FFFFFF", highlightbackground="#D9E3DF", highlightthickness=1, padx=14, pady=12)
     new_box.pack(fill="x", pady=5)
     tk.Label(new_box, text="NEW INSTITUTE  •  Create first Admin account",
-             bg="#FFFFFF", fg=GREEN, font=(UI_FONT, 11, "bold")).pack(anchor="w")
+             bg="#FFFFFF", fg="#0F7457", font=("Aptos", 11, "bold")).pack(anchor="w")
     tk.Label(new_box, text="I am installing Institute Ledger for the first time. Choose a new data folder and create the institute's first administrator login.",
              bg="#FFFFFF", fg="#52635C", wraplength=500, justify="left", font=("Aptos", 9)).pack(anchor="w", pady=(5, 8))
     tk.Button(new_box, text="Create a new institute / نیا ادارہ بنائیں", command=lambda: pick("new"),
-              bg=GREEN, fg=on_color(GREEN, "#FFFFFF", "#000000"), activebackground=GREEN_HOVER, activeforeground=on_color(GREEN_HOVER, "#FFFFFF", "#000000"),
+              bg="#0F7457", fg="#FFFFFF", activebackground="#0B6049", activeforeground="#FFFFFF",
               relief="flat", bd=0, padx=14, pady=9, cursor="hand2", font=("Aptos", 10, "bold")).pack(anchor="w")
     old_box = tk.Frame(frame, bg="#FFFFFF", highlightbackground="#D9E3DF", highlightthickness=1, padx=14, pady=12)
     old_box.pack(fill="x", pady=5)
@@ -13839,35 +14355,67 @@ def contrast_ratio(c1, c2):
     return (hi + 0.05) / (lo + 0.05)
 
 
+def ensure_contrast(color, bg, ratio=4.5):
+    """Move `color` toward black/white until it reaches `ratio`:1 against `bg` (WCAG)."""
+    if _rgb(color) is None or _rgb(bg) is None:
+        return color
+    if contrast_ratio(color, bg) >= ratio:
+        return color
+    toward = "#000000" if (_rel_luminance(bg) or 0) > 0.4 else "#FFFFFF"
+    for step in range(1, 21):
+        candidate = mix(color, toward, step / 20.0)
+        if contrast_ratio(candidate, bg) >= ratio:
+            return candidate
+    return toward
+
+
+def _status_ink(color, *surfaces):
+    for surface in surfaces:
+        color = ensure_contrast(color, surface, 7.0)
+    return color
+
+
+def derive_theme_tokens(primary, mode="light", custom_bg=None, custom_text=None):
+    """Every theme color, derived from ONE primary color plus light/dark mode."""
+    p = primary
+    if mode == "dark":
+        app_bg, card = mix("#111514", p, 0.07), mix("#1B201E", p, 0.07)
+        border = mix("#2E3633", p, 0.14)
+        text = ensure_contrast("#EEF3F0", card, 12.0)
+        muted = ensure_contrast("#B4C0BA", card, 7.0)
+        light, pale = mix(card, p, 0.38), mix(card, p, 0.20)
+    else:
+        app_bg = custom_bg or mix("#F5F7F6", p, 0.035)
+        card = "#FFFFFF"
+        border = mix("#D9DEDC", p, 0.12)
+        text = ensure_contrast(custom_text or "#101614", card, 12.0)
+        muted = ensure_contrast("#3F4C45", card, 7.0)
+        light, pale = mix(p, "#FFFFFF", 0.86), mix(p, "#FFFFFF", 0.93)
+    muted = ensure_contrast(muted, app_bg, 6.5)
+    primary_dark = shade(p, 0.22) if (_rel_luminance(p) or 0) > 0.02 else mix(p, "#FFFFFF", 0.16)
+    # Text/icon color on page surfaces: must read on the card, the page, the tint and the faint tint.
+    ink = p
+    for surface in (card, app_bg, light, pale, card):
+        ink = ensure_contrast(ink, surface, 4.5)
+    return {
+        "APP_BG": app_bg, "CARD_BG": card, "BORDER": border, "DARK": text, "MUTED": muted,
+        "PRIMARY": p, "PRIMARY_DARK": primary_dark, "PRIMARY_LIGHT": light, "PALE": pale,
+        "PRIMARY_TEXT": on_color(p, "#FFFFFF", "#0B1210"),
+        "PRIMARY_INK": ink,
+        "PRINT_INK": ensure_contrast(p, "#FFFFFF", 4.5),
+        # Status text is held to 7:1 so it stays clearly readable on cards, zebra rows and the page.
+        "OK_INK": _status_ink("#15803D", card, app_bg, pale),
+        "BAD_INK": _status_ink(SEM_RED, card, app_bg, pale),
+        "WARN_INK": _status_ink("#B45309", card, app_bg, pale),
+        "INFO_INK": _status_ink("#1D4ED8", card, app_bg, pale),
+    }
+
+
 def on_color(color, light="#FFFFFF", dark="#12261F"):
     """Readable text color for a background, chosen by real WCAG contrast."""
     if _rgb(color) is None:
         return light
     return light if contrast_ratio(color, light) >= contrast_ratio(color, dark) else dark
-
-
-_ROW_TAG_KIND = {
-    "paid": "ok", "present": "ok", "active": None, "available": "ok", "ok": "ok",
-    "partial": "warn", "pending": "warn", "late": "warn", "warn": "warn",
-    "unpaid": "bad", "absent": "bad", "overdue": "bad", "booked": "bad", "unavailable": "bad", "bad": "bad",
-    "leave": "info", "current": "info", "info": "info", "off": None,
-}
-_ROW_TAG_BASE = {"ok": "#16A34A", "warn": "#F5B301", "bad": "#DC2626", "info": "#2563EB"}
-
-
-def plain_row_text():
-    """Data text in tables is always black on light cards (white on dark cards)."""
-    return "#FFFFFF" if on_color(CARD_BG, "#FFFFFF", "#000000") == "#FFFFFF" else "#000000"
-
-
-def row_tag_opts(tag_name):
-    """Black text for every table row; the status is shown by a soft background tint instead."""
-    opts = {"foreground": plain_row_text()}
-    kind = _ROW_TAG_KIND.get(str(tag_name).replace("taha_", ""))
-    if kind:
-        dark = plain_row_text() == "#FFFFFF"
-        opts["background"] = mix(_ROW_TAG_BASE[kind], CARD_BG, 0.72 if dark else 0.86)
-    return opts
 
 
 def ui_size(value):
@@ -13879,8 +14427,12 @@ def ui_size(value):
 
 
 def semantic_colors(kind):
-    return {"ok": (OK_FG, OK_BG), "warn": (WARN_FG, WARN_BG), "bad": (BAD_FG, BAD_BG),
-            "info": (INFO_FG, INFO_BG)}.get(kind, (NEUTRAL_FG, NEUTRAL_BG))
+    """(text color, soft background) for a status kind.
+
+    Normal rows (paid / active / scheduled) keep the plain readable text color. Only rows that need
+    attention use a status color, and those are always adjusted to stay readable (AA) in light and dark mode."""
+    return {"ok": (DARK, OK_BG), "info": (DARK, INFO_BG),
+            "warn": (WARN_INK, WARN_BG), "bad": (BAD_INK, BAD_BG)}.get(kind, (DARK, NEUTRAL_BG))
 
 
 def status_kind(text):
@@ -13998,7 +14550,7 @@ class RoundCard(tk.Frame):
 
     def make_clickable(self, command):
         self._click_cmd = command
-        def enter(_e=None): self.set_border(GREEN)
+        def enter(_e=None): self.set_border(PRIMARY)
         def leave(_e=None): self.set_border(self._line)
         def click(_e=None):
             if callable(self._click_cmd): self._click_cmd()
@@ -14060,10 +14612,10 @@ class SearchBox(tk.Frame):
         self._debouncer = Debouncer(self, delay)
         self._placeholder = _language_text(placeholder)
         self._showing_placeholder = False
-        super().__init__(parent, bg=CARD_BG, bd=0, highlightthickness=1, highlightbackground=BORDER, highlightcolor=GREEN)
+        super().__init__(parent, bg=CARD_BG, bd=0, highlightthickness=1, highlightbackground=BORDER, highlightcolor=PRIMARY_INK)
         tk.Label(self, text="🔍", bg=CARD_BG, fg=MUTED, font=("Segoe UI Emoji", 10)).pack(side="left", padx=(10, 2))
         family = URDU_FONT if APP_LANGUAGE == "ur" else UI_FONT
-        self.entry = tk.Entry(self, width=width, relief="flat", bd=0, bg=CARD_BG, fg=DARK, insertbackground=GREEN,
+        self.entry = tk.Entry(self, width=width, relief="flat", bd=0, bg=CARD_BG, fg=DARK, insertbackground=PRIMARY_INK,
                               highlightthickness=0, font=(family, ui_size(10)))
         self.entry.pack(side="left", fill="x", expand=True, ipady=7, padx=(2, 0))
         self._clear = tk.Label(self, text="✕", bg=CARD_BG, fg=MUTED, cursor="hand2", font=(UI_FONT, 9, "bold"), padx=10)
@@ -14083,7 +14635,7 @@ class SearchBox(tk.Frame):
             self.entry.insert(0, self._placeholder)
             self.entry.configure(fg=MUTED)
     def _focus_in(self, _event=None):
-        self.configure(highlightbackground=GREEN)
+        self.configure(highlightbackground=PRIMARY)
         if self._showing_placeholder:
             self.entry.delete(0, "end"); self.entry.configure(fg=DARK); self._showing_placeholder = False
     def _focus_out(self, _event=None):
@@ -14114,7 +14666,7 @@ class SearchBox(tk.Frame):
 class Segmented(tk.Frame):
     """Pill-style segmented control bound to a Tk StringVar."""
     def __init__(self, parent, options, variable, command=None, padx=14, pady=6):
-        self._track = mix(GREEN, "#FFFFFF", .90)
+        self._track = mix(PRIMARY, "#FFFFFF", .90)
         super().__init__(parent, bg=self._track, bd=0, highlightthickness=1, highlightbackground=BORDER)
         self._var, self._command, self._buttons = variable, command, {}
         for value, label in options:
@@ -14138,9 +14690,9 @@ class Segmented(tk.Frame):
         try:
             for value, button in self._buttons.items():
                 if value == self._var.get():
-                    button.configure(bg=GREEN, fg=on_color(GREEN), activebackground=GREEN, activeforeground=on_color(GREEN))
+                    button.configure(bg=PRIMARY, fg=on_color(PRIMARY), activebackground=PRIMARY, activeforeground=on_color(PRIMARY))
                 else:
-                    button.configure(bg=self._track, fg=NEUTRAL_FG, activebackground=self._track, activeforeground=GREEN)
+                    button.configure(bg=self._track, fg=NEUTRAL_FG, activebackground=self._track, activeforeground=PRIMARY_INK)
         except tk.TclError: pass
 
 
@@ -14168,9 +14720,9 @@ def _install_modern_tree():
         try:
             self._taha_row_counter = 0
             self.tag_configure("taha_even", background=CARD_BG)
-            self.tag_configure("taha_odd", background=mix(GREEN, "#FFFFFF", .955))
+            self.tag_configure("taha_odd", background=mix(PRIMARY, CARD_BG, .93))
             for kind in ("ok", "warn", "bad", "info"):
-                self.tag_configure("taha_" + kind, **row_tag_opts(kind))
+                self.tag_configure("taha_" + kind, foreground=semantic_colors(kind)[0])
         except tk.TclError: pass
     def modern_insert(self, parent, index, iid=None, **kwargs):
         if MODERN_ZEBRA_ROWS:
