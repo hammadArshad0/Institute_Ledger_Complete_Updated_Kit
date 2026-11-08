@@ -4370,6 +4370,14 @@ class SchoolApp:
                     if not visible:
                         self._notification_animation_after_id = self.root.after(800, animate_notification_icon)
                         return
+                    # Keep the settings page visually steady while users adjust colors,
+                    # fonts and backgrounds; resume the animated alert icon on other pages.
+                    if getattr(self, "_active_page_key", "") == "settings":
+                        self._notification_animation_index = 0
+                        if bell.find_withtag("notification_icon"):
+                            bell.itemconfigure("notification_icon", image=icon_frames[0])
+                        self._notification_animation_after_id = self.root.after(800, animate_notification_icon)
+                        return
                     self._notification_animation_index = (self._notification_animation_index + 1) % len(icon_frames)
                     current = icon_frames[self._notification_animation_index]
                     if bell.find_withtag("notification_icon"):
@@ -8331,10 +8339,6 @@ class SchoolApp:
                     ampm = "AM" if h < 12 else "PM"
                     std_slots.append(f"{d} {h12:02d}:{minute:02d} {ampm}")
 
-        teacher = self.db.conn.execute("SELECT availability FROM teachers WHERE id=?", (teacher_id,)).fetchone()
-        avail_str = (teacher["availability"] or "").strip() if teacher else ""
-        avail_set = {x.strip() for x in avail_str.split(",") if x.strip()} if avail_str else set()
-
         sched_rows = self.db.conn.execute(
             "SELECT w.weekday, w.start_time, w.student_id, s.full_name "
             "FROM weekly_class_schedule w JOIN students s ON s.id=w.student_id "
@@ -8354,8 +8358,6 @@ class SchoolApp:
             if c_time and c_time not in booked:
                 booked[c_time] = {"sid": r["id"], "name": r["full_name"]}
 
-        has_explicit_avail = bool(avail_set and any(any(x.startswith(d) for d in days) for x in avail_set))
-
         results = []
         for slot in std_slots:
             booked_info = booked.get(slot)
@@ -8366,9 +8368,6 @@ class SchoolApp:
                 else:
                     status = "BOOKED"
                     name = booked_info["name"]
-            elif has_explicit_avail and slot not in avail_set:
-                status = "NOT IN AVAILABILITY"
-                name = "—"
             else:
                 status = "AVAILABLE"
                 name = "—"
@@ -9499,10 +9498,14 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 widget = ttk.Combobox(body, values=combos[key], state="readonly", width=1)
                 widget.set(default or (combos[key][0] if combos[key] else ""))
             else:
-                widget = ttk.Entry(body, width=1)
+                widget = ttk.Entry(body, width=1, show="*" if "password" in key.lower() else "")
                 if default is not None:
                     widget.insert(0, str(default))
-            widget.grid(row=i, column=1, sticky="ew", padx=6, pady=6)
+            if "password" in key.lower():
+                pw_row=ttk.Frame(body); pw_row.grid(row=i,column=1,sticky="ew",padx=6,pady=6); widget.pack(side="left",fill="x",expand=True)
+                ttk.Button(pw_row,text="Show",command=lambda e=widget,b=None: e.configure(show="" if e.cget("show") else "*")).pack(side="right",padx=(5,0))
+            else:
+                widget.grid(row=i, column=1, sticky="ew", padx=6, pady=6)
             entries[key] = widget
         body.grid_columnconfigure(1, weight=1)
 
@@ -10161,6 +10164,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                     sel=tree.selection()
                     if sel: self.teacher_profile(int(tree.item(sel[0],"values")[0]))
                 tree.bind("<Double-1>",open_selected)
+                ttk.Button(area,text="✏ Edit selected teacher",command=lambda: self.edit_teacher(int(tree.item(tree.selection()[0],"values")[0])) if tree.selection() else messagebox.showwarning("Select teacher","Select a teacher first.",parent=self.root)).pack(anchor="e",pady=4)
                 ttk.Button(area,text="👤 Open Teacher Profile / پروفائل",command=open_selected).pack(anchor="e",pady=4)
             else:
                 canvas=tk.Canvas(area,bg=CARD_BG,highlightthickness=0); vs=ttk.Scrollbar(area,orient="vertical",command=canvas.yview)
@@ -10171,12 +10175,33 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                     card=tk.Frame(inner,bg=PALE,highlightbackground=BORDER,highlightthickness=1,padx=14,pady=12)
                     card.grid(row=i//3,column=i%3,sticky="nsew",padx=7,pady=7)
                     smart_label(tk.Label, card,text="🧑‍🏫  "+(r["full_name"] or "Unnamed teacher"),bg=PALE,fg=PRIMARY_INK,font=(UI_FONT,12,"bold"),wraplength=210).pack(anchor="w")
-                    for label,value in (("🎓 Qualification",r["qualification"]),("🗓️ Availability",r["availability"]),("● Status",r["status"])):
+                    for label,value in (("🎓 Qualification",r["qualification"]),("● Status",r["status"])):
                         smart_label(tk.Label, card,text=f"{label}: {value or '—'}",bg=PALE,fg=DARK,font=(UI_FONT,9),wraplength=230,justify="left").pack(anchor="w",pady=2)
                     tk.Button(card,text="👁 Open Profile / پروفائل",bg=PRIMARY,fg=PRIMARY_TEXT,relief="flat",command=lambda tid=r["id"]:self.teacher_profile(tid)).pack(anchor="w",pady=(7,0))
+                    tk.Button(card,text="✏ Edit Teacher",bg=PALE,fg=PRIMARY_INK,relief="flat",command=lambda tid=r["id"]:self.edit_teacher(tid)).pack(anchor="w",pady=(4,0))
                 self._run_in_batches(inner, rows, add_card, batch_size=4, delay_ms=3)
                 for col in range(3): inner.grid_columnconfigure(col,weight=1)
         load()
+
+    def edit_teacher(self, teacher_id):
+        row = self.db.conn.execute("SELECT full_name,email,phone,qualification,experience,status FROM teachers WHERE id=?", (teacher_id,)).fetchone()
+        if not row:
+            messagebox.showwarning("Teacher not found", "This teacher record no longer exists.", parent=self.root); return
+        fields = [(key, label, row[key] or "") for key, label in (("full_name","Teacher full name *"),("email","Login username"),("phone","Phone"),("qualification","Qualifications"),("experience","Experience"),("status","Status"))]
+        def save(v, win):
+            if not v["full_name"].strip() or not v["email"].strip():
+                messagebox.showwarning("Required", "Teacher name and login username are required.", parent=win); return False
+            try:
+                self.db.conn.execute("BEGIN")
+                self.db.conn.execute("UPDATE teachers SET full_name=?,email=?,phone=?,qualification=?,experience=?,status=? WHERE id=?", (v["full_name"],v["email"],v["phone"],v["qualification"],v["experience"],v["status"],teacher_id))
+                self.db.conn.execute("UPDATE users SET username=? WHERE teacher_id=?", (v["email"],teacher_id))
+                self.db.conn.commit()
+            except sqlite3.IntegrityError:
+                self.db.conn.rollback(); messagebox.showerror("Username exists", "Choose a username that is not already in use.", parent=win); return False
+            except Exception as exc:
+                self.db.conn.rollback(); messagebox.showerror("Update failed", str(exc), parent=win); return False
+            return True
+        self.form_dialog("Edit Teacher", fields, save, {"status": STATUSES})
 
     def teacher_profile(self, teacher_id):
         """Administrator-only teacher profile; resilient to older database schemas."""
@@ -10199,6 +10224,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
 
             header = tk.Frame(win, bg=PRIMARY, padx=20, pady=16)
             header.pack(fill="x")
+            tk.Button(header,text="✏ Edit Teacher",command=lambda:self.edit_teacher(teacher_id),bg=PRIMARY_LIGHT,fg=PRIMARY_INK,relief="flat").pack(side="right",anchor="n",padx=6)
             photo_holder = tk.Frame(header, bg=PRIMARY)
             photo_holder.pack(side="left", padx=(0, 12))
             photo_widget = self._make_profile_photo(photo_holder, val("full_name", "Teacher"),
@@ -10270,7 +10296,6 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 ("📧 Email / ای میل", val("email")),
                 ("🎓 Qualification / قابلیت", val("qualification")),
                 ("🧑‍🏫 Experience / تجربہ", val("experience")),
-                ("🗓️ Availability / دستیاب اوقات", val("availability")),
                 ("🟢 Status / حیثیت", status),
             ])
             section(content, "🔒 Administrator-only Contact / صرف ایڈمن کے لیے رابطہ", [
@@ -10355,7 +10380,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True, pady=6)
         cols = ("slot", "status", "booked_by")
-        stree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8)
+        stree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=8, selectmode="extended")
         stree.heading("slot", text="Day and Time Slot / دن اور وقت")
         stree.heading("status", text="Availability / صورتحال")
         stree.heading("booked_by", text="Booked By / متعین طالب علم")
@@ -10400,52 +10425,79 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         def save_assignment():
             selected = stree.selection()
             if not selected:
-                messagebox.showwarning("Select Slot / وقت چنیں", "Please select a time slot from the list.", parent=win)
+                messagebox.showwarning("Select Slots / اوقات چنیں", "Select one or more available weekly class slots. Use Ctrl-click to select multiple days.", parent=win)
                 return
-            vals = stree.item(selected[0], "values")
-            slot, status, booked_by = vals[0], vals[1], vals[2]
-            if status not in ("AVAILABLE", "CURRENT SLOT"):
-                messagebox.showwarning("Slot Not Available / وقت دستیاب نہیں", f"This slot is {status} ({booked_by}). Please choose an available green slot.", parent=win)
+            selected_slots = [stree.item(item, "values") for item in selected]
+            invalid = [v for v in selected_slots if v[1] not in ("AVAILABLE", "CURRENT SLOT")]
+            if invalid:
+                messagebox.showwarning("Slot Not Available / وقت دستیاب نہیں", f"{invalid[0][0]} is {invalid[0][1]} ({invalid[0][2]}). Select only available slots.", parent=win)
                 return
             try:
                 tid = int(teacher_box.get().split(" - ", 1)[0])
                 sid = int(student_box.get().split(" - ", 1)[0])
             except (ValueError, IndexError):
                 return
-            parts = slot.split(" ", 1)
-            day = parts[0]
-            start = parts[1] if len(parts) > 1 else ""
-            end = self._calculate_end_time(start, 45)
-
+            fresh = {x["slot"]: x["status"] for x in self._get_teacher_slots(tid, sid)}
+            if any(fresh.get(v[0]) not in ("AVAILABLE", "CURRENT SLOT") for v in selected_slots):
+                messagebox.showwarning("Slot just booked", "One of the selected slots is no longer available. Refresh the selection and try again.", parent=win)
+                refresh_slots(); return
+            selected_intervals=[]
+            for slot, _status, _booked_by in selected_slots:
+                day,start=slot.split(" ",1)
+                begin=datetime.strptime(start,"%I:%M %p").hour*60+datetime.strptime(start,"%I:%M %p").minute
+                if any(day==other_day and begin<other_end and begin+45>other_begin for other_day,other_begin,other_end in selected_intervals):
+                    messagebox.showwarning("Overlapping classes", "Selected class slots overlap. Choose times at least 45 minutes apart.", parent=win); return
+                selected_intervals.append((day,begin,begin+45))
             try:
-                self.db.conn.execute("UPDATE students SET class_time=? WHERE id=?", (slot, sid))
-                self.db.conn.execute("INSERT OR IGNORE INTO teacher_students(teacher_id, student_id) VALUES(?,?)", (tid, sid))
-                self.db.conn.execute("DELETE FROM weekly_class_schedule WHERE student_id=? AND weekday=?", (sid, day))
-                self.db.conn.execute("INSERT INTO weekly_class_schedule(student_id, teacher_id, weekday, start_time, end_time, created_at) VALUES(?,?,?,?,?,?)",
-                                     (sid, tid, day, start, end, timestamp()))
+                self.db.conn.execute("BEGIN")
+                self.db.conn.execute("DELETE FROM weekly_class_schedule WHERE student_id=?", (sid,))
+                for slot, _status, _booked_by in selected_slots:
+                    day, start = slot.split(" ", 1)
+                    end = self._calculate_end_time(start, 45)
+                    self.db.conn.execute("INSERT INTO weekly_class_schedule(student_id, teacher_id, weekday, start_time, end_time, created_at) VALUES(?,?,?,?,?,?)",
+                                         (sid, tid, day, start, end, timestamp()))
+                self.db.conn.execute("DELETE FROM teacher_students WHERE student_id=?", (sid,))
+                self.db.conn.execute("INSERT INTO teacher_students(teacher_id, student_id) VALUES(?,?)", (tid, sid))
+                self.db.conn.execute("UPDATE students SET class_time=? WHERE id=?", (selected_slots[0][0], sid))
                 self.db.conn.commit()
-                messagebox.showinfo("Assigned Successfully / کامیابی سے تفویض", f"Student assigned to teacher.\nSlot: {slot}\nWeekly timetable and class schedule updated.", parent=win)
+                messagebox.showinfo("Assigned Successfully / کامیابی سے تفویض", f"Student assigned to teacher for {len(selected_slots)} weekly class day(s).\nWeekly timetable and class schedule updated.", parent=win)
                 win.destroy()
             except Exception as exc:
+                self.db.conn.rollback()
                 messagebox.showerror("Assignment Error", str(exc), parent=win)
 
     def add_teacher(self):
         fields = [
-            ("full_name", "Teacher full name *", ""), ("email", "Email / username", ""),
+            ("full_name", "Teacher full name *", ""), ("email", "Login username *", ""),
+            ("password", "Login password (12+ characters) *", ""),
+            ("confirm_password", "Confirm login password *", ""),
             ("phone", "Phone (admin only)", ""), ("qualification", "Qualifications", ""),
-            ("experience", "Experience", ""), ("availability", "Available class times", ""),
+            ("experience", "Experience", ""),
             ("status", "Status", "Active")
         ]
         def save(v, win):
             if not v["full_name"]:
                 messagebox.showwarning("Required", "Teacher name is required.", parent=win); return False
-            cur = self.db.conn.execute("INSERT INTO teachers(full_name,email,phone,qualification,experience,availability,status) VALUES(?,?,?,?,?,?,?)",
-                (v["full_name"],v["email"],v["phone"],v["qualification"],v["experience"],v["availability"],v["status"]))
-            self.db.conn.commit()
-            tid = cur.lastrowid
-            if messagebox.askyesno("Create login?", "Create a teacher login account now?", parent=win):
-                self.create_user_dialog("teacher", teacher_id=tid, suggested=v["email"])
-            messagebox.showinfo("Saved", "Teacher record saved.", parent=win)
+            if not v["email"].strip() or len(v["password"]) < 12:
+                messagebox.showwarning("Login required", "Enter a login username and a password of at least 12 characters.", parent=win); return False
+            if v["password"] != v["confirm_password"]:
+                messagebox.showwarning("Password mismatch", "The password and confirmation do not match.", parent=win); return False
+            try:
+                self.db.conn.execute("BEGIN")
+                cur = self.db.conn.execute("INSERT INTO teachers(full_name,email,phone,qualification,experience,status) VALUES(?,?,?,?,?,?)",
+                    (v["full_name"],v["email"],v["phone"],v["qualification"],v["experience"],v["status"]))
+                tid = cur.lastrowid
+                self.db.conn.execute("INSERT INTO users(username,password_hash,role,teacher_id,active,created_at) VALUES(?,?, 'teacher', ?,1,?)",
+                    (v["email"], password_hash(v["password"]), tid, timestamp()))
+                self.db.conn.commit()
+                messagebox.showinfo("Saved", "Teacher profile and login account saved.", parent=win)
+                self.root.after_idle(self._rebuild_ui_keep_page)
+            except sqlite3.IntegrityError:
+                self.db.conn.rollback()
+                messagebox.showerror("Username exists", "Choose a username that is not already in use.", parent=win); return False
+            except Exception as exc:
+                self.db.conn.rollback()
+                messagebox.showerror("Teacher not saved", f"The teacher and login were not saved.\n\n{exc}", parent=win); return False
             return True
         self.form_dialog("Add Teacher / نیا استاد", fields, save, {"status": STATUSES})
 
@@ -10574,6 +10626,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         ttk.Button(bar, text="Daily View", command=lambda: self.set_calendar_mode(parent, "day")).pack(side="left", padx=3)
         ttk.Button(bar, text="Weekly View", command=lambda: self.set_calendar_mode(parent, "week")).pack(side="left", padx=3)
         ttk.Button(bar, text="Monthly View", command=lambda: self.set_calendar_mode(parent, "month")).pack(side="left", padx=3)
+        smart_label(ttk.Label,parent,text="How to use: choose Daily, Weekly or Monthly view; use Weekly Schedule to add a student's recurring days (you can add several weekdays); select a calendar class for details or attendance.",style="Sub.TLabel",wraplength=1050).pack(anchor="w",pady=(0,5))
         # Keep the calendar at its natural content height. Expanding it vertically
         # inside the scrollable page caused month rows and attendance bubbles to
         # stretch as the viewport/scroll position changed. The outer page handles scrolling.
@@ -11104,7 +11157,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
 
     def manage_weekly_schedule(self, parent=None):
         students=self.db.conn.execute("SELECT id,full_name FROM students WHERE status='Active' ORDER BY full_name").fetchall()
-        teachers=self.db.conn.execute("SELECT id,full_name,availability FROM teachers WHERE status='Active' ORDER BY full_name").fetchall()
+        teachers=self.db.conn.execute("SELECT id,full_name FROM teachers WHERE status='Active' ORDER BY full_name").fetchall()
         if not students or not teachers:
             messagebox.showwarning("Records needed","Add at least one active student and teacher first.",parent=self.root)
             return
@@ -11145,12 +11198,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             except ValueError:
                 messagebox.showerror('Invalid time','Use time format like 03:00 PM.',parent=win);return
             if b<=a: messagebox.showerror('Invalid duration','End time must be after start time.',parent=win);return
-            # Teacher's explicit availability is enforced when it uses the documented comma-separated slot format.
-            tr=next((x for x in teachers if x['id']==tid),None); availability=(tr['availability'] or '').strip() if tr else ''
-            avail={x.strip() for x in availability.split(',') if x.strip()}
             slot=f'{day} {start}'
-            if any(x.startswith(tuple(days)) for x in avail) and slot not in avail:
-                messagebox.showerror('Teacher unavailable',f"{slot} is not listed in this teacher's availability.",parent=win);return
             for row in self.db.conn.execute("""SELECT w.student_id,w.teacher_id,w.start_time,w.end_time,s.full_name FROM weekly_class_schedule w JOIN students s ON s.id=w.student_id WHERE w.weekday=?""",(day,)).fetchall():
                 try: oa=mins(row['start_time']); ob=mins(row['end_time']) if row['end_time'] else oa+30
                 except ValueError: continue
@@ -11646,7 +11694,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         teacher_box.grid(row=1, column=1, sticky="ew", padx=5, pady=5)
         teacher_box.current(0)
         pick.grid_columnconfigure(1, weight=1)
-        smart_label(ttk.Label, body, text="Teacher availability can be entered as comma-separated slots, e.g. Monday 03:00 PM, Tuesday 04:00 PM. If blank, all unbooked slots are considered available.",
+        smart_label(ttk.Label, body, text="Choose a free class slot. A slot already assigned to another student is marked as booked.",
                   wraplength=700, style="Sub.TLabel").pack(anchor="w", pady=(4, 8))
         slot_frame = ttk.Frame(body)
         slot_frame.pack(fill="both", expand=True)
@@ -11685,18 +11733,12 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             # version stores only one class_time field per student.
             if current_slot and current_slot not in booked:
                 booked[current_slot] = '__CURRENT_STUDENT_SLOT__'
-            teacher = next((t for t in teachers if t["id"] == tid), None)
-            availability = (teacher["availability"] or "").strip() if teacher else ""
-            available_set = {x.strip() for x in availability.split(",") if x.strip()}
-            availability_uses_slot_format = any(x in slots for x in available_set)
             for slot in slots:
                 if slot == current_slot:
                     status = "CURRENT SLOT"
                 elif slot in booked:
                     booked_name=booked[slot]
                     status = ("ALREADY ASSIGNED TO THIS STUDENT" if booked_name == '__CURRENT_STUDENT_SLOT__' else "BOOKED - " + booked_name)
-                elif availability_uses_slot_format and slot not in available_set:
-                    status = "NOT IN AVAILABILITY"
                 else:
                     status = "AVAILABLE"
                 item = slot_tree.insert("", "end", values=(slot, status))
@@ -11729,12 +11771,6 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             if conflict:
                 messagebox.showerror("Slot just booked", f"This teacher's slot has been taken by {conflict['full_name']}. Choose another slot.", parent=win)
                 refresh_slots()
-                return
-            current_teacher = self.db.conn.execute("SELECT availability FROM teachers WHERE id=?", (tid,)).fetchone()
-            availability = (current_teacher["availability"] or "").strip() if current_teacher else ""
-            avail_set = {x.strip() for x in availability.split(",") if x.strip()}
-            if any(x in slots for x in avail_set) and slot not in avail_set:
-                messagebox.showerror("Teacher unavailable", "This time is not in the teacher's listed availability. Update the teacher availability or choose another slot.", parent=win)
                 return
             parts = slot.split(" ", 1)
             day = parts[0]
@@ -11780,7 +11816,6 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         ttk.Button(message_tools, text="🖨️ Print / Save Receipt", command=lambda: self.receipt_for_selected(tree)).pack(side="left", padx=(0, 4))
         ttk.Button(message_tools, text="💬 WhatsApp Reminder", command=lambda: self.whatsapp_fee_reminder(tree)).pack(side="left", padx=4)
         ttk.Button(message_tools, text="📢 Class Notice", command=lambda: self.whatsapp_class_notice(tree)).pack(side="left", padx=4)
-        ttk.Button(message_tools, text="⚠️ Absence Notice", command=lambda: self.whatsapp_absence_notice(tree)).pack(side="left", padx=4)
         summary = ttk.Frame(parent); summary.pack(fill="x", pady=(5,0))
         chart_row = ttk.Frame(parent); chart_row.pack(fill="x", pady=(5, 8))
         monthly_chart = self._fee_amount_chart(chart_row, "Monthly Collection / ماہانہ وصولی")
@@ -12223,6 +12258,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         student_var = tk.StringVar(value=labels[0])
         month_var = tk.StringVar(value=datetime.now().strftime("%Y-%m"))
         amount_var = tk.StringVar(value="")
+        fee_due_var = tk.StringVar(value="—")
         date_var = tk.StringVar(value=datetime.now().strftime("%Y-%m-%d"))
         status_var = tk.StringVar(value="Paid")
         notes_var = tk.StringVar(value="")
@@ -12256,6 +12292,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             except ValueError:
                 pass
             currency_var.set(code)
+            due = self.db.conn.execute("SELECT amount_due FROM fee_invoices WHERE student_id=? AND month=? ORDER BY id DESC LIMIT 1", (student["id"], month_var.get().strip())).fetchone()
+            fee_due_var.set(f"{float(due['amount_due'] or 0):,.2f} {code}" if due else f"{float(student['monthly_fee'] or 0):,.2f} {code} (monthly fee)")
 
         def add_field(row, label, widget):
             smart_label(ttk.Label, body, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=6)
@@ -12266,17 +12304,18 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         add_field(0, "Student / طالب علم", student_combo)
         month_entry = ttk.Entry(body, textvariable=month_var, width=20)
         add_field(1, "Fee month (YYYY-MM)", month_entry)
-        add_field(2, "Amount received", ttk.Entry(body, textvariable=amount_var, width=22))
+        add_field(2, "Student fee for selected month", ttk.Label(body, textvariable=fee_due_var))
+        add_field(3, "Amount received", ttk.Entry(body, textvariable=amount_var, width=22))
         currency_frame = ttk.Frame(body)
         smart_label(ttk.Label, currency_frame, textvariable=currency_var, font=(UI_FONT, 10, "bold")).pack(anchor="w")
-        add_field(3, "Invoice currency (automatic)", currency_frame)
-        add_field(4, "Payment date (YYYY-MM-DD)", ttk.Entry(body, textvariable=date_var, width=22))
+        add_field(4, "Invoice currency (automatic)", currency_frame)
+        add_field(5, "Payment date (YYYY-MM-DD)", ttk.Entry(body, textvariable=date_var, width=22))
         status_combo = ttk.Combobox(body, values=["Paid", "Partial"], textvariable=status_var,
                                     state="readonly", width=22)
-        add_field(5, "Payment status", status_combo)
-        add_field(6, "Notes / reference", ttk.Entry(body, textvariable=notes_var, width=35))
+        add_field(6, "Payment status", status_combo)
+        add_field(7, "Notes / reference", ttk.Entry(body, textvariable=notes_var, width=35))
         smart_label(ttk.Label, body, text="Currency follows the student's fee/invoice. No automatic conversion is performed.",
-                  style="Sub.TLabel", wraplength=430).grid(row=7, column=0, columnspan=2, sticky="w", padx=6, pady=(5, 8))
+                  style="Sub.TLabel", wraplength=430).grid(row=8, column=0, columnspan=2, sticky="w", padx=6, pady=(5, 8))
 
         student_combo.bind("<<ComboboxSelected>>", refresh_currency)
         month_var.trace_add("write", refresh_currency)
@@ -12291,12 +12330,14 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 amount = float(amount_var.get().strip())
                 month = month_var.get().strip()
                 payment_date = date_var.get().strip()
+                if len(payment_date) != 10:
+                    raise ValueError
                 datetime.strptime(month, "%Y-%m")
                 datetime.strptime(payment_date, "%Y-%m-%d")
             except ValueError:
                 messagebox.showerror("Invalid details", "Amount must be numeric, month YYYY-MM, and date YYYY-MM-DD.", parent=win)
                 return
-            if amount <= 0:
+            if amount != amount or amount in (float("inf"), float("-inf")) or amount <= 0:
                 messagebox.showerror("Invalid amount", "Payment amount must be greater than zero.", parent=win)
                 return
 
@@ -12346,7 +12387,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                     pass
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=8, column=0, columnspan=2, sticky="e", pady=(8, 0))
+        buttons.grid(row=9, column=0, columnspan=2, sticky="e", pady=(8, 0))
         ttk.Button(buttons, text="Cancel", command=win.destroy).pack(side="right", padx=(6, 0))
         ttk.Button(buttons, text="Save Payment / ادائیگی محفوظ کریں", style="Accent.TButton", command=save).pack(side="right")
         win.update_idletasks()
@@ -12630,6 +12671,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                        command=lambda: self.show_page(parent, lambda p: self.pending_attendance_page(p))).pack(side="right", padx=6)
         ttk.Button(bar, text="Today's Classes · Quick Mark / آج کی کلاسیں", style="Accent.TButton",
                    command=lambda: self.show_page(parent, lambda p: self.today_attendance_page(p))).pack(side="left", padx=6)
+        smart_label(ttk.Label,parent,text="How to use: select a view and date, then choose a class to mark attendance. Teachers submit records for admin review when approval is enabled; admins can review pending submissions.",style="Sub.TLabel",wraplength=1050).pack(anchor="w",pady=(0,5))
         self.attendance_area = ttk.Frame(parent); self.attendance_area.pack(fill="both", expand=True, pady=5)
         self.render_attendance_calendar(parent)
 
@@ -12938,7 +12980,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 LEFT JOIN students s ON s.id=a.student_id
                 LEFT JOIN teachers t ON t.id=a.teacher_id
                 WHERE COALESCE(a.approved,0)=0
-                ORDER BY a.class_date DESC, a.id DESC""").fetchall()
+                ORDER BY a.class_date, a.id""").fetchall()
             for row in rows:
                 tree.insert("", "end", iid=str(row["id"]), values=(row["id"], row["class_date"], row["student"],
                     row["status"], row["teacher"], row["notes"]))
@@ -13015,8 +13057,10 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         tree = self.make_tree(parent, ("id","student","course","level","lesson","score","date"),
                               ("ID","Student / طالب علم","Course / کورس","Level / درجہ","Lesson / سبق","Score / اسکور","Date / تاریخ"))
         rows = self.db.conn.execute("""SELECT p.id,COALESCE(s.full_name,'Unknown'),p.course,p.level,p.lesson,p.score,p.entry_date
-            FROM progress p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.id DESC""").fetchall()
+            FROM progress p LEFT JOIN students s ON s.id=p.student_id ORDER BY s.full_name,p.entry_date,p.id""").fetchall()
         self._run_in_batches(tree, rows, lambda r, _i: tree.insert("", "end", values=tuple(r)), batch_size=60, delay_ms=1)
+        ttk.Button(tools,text="Edit selected",command=lambda: self.edit_progress(tree, admin=True)).pack(side="right",padx=4)
+        ttk.Button(tools,text="Delete selected",command=lambda: self.delete_progress(tree, admin=True)).pack(side="right",padx=4)
 
     def add_progress(self, admin=False):
         if admin:
@@ -13031,13 +13075,15 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         fields = [("student","Student",opts[0]),("course","Course",COURSES[0]),("level","Level",LEVELS[0]),
                   ("lesson","Lesson / Sura / topic",""),("score","Score (optional)",""),("entry_date","Date",datetime.now().strftime("%Y-%m-%d")),("notes","Notes","")]
         def save(v, win):
-            sid = int(v["student"].split(" - ",1)[0])
-            score = None
-            if v["score"]:
-                try: score = float(v["score"])
-                except ValueError:
-                    messagebox.showerror("Invalid score", "Score must be a number.", parent=win); return False
-            tid = self.user.get("teacher_id") if self.user["role"] == "teacher" else None
+            try:
+                sid = int(v["student"].split(" - ",1)[0])
+                if not any(r["id"] == sid for r in students): raise ValueError("Choose an eligible student.")
+                score = float(v["score"]) if v["score"] else None
+                if score is not None and score < 0: raise ValueError("Score cannot be negative.")
+                datetime.strptime(v["entry_date"], "%Y-%m-%d")
+            except (ValueError,IndexError) as exc:
+                messagebox.showerror("Invalid progress", f"Choose an eligible student, a non-negative numeric score, and date YYYY-MM-DD.\n{exc}", parent=win); return False
+            tid = (self.user or {}).get("teacher_id") if (self.user or {}).get("role") == "teacher" else None
             self.db.conn.execute("INSERT INTO progress(student_id,course,level,lesson,score,teacher_id,notes,entry_date) VALUES(?,?,?,?,?,?,?,?)",
                 (sid,v["course"],v["level"],v["lesson"],score,tid,v["notes"],v["entry_date"]))
             self.db.conn.commit()
@@ -13053,11 +13099,38 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                    command=lambda: self.add_progress(admin=False)).pack(side="left", padx=4)
         ttk.Button(tools, text="Quran Progress Records / قرآنی ریکارڈ",
                    command=lambda: self._open_quran_progress("teacher")).pack(side="left", padx=4)
-        tree = self.make_tree(parent, ("student","course","level","lesson","score","date"),
-                              ("Student / طالب علم","Course / کورس","Level / درجہ","Lesson / سبق","Score / اسکور","Date / تاریخ"))
-        rows = self.db.conn.execute("""SELECT s.full_name,p.course,p.level,p.lesson,p.score,p.entry_date FROM progress p
-            JOIN students s ON s.id=p.student_id WHERE p.teacher_id=? ORDER BY p.id DESC""", (tid,)).fetchall()
+        rows = self.db.conn.execute("""SELECT p.id,s.full_name,p.course,p.level,p.lesson,p.score,p.entry_date FROM progress p
+            JOIN students s ON s.id=p.student_id WHERE p.teacher_id=? ORDER BY s.full_name,p.entry_date,p.id""", (tid,)).fetchall()
+        tree = self.make_tree(parent, ("id","student","course","level","lesson","score","date"), ("ID","Student / طالب علم","Course / کورس","Level / درجہ","Lesson / سبق","Score / اسکور","Date / تاریخ"))
         self._run_in_batches(tree, rows, lambda r, _i: tree.insert("", "end", values=tuple(r)), batch_size=60, delay_ms=1)
+        ttk.Button(tools,text="Edit selected",command=lambda: self.edit_progress(tree, admin=False)).pack(side="left",padx=4)
+        ttk.Button(tools,text="Delete selected",command=lambda: self.delete_progress(tree, admin=False)).pack(side="left",padx=4)
+
+    def edit_progress(self, tree, admin=False):
+        selected=tree.selection()
+        if not selected: messagebox.showwarning("Select progress","Select a progress entry first.",parent=self.root); return
+        pid=int(tree.item(selected[0],"values")[0]); row=self.db.conn.execute("SELECT * FROM progress WHERE id=?",(pid,)).fetchone()
+        tid=(self.user or {}).get("teacher_id")
+        if not row or (not admin and row["teacher_id"]!=tid): messagebox.showerror("Permission denied","This progress entry is not available to your account.",parent=self.root); return
+        students=self.db.conn.execute("SELECT id,full_name FROM students ORDER BY full_name").fetchall() if admin else self.db.conn.execute("SELECT s.id,s.full_name FROM students s JOIN teacher_students ts ON ts.student_id=s.id WHERE ts.teacher_id=? ORDER BY s.full_name",(tid,)).fetchall()
+        opts=[f"{r['id']} - {r['full_name']}" for r in students]; current=next((x for x in opts if x.startswith(f"{row['student_id']} - ")),"")
+        fields=[("student","Student",current),("course","Course",row["course"] or COURSES[0]),("level","Level",row["level"] or LEVELS[0]),("lesson","Lesson / topic",row["lesson"] or ""),("score","Score (optional)","" if row["score"] is None else str(row["score"])),("entry_date","Date",row["entry_date"] or ""),("notes","Notes",row["notes"] or "")]
+        def save(v,win):
+            try:
+                sid=int(v["student"].split(" - ",1)[0]); score=float(v["score"]) if v["score"] else None; datetime.strptime(v["entry_date"],"%Y-%m-%d")
+                if score is not None and (score < 0 or score != score or score == float("inf")): raise ValueError("Score must be a finite non-negative number.")
+                if not any(r["id"]==sid for r in students): raise ValueError("Select an eligible student.")
+            except (ValueError,IndexError) as exc: messagebox.showerror("Invalid progress",f"Choose an eligible student, numeric score and date in YYYY-MM-DD format.\n{exc}",parent=win); return False
+            self.db.conn.execute("UPDATE progress SET student_id=?,course=?,level=?,lesson=?,score=?,entry_date=?,notes=? WHERE id=?",(sid,v["course"],v["level"],v["lesson"],score,v["entry_date"],v["notes"],pid)); self.db.conn.commit(); return True
+        self.form_dialog("Edit Progress",fields,save,{"student":opts,"course":COURSES,"level":LEVELS})
+
+    def delete_progress(self, tree, admin=False):
+        selected=tree.selection()
+        if not selected: messagebox.showwarning("Select progress","Select a progress entry first.",parent=self.root); return
+        pid=int(tree.item(selected[0],"values")[0]); row=self.db.conn.execute("SELECT teacher_id FROM progress WHERE id=?",(pid,)).fetchone(); tid=(self.user or {}).get("teacher_id")
+        if not row or (not admin and row["teacher_id"]!=tid): messagebox.showerror("Permission denied","This progress entry is not available to your account.",parent=self.root); return
+        if not messagebox.askyesno("Delete progress","Permanently delete this progress entry?",parent=self.root): return
+        self.db.conn.execute("DELETE FROM progress WHERE id=?",(pid,)); self.db.conn.commit(); tree.delete(selected[0])
 
     def _open_quran_progress(self, viewer, student_id=None):
         """Open Quran-specific progress in a separate window with strict role scoping."""
@@ -13283,12 +13356,13 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         top = ttk.Frame(parent); top.pack(fill="x", pady=5)
         ttk.Button(top, text="Create Login", style="Accent.TButton", command=self.new_account).pack(side="right")
         ttk.Button(top, text="Activate / Deactivate selected", command=lambda: toggle()).pack(side="right", padx=6)
+        actions=ttk.Frame(parent); actions.pack(fill="x",pady=4)
         tree = self.make_tree(parent, ("id","username","role","linked","active","created_at"), ("ID","Username","Role","Linked record ID","Status / حالت","Created / تاریخ"))
         def load():
             tree.delete(*tree.get_children())
-            rows = self.db.conn.execute("""SELECT id,username,role,COALESCE(teacher_id,student_id,''),active,created_at FROM users ORDER BY id DESC""").fetchall()
+            rows = self.db.conn.execute("""SELECT id,username,role,COALESCE(teacher_id,student_id,''),active,created_at FROM users ORDER BY username COLLATE NOCASE,id""").fetchall()
             for r in rows:
-                status = "Active / فعال" if int(r[4] or 0) == 1 else "Pending / منظوری باقی"
+                status = "Active / فعال" if int(r[4] or 0) == 1 else "Inactive / غیر فعال"
                 tree.insert("", "end", values=(r[0], r[1], r[2], r[3], status, r[5]))
         def toggle():
             sel = tree.selection()
@@ -13302,15 +13376,49 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 self.db.conn.execute("UPDATE users SET active=? WHERE id=?",(active,uid))
             self.db.conn.commit(); load()
         load()
+        ttk.Button(actions,text="Edit / reset password",command=lambda: self.edit_account(tree)).pack(side="left",padx=3)
+        ttk.Button(actions,text="Delete account",command=lambda: self.delete_account(tree,load)).pack(side="left",padx=3)
+
+    def edit_account(self, tree):
+        chosen=tree.selection()
+        if not chosen: messagebox.showwarning("Select account","Select an account first.",parent=self.root); return
+        uid=int(tree.item(chosen[0],"values")[0]); row=self.db.conn.execute("SELECT username,role,teacher_id FROM users WHERE id=?",(uid,)).fetchone()
+        if not row: messagebox.showwarning("Account not found","This account no longer exists.",parent=self.root); return
+        fields=[("username","Username",row["username"]),("password","New password (leave blank to keep current)","")]
+        def save(v,win):
+            if not v["username"].strip(): messagebox.showwarning("Required","Username is required.",parent=win); return False
+            if v["password"] and len(v["password"])<12: messagebox.showwarning("Weak password","Use at least 12 characters.",parent=win); return False
+            try:
+                self.db.conn.execute("BEGIN")
+                self.db.conn.execute("UPDATE users SET username=? WHERE id=?",(v["username"],uid))
+                if row["role"] == "teacher" and row["teacher_id"]:
+                    self.db.conn.execute("UPDATE teachers SET email=? WHERE id=?",(v["username"],row["teacher_id"]))
+                if v["password"]: self.db.conn.execute("UPDATE users SET password_hash=? WHERE id=?",(password_hash(v["password"]),uid))
+                self.db.conn.commit()
+            except sqlite3.IntegrityError: self.db.conn.rollback(); messagebox.showerror("Username exists","Choose a different username.",parent=win); return False
+            except Exception as exc: self.db.conn.rollback(); messagebox.showerror("Update failed",str(exc),parent=win); return False
+            tree.item(chosen[0],values=(uid,v["username"],row["role"],tree.item(chosen[0],"values")[3],tree.item(chosen[0],"values")[4],tree.item(chosen[0],"values")[5])); return True
+        self.form_dialog("Edit Login Account",fields,save)
+
+    def delete_account(self, tree, reload):
+        chosen=tree.selection()
+        if not chosen: messagebox.showwarning("Select account","Select an account first.",parent=self.root); return
+        uid=int(tree.item(chosen[0],"values")[0]); role=str(tree.item(chosen[0],"values")[2])
+        if role=="admin" and self.db.scalar("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1")<=1:
+            messagebox.showwarning("Keep an admin","At least one active administrator account must remain.",parent=self.root); return
+        if not messagebox.askyesno("Delete account","Permanently delete this login account?",parent=self.root): return
+        self.db.conn.execute("DELETE FROM users WHERE id=?",(uid,)); self.db.conn.commit(); reload()
 
     def new_account(self):
         roles = ["teacher"]
-        fields = [("role","Role","teacher"),("username","Username",""),("password","Temporary password (12+ chars)",""),
+        fields = [("role","Role","teacher"),("username","Username",""),("password","Temporary password (12+ chars)",""),("confirm_password","Confirm password",""),
                   ("record_id","Teacher ID","")]
         def save(v, win):
             role=v["role"]
             if role not in roles or not v["username"] or len(v["password"])<12:
                 messagebox.showwarning("Check details","Choose teacher, username and a password of at least 12 characters.",parent=win); return False
+            if v["password"] != v["confirm_password"]:
+                messagebox.showwarning("Password mismatch","The password and confirmation do not match.",parent=win); return False
             try: rid=int(v["record_id"])
             except ValueError:
                 messagebox.showwarning("Record ID required","Enter the matching teacher record ID.",parent=win); return False
@@ -13321,7 +13429,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 self.db.conn.execute("INSERT INTO users(username,password_hash,role,teacher_id,student_id,active,created_at) VALUES(?,?,?,?,?,1,?)",
                     (v["username"],password_hash(v["password"]),role,rid if role=="teacher" else None,rid if role=="student" else None,timestamp()))
                 self.db.conn.commit()
-                messagebox.showinfo("Created","Login account created.",parent=win); return True
+                messagebox.showinfo("Created","Login account created.",parent=win)
+                self.root.after_idle(self._rebuild_ui_keep_page)
+                return True
             except sqlite3.IntegrityError:
                 messagebox.showerror("Username exists","Choose a different username.",parent=win); return False
         self.form_dialog("Create Login", fields, save, {"role": roles})
@@ -13366,10 +13476,10 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         ttk.Label(parent, textvariable=report_status_var, style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
         report_queries = {
             "Students": "SELECT id,full_name,guardian_name,phone,course,level,class_time,monthly_fee,currency,status,admission_date FROM students ORDER BY full_name",
-            "Teachers": "SELECT id,full_name,email,phone,qualification,experience,availability,status FROM teachers ORDER BY full_name",
-            "Payments": "SELECT p.id,s.full_name,p.amount,p.currency,p.payment_date,p.month,p.status,p.notes FROM payments p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.payment_date DESC",
-            "Attendance": "SELECT a.id,s.full_name,a.class_date,a.status,a.notes,t.full_name AS teacher FROM attendance a LEFT JOIN students s ON s.id=a.student_id LEFT JOIN teachers t ON t.id=a.teacher_id ORDER BY a.class_date DESC",
-            "Progress": "SELECT p.id,s.full_name,p.course,p.level,p.lesson,p.score,p.entry_date,p.notes FROM progress p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.entry_date DESC"
+            "Teachers": "SELECT id,full_name,email,phone,qualification,experience,status FROM teachers ORDER BY full_name",
+            "Payments": "SELECT p.id,s.full_name,p.amount,p.currency,p.payment_date,p.month,p.status,p.notes FROM payments p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.payment_date,p.id",
+            "Attendance": "SELECT a.id,s.full_name,a.class_date,a.status,a.notes,t.full_name AS teacher FROM attendance a LEFT JOIN students s ON s.id=a.student_id LEFT JOIN teachers t ON t.id=a.teacher_id ORDER BY a.class_date,a.id",
+            "Progress": "SELECT p.id,s.full_name,p.course,p.level,p.lesson,p.score,p.entry_date,p.notes FROM progress p LEFT JOIN students s ON s.id=p.student_id ORDER BY p.entry_date,p.id"
         }
         report_job = {"running": False}
         def fetch_report_async(report, on_rows):
@@ -13417,7 +13527,18 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                         else:
                             writer.writerow(headers)
                         for row in rows:
-                            writer.writerow([_report_value_for_language(h, row.get(h), language) for h in headers])
+                            cells=[]
+                            for h in headers:
+                                value=_report_value_for_language(h, row.get(h), language)
+                                raw="" if value is None else str(value)
+                                # Keep identifiers and phone numbers as text in Excel (no lost
+                                # leading zeroes or scientific notation), and neutralize formulas.
+                                if h.lower() in {"id","student_id","teacher_id","phone","guardian_phone","mobile","contact_number","linked"} and raw:
+                                    raw="'"+raw
+                                elif raw.startswith(("=","+","-","@")):
+                                    raw="'"+raw
+                                cells.append(raw)
+                            writer.writerow(cells)
                     else:
                         writer.writerow(["No records"])
                 messagebox.showinfo("Export complete", f"CSV report saved:\n{path}", parent=self.root)
