@@ -9497,14 +9497,26 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             if key in combos:
                 widget = ttk.Combobox(body, values=combos[key], state="readonly", width=1)
                 widget.set(default or (combos[key][0] if combos[key] else ""))
-            else:
-                widget = ttk.Entry(body, width=1, show="*" if "password" in key.lower() else "")
+                widget.grid(row=i, column=1, sticky="ew", padx=6, pady=6)
+            elif "password" in key.lower():
+                pw_row = ttk.Frame(body)
+                pw_row.grid(row=i, column=1, sticky="ew", padx=6, pady=6)
+                widget = ttk.Entry(pw_row, width=36, show="*")
                 if default is not None:
                     widget.insert(0, str(default))
-            if "password" in key.lower():
-                pw_row=ttk.Frame(body); pw_row.grid(row=i,column=1,sticky="ew",padx=6,pady=6); widget.pack(side="left",fill="x",expand=True)
-                ttk.Button(pw_row,text="Show",command=lambda e=widget,b=None: e.configure(show="" if e.cget("show") else "*")).pack(side="right",padx=(5,0))
+                widget.pack(side="left", fill="x", expand=True)
+                def toggle_password(entry=widget, button=None):
+                    showing = entry.cget("show") == ""
+                    entry.configure(show="*" if showing else "")
+                    if button is not None:
+                        button.configure(text="Show" if showing else "Hide")
+                show_button = ttk.Button(pw_row, text="Show", width=7)
+                show_button.configure(command=lambda e=widget, b=show_button: toggle_password(e, b))
+                show_button.pack(side="right", padx=(5, 0))
             else:
+                widget = ttk.Entry(body, width=36)
+                if default is not None:
+                    widget.insert(0, str(default))
                 widget.grid(row=i, column=1, sticky="ew", padx=6, pady=6)
             entries[key] = widget
         body.grid_columnconfigure(1, weight=1)
@@ -10349,7 +10361,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         body.pack(fill="both", expand=True)
 
         smart_label(ttk.Label, body, text="Assign Student to Teacher & Reserve Slot", style="Title.TLabel").pack(anchor="w")
-        smart_label(ttk.Label, body, text="Select teacher and student, then choose an available weekly slot. This assigns the student, sets their class time, and updates the weekly timetable in one step.", style="Sub.TLabel", wraplength=760).pack(anchor="w", pady=(2, 10))
+        smart_label(ttk.Label, body, text="Select teacher and student, tick the weekdays for classes, then choose at least one free time slot for each checked day.", style="Sub.TLabel", wraplength=760).pack(anchor="w", pady=(2, 10))
 
         top_grid = ttk.Frame(body)
         top_grid.pack(fill="x", pady=(0, 10))
@@ -10365,6 +10377,17 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                                    values=[f"{r['id']} - {r['full_name']}" for r in students])
         student_box.grid(row=0, column=3, sticky="w", padx=6, pady=4)
         student_box.current(0)
+
+        weekdays = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+        weekday_vars = {day: tk.BooleanVar(value=False) for day in weekdays}
+        day_box = ttk.LabelFrame(body, text="Class days / کلاس کے دن", padding=(8, 4))
+        day_box.pack(fill="x", pady=(0, 6))
+        for index, day in enumerate(weekdays):
+            ttk.Checkbutton(day_box, text=day, variable=weekday_vars[day], command=lambda: refresh_slots()).grid(
+                row=0, column=index, sticky="w", padx=4, pady=2)
+        day_hint = tk.StringVar(value="Tick one or more days to see available slots.")
+        smart_label(ttk.Label, day_box, textvariable=day_hint, style="Sub.TLabel").grid(
+            row=1, column=0, columnspan=len(weekdays), sticky="w", padx=4, pady=(1, 3))
 
         # The action bar and the filter are packed FIRST (side=bottom). The slot list takes only the
         # space that is left, so Save can never be pushed out of the window (large fonts, 125%/150%).
@@ -10399,6 +10422,11 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
 
         def refresh_slots(_e=None):
             stree.delete(*stree.get_children())
+            checked_days = {day for day, var in weekday_vars.items() if var.get()}
+            if not checked_days:
+                day_hint.set("Tick one or more days to see available slots.")
+                return
+            day_hint.set("Choose at least one free time slot for every checked day. Ctrl-click to select more than one.")
             try:
                 tid = int(teacher_box.get().split(" - ", 1)[0])
                 sid = int(student_box.get().split(" - ", 1)[0])
@@ -10407,6 +10435,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             all_slots = self._get_teacher_slots(tid, sid)
             only_free = only_free_var.get()
             for s in all_slots:
+                if s["slot"].split(" ", 1)[0] not in checked_days:
+                    continue
                 status = s["status"]
                 if only_free and status != "AVAILABLE" and status != "CURRENT SLOT":
                     continue
@@ -10428,6 +10458,15 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 messagebox.showwarning("Select Slots / اوقات چنیں", "Select one or more available weekly class slots. Use Ctrl-click to select multiple days.", parent=win)
                 return
             selected_slots = [stree.item(item, "values") for item in selected]
+            checked_days = {day for day, var in weekday_vars.items() if var.get()}
+            selected_days = {str(v[0]).split(" ", 1)[0] for v in selected_slots}
+            if not checked_days:
+                messagebox.showwarning("Choose class days", "Tick the weekdays when this student should have classes.", parent=win)
+                return
+            if selected_days != checked_days:
+                missing = sorted(checked_days - selected_days)
+                messagebox.showwarning("Choose a slot for each day", "Select at least one available time slot for each checked day" + (f": {', '.join(missing)}." if missing else ". Uncheck any day you do not want to assign."), parent=win)
+                return
             invalid = [v for v in selected_slots if v[1] not in ("AVAILABLE", "CURRENT SLOT")]
             if invalid:
                 messagebox.showwarning("Slot Not Available / وقت دستیاب نہیں", f"{invalid[0][0]} is {invalid[0][1]} ({invalid[0][2]}). Select only available slots.", parent=win)
@@ -10450,17 +10489,23 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 selected_intervals.append((day,begin,begin+45))
             try:
                 self.db.conn.execute("BEGIN")
-                self.db.conn.execute("DELETE FROM weekly_class_schedule WHERE student_id=?", (sid,))
+                # Replace only the days being edited; keep the student's other
+                # recurring weekdays when another assignment is added later.
+                for day in checked_days:
+                    self.db.conn.execute("DELETE FROM weekly_class_schedule WHERE student_id=? AND weekday=?", (sid, day))
                 for slot, _status, _booked_by in selected_slots:
                     day, start = slot.split(" ", 1)
                     end = self._calculate_end_time(start, 45)
                     self.db.conn.execute("INSERT INTO weekly_class_schedule(student_id, teacher_id, weekday, start_time, end_time, created_at) VALUES(?,?,?,?,?,?)",
                                          (sid, tid, day, start, end, timestamp()))
-                self.db.conn.execute("DELETE FROM teacher_students WHERE student_id=?", (sid,))
-                self.db.conn.execute("INSERT INTO teacher_students(teacher_id, student_id) VALUES(?,?)", (tid, sid))
-                self.db.conn.execute("UPDATE students SET class_time=? WHERE id=?", (selected_slots[0][0], sid))
+                self.db.conn.execute("INSERT OR IGNORE INTO teacher_students(teacher_id, student_id) VALUES(?,?)", (tid, sid))
+                self.db.conn.execute("""UPDATE students SET class_time=(
+                    SELECT weekday || ' ' || start_time FROM weekly_class_schedule WHERE student_id=?
+                    ORDER BY CASE weekday WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3
+                    WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,start_time LIMIT 1
+                ) WHERE id=?""", (sid, sid))
                 self.db.conn.commit()
-                messagebox.showinfo("Assigned Successfully / کامیابی سے تفویض", f"Student assigned to teacher for {len(selected_slots)} weekly class day(s).\nWeekly timetable and class schedule updated.", parent=win)
+                messagebox.showinfo("Assigned Successfully / کامیابی سے تفویض", f"Added or updated {len(selected_slots)} weekly class slot(s). Other weekdays were kept.\nWeekly timetable and class schedule updated.", parent=win)
                 win.destroy()
             except Exception as exc:
                 self.db.conn.rollback()
@@ -10468,11 +10513,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
 
     def add_teacher(self):
         fields = [
-            ("full_name", "Teacher full name *", ""), ("email", "Login username *", ""),
-            ("password", "Login password (12+ characters) *", ""),
-            ("confirm_password", "Confirm login password *", ""),
-            ("phone", "Phone (admin only)", ""), ("qualification", "Qualifications", ""),
-            ("experience", "Experience", ""),
+            ("full_name", "Name *", ""), ("email", "Email / login username *", ""),
+            ("phone", "Phone", ""), ("password", "Password (12+ characters) *", ""),
+            ("qualification", "Qualification", ""), ("experience", "Experience", ""),
             ("status", "Status", "Active")
         ]
         def save(v, win):
@@ -10480,15 +10523,13 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 messagebox.showwarning("Required", "Teacher name is required.", parent=win); return False
             if not v["email"].strip() or len(v["password"]) < 12:
                 messagebox.showwarning("Login required", "Enter a login username and a password of at least 12 characters.", parent=win); return False
-            if v["password"] != v["confirm_password"]:
-                messagebox.showwarning("Password mismatch", "The password and confirmation do not match.", parent=win); return False
             try:
                 self.db.conn.execute("BEGIN")
                 cur = self.db.conn.execute("INSERT INTO teachers(full_name,email,phone,qualification,experience,status) VALUES(?,?,?,?,?,?)",
                     (v["full_name"],v["email"],v["phone"],v["qualification"],v["experience"],v["status"]))
                 tid = cur.lastrowid
                 self.db.conn.execute("INSERT INTO users(username,password_hash,role,teacher_id,active,created_at) VALUES(?,?, 'teacher', ?,1,?)",
-                    (v["email"], password_hash(v["password"]), tid, timestamp()))
+                    (v["email"].strip(),password_hash(v["password"]),tid,timestamp()))
                 self.db.conn.commit()
                 messagebox.showinfo("Saved", "Teacher profile and login account saved.", parent=win)
                 self.root.after_idle(self._rebuild_ui_keep_page)
@@ -10497,9 +10538,9 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 messagebox.showerror("Username exists", "Choose a username that is not already in use.", parent=win); return False
             except Exception as exc:
                 self.db.conn.rollback()
-                messagebox.showerror("Teacher not saved", f"The teacher and login were not saved.\n\n{exc}", parent=win); return False
+                messagebox.showerror("Teacher not saved", str(exc), parent=win); return False
             return True
-        self.form_dialog("Add Teacher / نیا استاد", fields, save, {"status": STATUSES})
+        self.form_dialog("Add Teacher", fields, save, {"status": STATUSES})
 
     def create_user_dialog(self, role, teacher_id=None, student_id=None, suggested=""):
         # Current release supports admin-managed teacher logins only. Legacy
@@ -13022,7 +13063,7 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         load_rows()
 
     def teacher_students(self, parent):
-        self.page_title(parent, "My Assigned Students / میرے طلبہ", "Privacy mode: only student name, class time and level/course are shown.")
+        self.page_title(parent, "My Assigned Students / میرے طلبہ", "View each assigned student's complete weekly class schedule, level and course.")
         tid = self.user.get("teacher_id")
         if not tid:
             smart_label(ttk.Label, parent, text="This teacher login is not linked to a teacher record. Ask the administrator to create/link the account.", style="Sub.TLabel").pack(anchor="w", pady=10)
@@ -13041,7 +13082,18 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
             card = tk.Frame(parent, bg=PALE, padx=14, pady=12, highlightbackground=BORDER, highlightthickness=1)
             card.pack(fill="x", pady=5)
             smart_label(tk.Label, card, text=r["full_name"], bg=PALE, fg=PRIMARY_INK, font=(UI_FONT, 12, "bold")).pack(anchor="w")
-            smart_label(tk.Label, card, text=f"Class time: {r['class_time'] or 'Not set'}  |  Level: {r['level'] or 'Beginner'}  |  Course: {r['course'] or 'Not assigned'}", bg=PALE, fg=DARK).pack(anchor="w", pady=(5,0))
+            schedule_rows = self.db.conn.execute("""SELECT weekday,start_time,end_time FROM weekly_class_schedule
+                WHERE student_id=? AND teacher_id=?
+                ORDER BY CASE weekday WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3
+                WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,start_time""",
+                (r["id"], tid)).fetchall()
+            if schedule_rows:
+                class_times = "  •  ".join(
+                    f"{slot['weekday']} {slot['start_time']}" + (f"–{slot['end_time']}" if slot['end_time'] else "")
+                    for slot in schedule_rows)
+            else:
+                class_times = r["class_time"] or "Not set"
+            smart_label(tk.Label, card, text=f"Class times: {class_times}\nLevel: {r['level'] or 'Beginner'}  |  Course: {r['course'] or 'Not assigned'}", bg=PALE, fg=DARK, justify="left", wraplength=1000).pack(anchor="w", pady=(5,0))
 
     def teacher_attendance(self, parent):
         self.attendance_calendar_page(parent)
@@ -13356,14 +13408,19 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
         top = ttk.Frame(parent); top.pack(fill="x", pady=5)
         ttk.Button(top, text="Create Login", style="Accent.TButton", command=self.new_account).pack(side="right")
         ttk.Button(top, text="Activate / Deactivate selected", command=lambda: toggle()).pack(side="right", padx=6)
+        ttk.Button(top, text="Refresh", command=lambda: load()).pack(side="right", padx=6)
         actions=ttk.Frame(parent); actions.pack(fill="x",pady=4)
-        tree = self.make_tree(parent, ("id","username","role","linked","active","created_at"), ("ID","Username","Role","Linked record ID","Status / حالت","Created / تاریخ"))
+        tree = self.make_tree(parent, ("id","username","role","linked_name","linked","active","created_at"), ("ID","Username","Role","Linked profile","Record ID","Status / حالت","Created / تاریخ"))
         def load():
             tree.delete(*tree.get_children())
-            rows = self.db.conn.execute("""SELECT id,username,role,COALESCE(teacher_id,student_id,''),active,created_at FROM users ORDER BY username COLLATE NOCASE,id""").fetchall()
+            rows = self.db.conn.execute("""SELECT u.id,u.username,u.role,
+                    COALESCE(t.full_name,s.full_name,''),COALESCE(u.teacher_id,u.student_id,''),u.active,u.created_at
+                FROM users u LEFT JOIN teachers t ON t.id=u.teacher_id LEFT JOIN students s ON s.id=u.student_id
+                ORDER BY u.username COLLATE NOCASE,u.id""").fetchall()
             for r in rows:
-                status = "Active / فعال" if int(r[4] or 0) == 1 else "Inactive / غیر فعال"
-                tree.insert("", "end", values=(r[0], r[1], r[2], r[3], status, r[5]))
+                # r[5] is the active flag after adding linked profile name.
+                status = "Active / فعال" if int(r[5] or 0) == 1 else "Inactive / غیر فعال"
+                tree.insert("", "end", values=(r[0], r[1], r[2], r[3], r[4], status, r[6]))
         def toggle():
             sel = tree.selection()
             if not sel: messagebox.showwarning("Select account","Select an account first."); return
@@ -13397,7 +13454,8 @@ body {{ font-family: 'Jameel Noori Nastaleeq', 'Segoe UI', Tahoma, sans-serif; b
                 self.db.conn.commit()
             except sqlite3.IntegrityError: self.db.conn.rollback(); messagebox.showerror("Username exists","Choose a different username.",parent=win); return False
             except Exception as exc: self.db.conn.rollback(); messagebox.showerror("Update failed",str(exc),parent=win); return False
-            tree.item(chosen[0],values=(uid,v["username"],row["role"],tree.item(chosen[0],"values")[3],tree.item(chosen[0],"values")[4],tree.item(chosen[0],"values")[5])); return True
+            old=tree.item(chosen[0],"values")
+            tree.item(chosen[0],values=(uid,v["username"],row["role"],old[3],old[4],old[5],old[6])); return True
         self.form_dialog("Edit Login Account",fields,save)
 
     def delete_account(self, tree, reload):
